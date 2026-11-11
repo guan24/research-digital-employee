@@ -6,7 +6,7 @@ A minimal, long-running autonomous research employee built with **Deep Agents + 
 
 - Autonomous research loop powered by Deep Agents (not a fixed search/read/summarize script).
 - External tools: Tavily web search, public webpage fetch/read, task-scoped artifact read/write/list.
-- FastAPI task API: create, inspect, list events, pause, resume, cancel, list/download artifacts.
+- FastAPI task API: create, inspect, list events, pause, resume, manually retry failed tasks, cancel, list/download artifacts.
 - SQLite task lifecycle, event log, single-worker lease, heartbeat, retry scheduling.
 - LangGraph SQLite checkpointing keyed by `task_id`; stale `RUNNING` tasks are re-queued and resumed from the latest graph checkpoint.
 - Atomic artifact writes under `workspaces/<task_id>/`.
@@ -110,9 +110,16 @@ curl -X POST http://127.0.0.1:8000/tasks/<task_id>/pause
 # Resume a paused task from its LangGraph checkpoint
 curl -X POST http://127.0.0.1:8000/tasks/<task_id>/resume
 
+# Manually retry a failed task (preserves task_id, checkpoint thread, and workspace)
+curl -X POST http://127.0.0.1:8000/tasks/<task_id>/retry \
+  -H "Content-Type: application/json" \
+  -d '{"reason":"OpenAI API quota replenished"}'
+
 # Cooperative cancellation
 curl -X POST http://127.0.0.1:8000/tasks/<task_id>/cancel
 ```
+
+The manual retry endpoint accepts only tasks in `failed` state and returns **202** after atomically re-queueing the task. It resets the attempt counter and terminal error, preserves the task workspace, and reuses the LangGraph checkpoint under the original `task_id` when available. If no checkpoint exists, the executor starts from the original goal. Other states return **409**; unknown task IDs return **404**. The `task_manually_requeued` event records the reason and previous attempt count.
 
 Pause/cancel are cooperative: an in-flight HTTP request or model generation may finish before the next control boundary is reached.
 

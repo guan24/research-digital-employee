@@ -35,3 +35,16 @@ class EventOut(BaseModel):
     timestamp: str
     event_type: str
     payload: dict
+
+
+class TaskRetry(BaseModel):
+    reason: str | None = Field(default=None, max_length=1000)
+
+
+class TaskRetryOut(BaseModel):
+    task_id: str
+    status: str
+    checkpoint_reuse_requested: bool
+    workspace_preserved: bool
+    previous_attempts: int
+    message: str

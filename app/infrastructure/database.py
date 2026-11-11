@@ -305,6 +305,80 @@ class Database:
             self.add_event(task_id, "cancel_requested", {})
         return cur.rowcount == 1
 
+    def requeue_failed_task(self, task_id: str, reason: str | None = None) -> dict[str, Any] | None:
+        """Atomically requeue a failed task and append its audit event.
+
+        The task identifier, LangGraph checkpoint thread, and task workspace are
+        intentionally retained so the executor can resume the existing run.
+        """
+        normalized_reason = reason.strip() if reason and reason.strip() else None
+        with self.transaction() as conn:
+            row = conn.execute(
+                "SELECT status, attempts FROM tasks WHERE task_id=?",
+                (task_id,),
+            ).fetchone()
+            if row is None:
+                return None
+            if row["status"] != "failed":
+                return {"requeued": False, "current_status": row["status"]}
+
+            previous_attempts = int(row["attempts"])
+            now = utc_now()
+            cur = conn.execute(
+                """UPDATE tasks
+                   SET status='queued',
+                       attempts=0,
+                       next_run_at=0,
+                       worker_id=NULL,
+                       heartbeat_at=NULL,
+                       resume_mode=1,
+                       pause_requested=0,
+                       cancel_requested=0,
+                       updated_at=?,
+                       completed_at=NULL,
+                       last_error=NULL,
+                       result_path=NULL
+                   WHERE task_id=? AND status='failed'""",
+                (now, task_id),
+            )
+            if cur.rowcount != 1:
+                current = conn.execute(
+                    "SELECT status FROM tasks WHERE task_id=?",
+                    (task_id,),
+                ).fetchone()
+                return {
+                    "requeued": False,
+                    "current_status": current["status"] if current else "missing",
+                }
+
+            payload = {
+                "reason": normalized_reason,
+                "previous_attempts": previous_attempts,
+                "attempts_reset_to": 0,
+                "checkpoint_reuse_requested": True,
+                "workspace_preserved": True,
+            }
+            conn.execute(
+                """INSERT INTO events(task_id, timestamp, event_type, payload_json)
+                   VALUES (?, ?, ?, ?)""",
+                (
+                    task_id,
+                    now,
+                    "task_manually_requeued",
+                    json.dumps(payload, ensure_ascii=False, default=str),
+                ),
+            )
+            updated = conn.execute(
+                "SELECT * FROM tasks WHERE task_id=?",
+                (task_id,),
+            ).fetchone()
+
+        return {
+            "requeued": True,
+            "task": dict(updated),
+            "previous_attempts": previous_attempts,
+        }
+
     def resume_task(self, task_id: str) -> bool:
         with closing(self.connect()) as conn:
             cur = conn.execute(

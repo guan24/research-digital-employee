@@ -45,3 +45,65 @@ def test_pause_resume_and_cancel_transitions(db):
     assert db.get_task(task["task_id"])["status"] == "queued"
     assert db.request_cancel(task["task_id"]) is True
     assert db.get_task(task["task_id"])["status"] == "cancelled"
+
+
+
+def test_manual_retry_requeues_failed_task_and_preserves_recovery_state(db):
+    task = db.create_task("Research a topic with enough detail", max_attempts=1)
+    claimed = db.claim_next_task("worker-a")
+    assert db.schedule_retry(
+        claimed, "OpenAI API quota exhausted", delay_seconds=0, worker_id="worker-a"
+    ) == "failed"
+
+    result = db.requeue_failed_task(task["task_id"], reason="OpenAI API quota replenished")
+
+    assert result is not None
+    assert result["requeued"] is True
+    assert result["previous_attempts"] == 1
+    updated = db.get_task(task["task_id"])
+    assert updated["task_id"] == task["task_id"]
+    assert updated["status"] == "queued"
+    assert updated["attempts"] == 0
+    assert updated["max_attempts"] == 1
+    assert updated["resume_mode"] == 1
+    assert updated["worker_id"] is None
+    assert updated["heartbeat_at"] is None
+    assert updated["last_error"] is None
+    assert updated["result_path"] is None
+
+    retry_event = db.get_events(task["task_id"])[-1]
+    assert retry_event["event_type"] == "task_manually_requeued"
+    assert retry_event["payload"] == {
+        "reason": "OpenAI API quota replenished",
+        "previous_attempts": 1,
+        "attempts_reset_to": 0,
+        "checkpoint_reuse_requested": True,
+        "workspace_preserved": True,
+    }
+
+
+def test_manual_retry_rejects_non_failed_task_without_mutation(db):
+    task = db.create_task("Research a topic with enough detail")
+    before_events = db.get_events(task["task_id"])
+    result = db.requeue_failed_task(task["task_id"], reason="not failed yet")
+    assert result == {"requeued": False, "current_status": "queued"}
+    assert db.get_task(task["task_id"])["status"] == "queued"
+    assert db.get_events(task["task_id"]) == before_events
+
+
+def test_manual_retry_returns_none_for_missing_task(db):
+    assert db.requeue_failed_task("missing-task-id", reason="retry") is None
+
+
+def test_manual_retry_is_idempotently_rejected_after_first_requeue(db):
+    task = db.create_task("Research a topic with enough detail", max_attempts=1)
+    claimed = db.claim_next_task("worker-a")
+    assert db.schedule_retry(claimed, "quota exhausted", 0, "worker-a") == "failed"
+    first = db.requeue_failed_task(task["task_id"], reason="quota replenished")
+    second = db.requeue_failed_task(task["task_id"], reason="duplicate request")
+    assert first is not None and first["requeued"] is True
+    assert second == {"requeued": False, "current_status": "queued"}
+    assert sum(
+        event["event_type"] == "task_manually_requeued"
+        for event in db.get_events(task["task_id"])
+    ) == 1
