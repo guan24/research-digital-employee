@@ -1,101 +1,48 @@
-# Design Notes — Research Digital Employee MVP
+# Design — Research Digital Employee
 
-## 1. Digital employee vs. ordinary LLM application
+## Runtime model
 
-An ordinary LLM application primarily maps one request to one answer or runs a fixed workflow. A digital employee is goal-oriented and long-running: it decomposes a goal, chooses tools, accumulates evidence, changes its plan when evidence exposes gaps, persists its working state, and produces a durable artifact. The system therefore treats task lifecycle, agent state, tool execution, artifacts, and observability as first-class concerns rather than treating the conversation transcript as the application database.
+The browser is the operator console. FastAPI creates and controls durable tasks. A separate single Worker claims tasks and runs a task-scoped Deep Agent. LangGraph SQLite checkpoints preserve graph state; the task database preserves lifecycle and an append-only observable event journal.
 
-## 2. Architecture and responsibility boundaries
+## Responsibilities
 
-```text
-Client
-  |
-  v
-FastAPI ---------------------- SQLite task/event DB
-  |                                  ^
-  | creates task                     | claim / heartbeat / status / events
-  v                                  |
-Single Worker -----------------------+
-  |
-  v
-ResearchExecutor
-  |
-  +---- Deep Agents (planning, file/context harness, tool selection)
-  |       |
-  |       +---- web_search (Tavily)
-  |       +---- fetch_url (HTTP + HTML extraction)
-  |       +---- save/read/list_artifact (task workspace)
-  |
-  +---- LangGraph SqliteSaver (checkpoints.sqlite; thread_id = task_id)
-  |
-  +---- workspaces/<task_id>/ (durable notes, sources, report.md)
-```
+- Role-specific: `app/agents/research/` owns the research role prompt and research conventions.
+- Shared runtime: FastAPI, task database, Worker lease/heartbeat, retry, cancellation, checkpoint lifecycle, SSE, event redaction and artifact storage.
+- Tools: web search, public-page fetch and task-scoped artifact operations.
 
-### Digital employee / role-specific layer
+## Event journal and SSE
 
-`app/agents/research/` owns the Research Agent's role prompt, profile, and research conventions. A future Coding Agent or Data Analysis Agent should add a profile, skills, and an allowlisted tool set rather than reimplementing the Worker, task database, or checkpoint lifecycle.
+Every event is committed to SQLite before it is streamed. `event_id` is the durable cursor. SSE accepts `Last-Event-ID` and `after_id`, queries events with a greater ID, and emits keep-alive comments when idle. Browser reconnection therefore replays persisted events without losing the event journal. The UI deduplicates by event ID.
 
-### Shared platform layer
+Event categories include task lifecycle, generated plan/plan updates, model-call start/completion/failure, tool-call start/completion/failure, research search/fetch, checkpoint resume, artifact save, retries and execution exceptions. Callback instrumentation records model identity/purpose, bounded input summary, observable generated output/decision summary, token usage and duration. Tool callbacks record tool name, parameters, output and duration. Hidden chain-of-thought is not captured.
 
-- `api/`: task submission, status, event, control, and artifact endpoints.
-- `runtime/`: one Worker, execution boundary, retries, heartbeat, and recovery.
-- `infrastructure/database.py`: task state, event journal, and singleton worker lease.
-- `infrastructure/artifact_store.py`: task-scoped durable artifact storage with atomic writes and path validation.
-- `tools/`: reusable search, fetch, and artifact capabilities.
-- LangGraph Checkpointer: durable graph state, separate from task lifecycle rows.
+## Credential redaction
 
-This split makes a role replaceable without rewriting platform concerns.
+All event payloads pass through recursive key-based and common token-pattern redaction before JSON serialization and persistence. API key/token/password/authorization/credential-like keys are replaced with `[REDACTED]`; bearer tokens and common provider key prefixes in text are masked. Research text is retained. Redaction is defense-in-depth, not a substitute for secret-free prompts and tool outputs.
 
-## 3. Execution and recovery model
+## Safe task deletion
 
-1. `POST /tasks` writes a `queued` task row and a `task_created` event, then returns a UUID.
-2. The Worker acquires a SQLite singleton lease and atomically claims the oldest due task (`queued` or `retry_wait`). Claiming increments `attempts` and sets `status=running`.
-3. The executor opens `SqliteSaver` and uses `thread_id=task_id`. If the graph has pending nodes, it calls `agent.invoke(None, config=...)` to continue from the checkpoint. If no checkpoint exists, it submits the original goal. If the graph has completed but the Worker died before updating the task row, it materializes `report.md` from the last assistant message.
-4. Model/tool callbacks and tool services append structured events to SQLite. Search responses and fetched pages are saved under the task workspace. Agent-generated plans/notes/report are persisted with `save_artifact`.
-5. A heartbeat thread renews both the worker lease and task heartbeat while a long synchronous model call is running.
-6. On Worker restart, a task still marked `running` whose heartbeat is older than the lease threshold is moved to `queued` with `resume_mode=1`. The same LangGraph `thread_id` allows the executor to inspect and continue its checkpoint.
-7. Transient or unexpected failures are recorded and scheduled with bounded exponential backoff. After `max_attempts`, the task becomes `failed`.
-8. An operator can call `POST /tasks/{task_id}/retry` for a failed task. Within one `BEGIN IMMEDIATE` SQLite transaction, the task returns to `queued` and a `task_manually_requeued` event records the reason and previous attempt count. The original `task_id`, LangGraph `thread_id`, checkpoint database, and task workspace are preserved. The executor resumes pending graph work from the existing checkpoint, or starts from the original goal when no checkpoint exists.
+Deletion is a two-phase operation:
 
-Task rows and LangGraph checkpoints solve different problems. A task row answers “is this job queued/running/completed and who owns it?” A checkpoint answers “what state and graph node should this Agent continue from?” Neither replaces the other.
+1. In a `BEGIN IMMEDIATE` transaction, change the task to `deleting`. This state is excluded from Worker claim queries. For a running task, set `cancel_requested=1` while retaining its worker ID; for non-running tasks, clear the worker owner immediately.
+2. For a running task, wait up to 60 seconds for the Worker to handle cooperative cancellation. The Worker exits the executor (thereby closing the LangGraph SQLite checkpointer) and clears its worker ID while leaving status `deleting`.
+3. Only after worker ownership is cleared, remove all checkpoint rows with matching `thread_id`, remove the task workspace, and delete the task row. The events table uses foreign-key cascade.
+4. If the Worker does not stop within 60 seconds, restore a non-deleting status and preserve the task row, events, checkpoint and workspace. A cleanup error leaves the task row available for diagnosis/retry.
 
-## 4. Main technical challenges
+This is designed for the single-worker MVP. It does not provide cross-process filesystem locking against external processes writing directly into a task workspace.
 
-### 4.1 Long-context control
+## Unicode
 
-Research pages and search results can grow much faster than the useful working context. Deep Agents provides a filesystem/context harness; the Research Agent is instructed to save plans, source notes, and evidence files, then carry concise summaries in its active context. The task workspace stores the durable evidence independently of the model context.
+Task goals are JSON strings encoded as UTF-8 by browsers and stored in SQLite TEXT. API round-trip tests verify Chinese, English and punctuation survive POST, persistence and GET unchanged. The console sends `application/json; charset=utf-8`.
 
-### 4.2 Durable execution and at-least-once replay
+## Persistence
 
-Checkpointing does not create exactly-once external side effects. A Worker can die after a tool succeeds but before the next checkpoint is committed. This MVP uses read-only web tools and atomic, overwrite-safe artifact writes, making replay low-risk. Any future tool that sends messages, modifies tickets, deploys code, or changes business data must add an idempotency key and a durable operation journal.
+- `tasks.sqlite`: task state and event journal.
+- `checkpoints.sqlite`: LangGraph checkpoint state.
+- `workspaces/<task_id>/`: durable research artifacts.
 
-### 4.3 Observability and evidence quality
+Task data is retained indefinitely until explicit deletion. Back up all three storage locations together.
 
-The event journal records task transitions, model call boundaries, tool inputs/outputs (truncated), errors, checkpoint recovery, and artifact writes. The Research Agent must save source artifacts and include direct URLs in the report. A future evaluator can use these traces to identify weak planning, repetitive search, unsupported claims, and expensive tool/model choices.
+## Current limits
 
-## 5. Reliability controls
-
-- Model timeout and bounded model retry configured on `ChatOpenAI`.
-- Worker-level bounded retries with exponential backoff; failed tasks can be manually re-queued through an audited API without deleting their checkpoint or workspace.
-- Single-worker SQLite lease prevents accidental concurrent Worker processes.
-- Heartbeat allows recovery of stale `running` tasks.
-- Graph recursion limit bounds the number of internal graph transitions.
-- Per-attempt wall-clock budget is checked at model/tool boundaries.
-- Pause/cancel are cooperative and checked at model/tool boundaries; an in-flight HTTP/model request may finish first.
-- Search/fetch have network timeouts; fetch limits response bytes and validates public HTTP(S) destinations/redirects.
-- Artifact paths are relative to a task workspace, traversal is rejected, and writes use temporary files plus atomic replace.
-
-## 6. Most important three problems
-
-1. **Context and state management:** preserve useful evidence without carrying every page in the model context; use file-backed notes plus LangGraph checkpoints.
-2. **Long-running reliability:** separate API from Worker, persist task lifecycle, heartbeat the Worker, recover stale tasks, and bound retries/runtime.
-3. **Observability and trustworthiness:** record the decision/tool lifecycle, preserve source URLs and fetched material, and distinguish sourced facts from recommendations.
-
-## 7. What to improve after six months of task history
-
-1. **Trajectory evaluation and failure analytics:** build task benchmarks, replay traces, classify failure modes, measure source coverage/citation validity, and run regression evaluations before changing prompts/models.
-2. **Adaptive planning and model/tool routing:** learn which planning patterns, search providers, and model tiers work for each task class; use cost/quality-aware routing and reusable Skills.
-3. **Multi-role production runtime:** move task/event state to PostgreSQL, queue work through Redis or a durable queue, run multiple isolated Workers, add per-user authorization, sandboxing, rate limits, quotas, and centralized tracing.
-
-## 8. Current scope and trade-offs
-
-This is a local, single-worker MVP, not a multi-tenant production service. SQLite and a local workspace keep setup small and make the recovery path easy to inspect. Search uses Tavily and webpage text extraction uses HTTP + BeautifulSoup rather than a headless browser. The agent has no shell execution capability. The system intentionally avoids multi-agent delegation so that the core single-agent execution and recovery behavior can be validated first.
+Single machine, one active Worker, SQLite, Tavily search and HTTP/BeautifulSoup extraction. Cancellation is cooperative and cannot interrupt a blocking provider call mid-request. The UI reports observable model output and decisions, not hidden chain-of-thought.

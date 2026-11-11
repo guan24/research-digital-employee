@@ -34,6 +34,7 @@ class TaskEventCallback(BaseCallbackHandler):
         self.max_runtime_seconds = max_runtime_seconds
         self.worker_id = worker_id
         self._llm_started: dict[str, float] = {}
+        self._tool_started: dict[str, float] = {}
 
     def _check_control(self) -> None:
         if self.worker_id and not self.db.owns_worker_lease(self.worker_id):
@@ -48,16 +49,33 @@ class TaskEventCallback(BaseCallbackHandler):
         if flags["pause_requested"] or flags["status"] == "paused":
             raise TaskPaused("task pause requested")
 
-    def _on_model_start(self, serialized, run_id):
+    def _on_model_start(self, serialized, run_id, input_summary="", raw_request=None):
         self._check_control()
         self._llm_started[str(run_id)] = time.monotonic()
-        self.db.add_event(self.task_id, "model_call_started", {"model": (serialized or {}).get("name")})
+        model_name = (serialized or {}).get("name") or str((serialized or {}).get("id", ["unknown"])[-1])
+        self.db.add_event(self.task_id, "model_call_started", {
+            "model": model_name,
+            "purpose": "research planning / evidence synthesis",
+            "input_summary": input_summary[:1200],
+            "raw_request": raw_request,
+        })
 
     def on_llm_start(self, serialized, prompts, *, run_id, **kwargs):
-        self._on_model_start(serialized, run_id)
+        self._on_model_start(serialized, run_id, "Text completion request",
+                             {"prompt": [str(item)[:20000] for item in (prompts or [])]})
 
     def on_chat_model_start(self, serialized, messages, *, run_id, **kwargs):
-        self._on_model_start(serialized, run_id)
+        request_messages = []
+        user_parts = []
+        for batch in messages or []:
+            for message in batch:
+                role = getattr(message, "type", "unknown")
+                content = getattr(message, "content", "")
+                request_messages.append({"role": role, "content": content})
+                if role in {"human", "user"}:
+                    user_parts.append(str(content))
+        self._on_model_start(serialized, run_id, " | ".join(user_parts)[-1200:],
+                             {"messages": request_messages})
 
     def on_llm_end(self, response, *, run_id, **kwargs):
         started = self._llm_started.pop(str(run_id), time.monotonic())
@@ -68,10 +86,15 @@ class TaskEventCallback(BaseCallbackHandler):
             usage = getattr(message, "usage_metadata", None) or getattr(message, "response_metadata", {}).get("token_usage", {}) or {}
         except Exception:
             pass
+        output = ""
+        try:
+            output = str(response.generations[0][0].message.content)
+        except Exception:
+            pass
         self.db.add_event(
-            self.task_id,
-            "model_call_completed",
-            {"duration_ms": int((time.monotonic() - started) * 1000), "usage": usage},
+            self.task_id, "model_call_completed",
+            {"duration_ms": int((time.monotonic() - started) * 1000),
+             "usage": usage, "decision_summary": output[:1200], "raw_response": output[:20000]},
         )
 
     def on_llm_error(self, error, *, run_id, **kwargs):
@@ -85,6 +108,7 @@ class TaskEventCallback(BaseCallbackHandler):
     def on_tool_start(self, serialized, input_str, *, run_id, **kwargs):
         self._check_control()
         tool_name = (serialized or {}).get("name", "unknown")
+        self._tool_started[str(run_id)] = time.monotonic()
         self.db.add_event(
             self.task_id,
             "tool_call_started",
@@ -92,17 +116,19 @@ class TaskEventCallback(BaseCallbackHandler):
         )
 
     def on_tool_end(self, output, *, run_id, **kwargs):
+        started = self._tool_started.pop(str(run_id), time.monotonic())
         self.db.add_event(
             self.task_id,
             "tool_call_completed",
-            {"output": str(output)[:2500], "run_id": str(run_id)},
+            {"output": str(output)[:20000], "duration_ms": int((time.monotonic() - started) * 1000), "run_id": str(run_id)},
         )
 
     def on_tool_error(self, error, *, run_id, **kwargs):
+        started = self._tool_started.pop(str(run_id), time.monotonic())
         self.db.add_event(
             self.task_id,
             "tool_call_failed",
-            {"error": str(error)[:2000], "run_id": str(run_id)},
+            {"error": str(error)[:4000], "duration_ms": int((time.monotonic() - started) * 1000), "run_id": str(run_id)},
         )
 
 
@@ -174,6 +200,7 @@ class ResearchExecutor:
             "callbacks": [callback],
         }
         self.db.add_event(task_id, "agent_execution_started", {"thread_id": task_id})
+        self.db.add_event(task_id, "agent_plan_started", {"goal": task["goal"], "note": "Agent-generated plan and plan revisions are observable in subsequent model outputs and artifact saves."})
 
         with self.checkpointer_factory(self.settings.checkpoint_path) as checkpointer:
             agent = self._build_agent(task, checkpointer, started)

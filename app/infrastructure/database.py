@@ -10,7 +10,7 @@ from typing import Any, Iterator
 from datetime import datetime, timezone
 
 
-TASK_STATUSES = {"queued", "running", "retry_wait", "paused", "completed", "failed", "cancelled"}
+TASK_STATUSES = {"queued", "running", "retry_wait", "paused", "completed", "failed", "cancelled", "deleting"}
 
 
 def utc_now() -> str:
@@ -158,12 +158,25 @@ class Database:
         }
 
     def add_event(self, task_id: str, event_type: str, payload: dict[str, Any] | None = None) -> None:
-        safe_payload = json.dumps(payload or {}, ensure_ascii=False, default=str)
+        from app.infrastructure.redaction import redact_value\n        safe_payload = json.dumps(redact_value(payload or {}), ensure_ascii=False, default=str)
         with closing(self.connect()) as conn:
             conn.execute(
                 "INSERT INTO events(task_id, timestamp, event_type, payload_json) VALUES (?, ?, ?, ?)",
                 (task_id, utc_now(), event_type, safe_payload),
             )
+
+    def get_events_after(self, task_id: str, after_id: int = 0, limit: int = 500) -> list[dict[str, Any]]:
+        with closing(self.connect()) as conn:
+            rows = conn.execute(
+                "SELECT * FROM events WHERE task_id=? AND event_id>? ORDER BY event_id ASC LIMIT ?",
+                (task_id, after_id, limit),
+            ).fetchall()
+        result = []
+        for row in rows:
+            item = dict(row)
+            item["payload"] = json.loads(item.pop("payload_json"))
+            result.append(item)
+        return result
 
     def get_events(self, task_id: str, limit: int = 500) -> list[dict[str, Any]]:
         with closing(self.connect()) as conn:
@@ -177,6 +190,39 @@ class Database:
             item["payload"] = json.loads(item.pop("payload_json"))
             result.append(item)
         return result
+
+    def begin_delete(self, task_id: str) -> dict[str, Any] | None:
+        with self.transaction() as conn:
+            row = conn.execute("SELECT * FROM tasks WHERE task_id=?", (task_id,)).fetchone()
+            if row is None:
+                return None
+            if row["status"] != "deleting":
+                conn.execute(
+                    """UPDATE tasks SET status='deleting', cancel_requested=?,
+                       worker_id=CASE WHEN status='running' THEN worker_id ELSE NULL END,
+                       heartbeat_at=CASE WHEN status='running' THEN heartbeat_at ELSE NULL END,
+                       updated_at=? WHERE task_id=?""",
+                    (1 if row["status"] == "running" else 0, utc_now(), task_id),
+                )
+            return dict(conn.execute("SELECT * FROM tasks WHERE task_id=?", (task_id,)).fetchone())
+
+    def abort_delete(self, task_id: str) -> None:
+        with self.transaction() as conn:
+            conn.execute(
+                """UPDATE tasks SET status=CASE WHEN worker_id IS NULL THEN 'cancelled' ELSE 'running' END,
+                   cancel_requested=0, updated_at=? WHERE task_id=? AND status='deleting'""",
+                (utc_now(), task_id),
+            )
+
+    def delete_task_record(self, task_id: str) -> bool:
+        with self.transaction() as conn:
+            row = conn.execute("SELECT status, worker_id FROM tasks WHERE task_id=?", (task_id,)).fetchone()
+            if row is None:
+                return False
+            if row["status"] != "deleting" or row["worker_id"] is not None:
+                raise RuntimeError("worker has not stopped; refusing deletion")
+            conn.execute("DELETE FROM tasks WHERE task_id=?", (task_id,))
+            return True
 
     def claim_next_task(self, worker_id: str) -> dict[str, Any] | None:
         now = time.time()
@@ -267,19 +313,22 @@ class Database:
         return cur.rowcount == 1
 
     def mark_cancelled(self, task_id: str, worker_id: str | None = None) -> bool:
-        with closing(self.connect()) as conn:
+        with self.transaction() as conn:
             if worker_id is None:
                 cur = conn.execute(
-                    "UPDATE tasks SET status='cancelled', cancel_requested=0, worker_id=NULL, heartbeat_at=NULL, updated_at=? WHERE task_id=?",
+                    "UPDATE tasks SET status=CASE WHEN status='deleting' THEN 'deleting' ELSE 'cancelled' END, cancel_requested=0, worker_id=NULL, heartbeat_at=NULL, updated_at=? WHERE task_id=?",
                     (utc_now(), task_id),
                 )
             else:
                 cur = conn.execute(
-                    "UPDATE tasks SET status='cancelled', cancel_requested=0, worker_id=NULL, heartbeat_at=NULL, updated_at=? WHERE task_id=? AND worker_id=? AND status='running'",
+                    "UPDATE tasks SET status=CASE WHEN status='deleting' THEN 'deleting' ELSE 'cancelled' END, cancel_requested=0, worker_id=NULL, heartbeat_at=NULL, updated_at=? WHERE task_id=? AND worker_id=? AND status IN ('running','deleting')",
                     (utc_now(), task_id, worker_id),
                 )
-        if cur.rowcount:
-            self.add_event(task_id, "task_cancelled", {})
+            if cur.rowcount:
+                conn.execute(
+                    "INSERT INTO events(task_id,timestamp,event_type,payload_json) VALUES(?,?,?,?)",
+                    (task_id, utc_now(), "task_cancelled", "{}"),
+                )
         return cur.rowcount == 1
 
     def schedule_retry(self, task: dict[str, Any], error: str, delay_seconds: int, worker_id: str | None = None) -> str:

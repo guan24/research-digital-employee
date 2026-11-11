@@ -1,9 +1,14 @@
 from __future__ import annotations
 
 from pathlib import Path
+import asyncio
+import json
+import shutil
+import sqlite3
+import time
 
 from fastapi import APIRouter, HTTPException, Request
-from fastapi.responses import PlainTextResponse
+from fastapi.responses import PlainTextResponse, StreamingResponse
 
 from app.infrastructure.artifact_store import ArtifactError, ArtifactStore
 from app.schemas.task import EventOut, TaskCreate, TaskOut, TaskRetry, TaskRetryOut
@@ -92,6 +97,74 @@ def retry_task(task_id: str, body: TaskRetry, request: Request):
             "when one is available."
         ),
     }
+
+
+@router.get("/tasks/{task_id}/events/stream")
+async def stream_events(task_id: str, request: Request, after_id: int = 0):
+    db = _db(request)
+    if not db.get_task(task_id):
+        raise HTTPException(status_code=404, detail="task not found")
+
+    async def generate():
+        try:
+            cursor = max(after_id, int(request.headers.get("last-event-id", "0") or 0))
+        except ValueError:
+            cursor = max(after_id, 0)
+        while not await request.is_disconnected():
+            if not db.get_task(task_id):
+                yield "event: task_deleted\\ndata: {}\\n\\n"
+                return
+            batch = db.get_events_after(task_id, cursor, 100)
+            for event in batch:
+                cursor = event["event_id"]
+                yield f"id: {cursor}\\nevent: task_event\\ndata: {json.dumps(event, ensure_ascii=False)}\\n\\n"
+            if not batch:
+                yield ": keep-alive\\n\\n"
+                await asyncio.sleep(1)
+
+    return StreamingResponse(generate(), media_type="text/event-stream",
+        headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"})
+
+
+@router.delete("/tasks/{task_id}")
+def delete_task(task_id: str, request: Request):
+    db = _db(request)
+    settings = _settings(request)
+    task = db.begin_delete(task_id)
+    if task is None:
+        raise HTTPException(status_code=404, detail="task not found")
+
+    deadline = time.monotonic() + (60 if task.get("worker_id") else 0)
+    while task.get("worker_id") is not None and time.monotonic() < deadline:
+        time.sleep(0.25)
+        task = db.get_task(task_id)
+        if task is None:
+            return {"task_id": task_id, "deleted": True}
+    if task.get("worker_id") is not None:
+        db.abort_delete(task_id)
+        raise HTTPException(status_code=409, detail="Worker did not confirm stop within 60 seconds. Task data was preserved.")
+
+    checkpoint_path = settings.checkpoint_path
+    if checkpoint_path.exists():
+        with sqlite3.connect(checkpoint_path, timeout=30) as conn:
+            tables = conn.execute("SELECT name FROM sqlite_master WHERE type='table'").fetchall()
+            for (table_name,) in tables:
+                columns = {row[1] for row in conn.execute(f'PRAGMA table_info("{table_name}")')}
+                if "thread_id" in columns:
+                    conn.execute(f'DELETE FROM "{table_name}" WHERE thread_id=?', (task_id,))
+            conn.commit()
+
+    workspace = (settings.workspace_dir / task_id).resolve()
+    if settings.workspace_dir.resolve() not in workspace.parents:
+        db.abort_delete(task_id)
+        raise HTTPException(status_code=400, detail="invalid task workspace path")
+    try:
+        if workspace.exists():
+            shutil.rmtree(workspace)
+        db.delete_task_record(task_id)
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=f"Task cleanup failed; task retained: {exc}")
+    return {"task_id": task_id, "deleted": True}
 
 
 @router.post("/tasks/{task_id}/pause")

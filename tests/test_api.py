@@ -1,5 +1,9 @@
 from __future__ import annotations
 
+import sqlite3
+import threading
+import time
+
 from fastapi.testclient import TestClient
 
 from app.api.main import app
@@ -128,3 +132,27 @@ def test_console_root_serves_frontend_and_static_assets(tmp_path, monkeypatch):
         assert script.status_code == 200
         assert "checkpoint_resume" in script.text
         assert stylesheet.status_code == 200
+
+
+def test_delete_running_task_waits_for_worker_stop_confirmation(tmp_path, monkeypatch):
+    monkeypatch.setenv("APP_HOME", str(tmp_path))
+    monkeypatch.setenv("DATA_DIR", str(tmp_path / "data"))
+    monkeypatch.setenv("WORKSPACE_DIR", str(tmp_path / "workspaces"))
+    with TestClient(app) as client:
+        created = client.post("/tasks", json={"goal": "Research a sufficiently detailed topic"})
+        task_id = created.json()["task_id"]
+        db = client.app.state.db
+        claimed = db.claim_next_task("worker-delete-test")
+        assert claimed["task_id"] == task_id
+
+        def stop_worker():
+            time.sleep(0.15)
+            assert db.mark_cancelled(task_id, "worker-delete-test")
+
+        thread = threading.Thread(target=stop_worker)
+        thread.start()
+        response = client.delete(f"/tasks/{task_id}")
+        thread.join(timeout=2)
+        assert response.status_code == 200
+        assert response.json()["deleted"] is True
+        assert db.get_task(task_id) is None
