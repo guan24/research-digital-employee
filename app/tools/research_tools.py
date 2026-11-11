@@ -48,6 +48,10 @@ class TaskDeadlineExceeded(TaskControlSignal):
     pass
 
 
+class TaskStepLimitExceeded(TaskControlSignal):
+    pass
+
+
 class WorkerLeaseLost(TaskControlSignal):
     pass
 
@@ -68,8 +72,11 @@ class ResearchToolService:
         self.started_monotonic = started_monotonic
 
     def check_control(self) -> None:
-        if time.monotonic() - self.started_monotonic > self._task_runtime_limit():
-            raise TaskDeadlineExceeded("task exceeded max_runtime_seconds")
+        task = self.db.get_task(self.task_id)
+        used = float((task or {}).get("runtime_seconds_used", 0) or 0)
+        accounted_at = (task or {}).get("runtime_last_accounted_at") or (task or {}).get("heartbeat_at") or time.time()
+        if used + max(0.0, time.time() - float(accounted_at)) >= self._task_runtime_limit():
+            raise TaskDeadlineExceeded("task exceeded cumulative max_runtime_seconds")
         flags = self.db.get_control_flags(self.task_id)
         if not flags:
             raise TaskCancelled("task record no longer exists")
@@ -346,9 +353,9 @@ class ResearchToolService:
                     main = (
                         soup.find("main") or soup.find("article") or soup.body or soup
                     )
-                    text = "\\n".join(
+                    text = "\n".join(
                         line.strip()
-                        for line in main.get_text("\\n").splitlines()
+                        for line in main.get_text("\n").splitlines()
                         if line.strip()
                     )
                 else:
@@ -367,7 +374,7 @@ class ResearchToolService:
 
                 digest = hashlib.sha256(final_url.encode("utf-8")).hexdigest()[:12]
                 content = (
-                    f"# {title or final_url}\\n\\nSource: {final_url}\\n\\n{text}\\n"
+                    f"# {title or final_url}\n\nSource: {final_url}\n\n{text}\n"
                 )
                 artifact_path = self.artifacts.write_text(
                     f"sources/page_{digest}.md",
@@ -462,6 +469,51 @@ class ResearchToolService:
             max_attempts,
             failed_url,
         )
+
+    def fetch_pdf(self, url: str) -> str:
+        """Download and extract a public PDF into the task evidence workspace."""
+        self.check_control()
+        from io import BytesIO
+        from pypdf import PdfReader
+
+        requested = url.strip()
+        self._assert_public_url(requested)
+        try:
+            with httpx.Client(timeout=self.settings.fetch_timeout_seconds, follow_redirects=False) as client:
+                response = client.get(requested)
+                response.raise_for_status()
+                if len(response.content) > self.settings.max_fetch_bytes:
+                    raise ValueError("PDF exceeds MAX_FETCH_BYTES")
+                content_type = response.headers.get("content-type", "").lower()
+                if "pdf" not in content_type and not response.content.startswith(b"%PDF"):
+                    raise ValueError("URL did not return a PDF document")
+            reader = PdfReader(BytesIO(response.content))
+            pages = []
+            for index, page in enumerate(reader.pages):
+                self.check_control()
+                text = (page.extract_text() or "").strip()
+                if text:
+                    pages.append(f"## Page {index + 1}\n\n{text}")
+            extracted = "\n\n".join(pages)
+            if len(extracted) < 80:
+                raise ValueError("PDF contains insufficient extractable text; OCR may be required")
+            digest = hashlib.sha256(requested.encode("utf-8")).hexdigest()[:12]
+            path = self.artifacts.write_text(
+                f"sources/pdf_{digest}.md",
+                f"# PDF source\n\nSource: {requested}\n\n{extracted[:60000]}\n",
+            )
+            self.db.add_event(self.task_id, "research_pdf_fetched", {
+                "url": requested, "pages": len(reader.pages), "characters": len(extracted), "artifact": path
+            })
+            return json.dumps({"success": True, "url": requested, "pages": len(reader.pages),
+                               "characters": len(extracted), "saved_to": path}, ensure_ascii=False)
+        except TaskControlSignal:
+            raise
+        except Exception as exc:
+            self.db.add_event(self.task_id, "research_pdf_fetch_failed", {
+                "url": requested, "error_type": type(exc).__name__, "error": str(exc)[:1000]
+            })
+            return json.dumps({"success": False, "url": requested, "error": str(exc)[:1000]}, ensure_ascii=False)
 
     def save_artifact(self, path: str, content: str) -> str:
         self.check_control()
@@ -1021,6 +1073,11 @@ class ResearchToolService:
             """Read a public webpage and save its main text as Markdown. Returns structured JSON; transient network failures are retried and reported without aborting the whole agent tool batch."""
             return self.fetch_url(url)
 
+        @tool("fetch_pdf")
+        def fetch_pdf_tool(url: str) -> str:
+            """Download a public PDF, extract its text by page, and save it as task evidence."""
+            return self.fetch_pdf(url)
+
         @tool("save_artifact")
         def save_artifact_tool(path: str, content: str) -> str:
             """Persist research notes, plans, evidence tables or report files in the task workspace. Use relative paths ending in .md, .txt, .json, .csv or .yaml."""
@@ -1041,6 +1098,7 @@ class ResearchToolService:
             update_plan_step_status_tool,
             web_search_tool,
             fetch_url_tool,
+            fetch_pdf_tool,
             save_artifact_tool,
             read_artifact_tool,
             list_artifacts_tool,

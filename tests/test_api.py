@@ -179,3 +179,15 @@ def test_delete_running_task_waits_for_worker_stop_confirmation(tmp_path, monkey
         assert response.status_code == 200
         assert response.json()["deleted"] is True
         assert db.get_task(task_id) is None
+
+
+def test_task_api_rejects_unregistered_agent_type(tmp_path, monkeypatch):
+    monkeypatch.setenv("APP_HOME", str(tmp_path))
+    monkeypatch.setenv("DATA_DIR", str(tmp_path / "data"))
+    monkeypatch.setenv("WORKSPACE_DIR", str(tmp_path / "workspaces"))
+    with TestClient(app) as client:
+        response = client.post("/tasks", json={
+            "goal": "Research the architecture of autonomous coding agents",
+            "agent_type": "unknown-role",
+        })
+        assert response.status_code == 422

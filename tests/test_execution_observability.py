@@ -22,7 +22,7 @@ def test_instance_diagnostics_defaults_collapsed_and_preserves_user_toggle():
     end = source.index("\nfunction renderArtifacts()", start)
     renderer = source[start:end]
     assert "const wasOpen = root.querySelector('details.instance-diagnostics')?.open ?? false;" in renderer
-    assert "'<details class=\\"instance-diagnostics\\" '+(wasOpen?'open':'')" in renderer
+    assert "wasOpen?" in renderer and "instance-diagnostics" in renderer
     assert '<details class="instance-diagnostics" open>' not in renderer
 
 

@@ -107,3 +107,38 @@ def test_manual_retry_is_idempotently_rejected_after_first_requeue(db):
         event["event_type"] == "task_manually_requeued"
         for event in db.get_events(task["task_id"])
     ) == 1
+
+
+def test_runtime_budget_is_accounted_across_heartbeats_and_retries(db):
+    task = db.create_task("Research a topic with enough detail", max_runtime_seconds=60)
+    claimed = db.claim_next_task("worker-a")
+    with sqlite3.connect(db.path) as conn:
+        conn.execute(
+            "UPDATE tasks SET runtime_last_accounted_at=?, heartbeat_at=? WHERE task_id=?",
+            (time.time() - 7, time.time() - 7, task["task_id"]),
+        )
+    assert db.heartbeat(task["task_id"], "worker-a") is True
+    current = db.get_task(task["task_id"])
+    assert 6.0 <= current["runtime_seconds_used"] < 10.0
+    assert db.schedule_retry(current, "temporary model error", 0, "worker-a") == "retry_wait"
+    after_retry = db.get_task(task["task_id"])
+    assert after_retry["runtime_seconds_used"] >= current["runtime_seconds_used"]
+    assert after_retry["runtime_last_accounted_at"] is None
+
+
+def test_execution_step_budget_is_atomic_and_never_exceeds_limit(db):
+    task = db.create_task("Research a topic with enough detail", max_steps=2)
+    db.claim_next_task("worker-a")
+    assert db.consume_execution_step(task["task_id"], "worker-a") == 1
+    assert db.consume_execution_step(task["task_id"], "worker-a") == 2
+    assert db.consume_execution_step(task["task_id"], "worker-a") is None
+    assert db.get_task(task["task_id"])["execution_steps"] == 2
+
+
+def test_agent_type_and_step_counter_are_persisted(db):
+    task = db.create_task("Research a topic with enough detail", agent_type="research", max_steps=1)
+    assert task["agent_type"] == "research"
+    claimed = db.claim_next_task("worker-a")
+    assert db.consume_execution_step(task["task_id"], "worker-a") == 1
+    assert db.consume_execution_step(task["task_id"], "worker-a") is None
+    assert db.get_task(task["task_id"])["execution_steps"] == 1

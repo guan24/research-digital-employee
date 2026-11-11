@@ -16,7 +16,10 @@ def fake_checkpointer(_path):
 class FakeAgent:
     def __init__(self, snapshot=None, result=None):
         self.snapshot = snapshot
-        self.result = result or {"messages": [{"role": "assistant", "content": "# Research report\n\nEvidence-backed result."}]}
+        self.result = result or {"messages": [{"role": "assistant", "content": (
+            "# Research report\n\n## 摘要\n\n" + ("Evidence-backed result and analysis. " * 12)
+            + "\n\n## Sources\n- https://example.org/research-source"
+        )}]}
         self.invocations = []
         self.configs = []
 
@@ -62,7 +65,10 @@ def test_executor_recovers_completed_checkpoint_without_reinvoking(settings, db)
     task = db.claim_next_task("worker-a")
     snapshot = SimpleNamespace(
         next=(),
-        values={"messages": [{"role": "assistant", "content": "# Already completed\n\nSaved from checkpoint."}]},
+        values={"messages": [{"role": "assistant", "content": (
+                "# Already completed\n\n## 摘要\n\n" + ("Saved from checkpoint evidence. " * 12)
+                + "\n\n## Sources\n- https://example.org/checkpoint-source"
+            )}]},
     )
     agent = FakeAgent(snapshot=snapshot)
     runner = _make_runner(settings, db, agent)
@@ -95,3 +101,45 @@ def test_manual_retry_resumes_original_checkpoint_thread_id(settings, db):
         event["event_type"] == "checkpoint_resume"
         for event in db.get_events(task["task_id"])
     )
+
+
+def test_real_sqlite_checkpoint_resumes_after_interrupted_node(tmp_path):
+    from typing import TypedDict
+    from langgraph.graph import END, START, StateGraph
+    from app.runtime.executor import sqlite_checkpointer
+
+    class State(TypedDict):
+        completed: int
+        final: str
+
+    calls = {"completed_node": 0, "interrupted_node": 0}
+    def completed_node(state):
+        calls["completed_node"] += 1
+        return {"completed": state["completed"] + 1}
+    def interrupted_node(state):
+        calls["interrupted_node"] += 1
+        if calls["interrupted_node"] == 1:
+            raise RuntimeError("simulated provider interruption")
+        return {"final": "resumed"}
+
+    graph = StateGraph(State)
+    graph.add_node("completed_node", completed_node)
+    graph.add_node("interrupted_node", interrupted_node)
+    graph.add_edge(START, "completed_node")
+    graph.add_edge("completed_node", "interrupted_node")
+    graph.add_edge("interrupted_node", END)
+    config = {"configurable": {"thread_id": "integration-resume"}}
+    with sqlite_checkpointer(tmp_path / "real-checkpoint.sqlite") as saver:
+        app = graph.compile(checkpointer=saver)
+        try:
+            app.invoke({"completed": 0, "final": ""}, config=config)
+        except RuntimeError as exc:
+            assert "simulated provider interruption" in str(exc)
+        else:
+            raise AssertionError("first invocation must be interrupted")
+        snapshot = app.get_state(config)
+        assert snapshot.values["completed"] == 1
+        assert snapshot.next == ("interrupted_node",)
+        result = app.invoke(None, config=config)
+        assert result["final"] == "resumed"
+    assert calls == {"completed_node": 1, "interrupted_node": 2}

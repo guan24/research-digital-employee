@@ -69,3 +69,12 @@ Markdown has rendered and raw-source modes. JSON is intentionally shown as origi
 Strategic plan versions and step execution progress are separate event streams. \`research_plan_updated\` stores strategy; \`research_plan_step_status\` stores per-step transitions (\`pending\`, \`in_progress\`, \`completed\`, \`skipped\`, \`failed\`). Unchanged step IDs retain progress after a replan; added or materially modified steps reset to pending. On terminal task failure, still-in-progress steps are marked failed with the task error. The final archive stores both the strategy-only plan and a final plan snapshot with progress.
 
 Task details expose Worker ID, heartbeat, next retry time, checkpoint-resume mode and pause/cancel flags. The console derives model/tool counts, attempt history, recovery events and recent diagnostics from the event journal. The task-detail loader independently loads task metadata, events and artifacts so one failed endpoint does not blank the other panels; a load-generation token prevents stale requests from overwriting the current selection.
+
+
+## Runtime budgets, report validation and role registry
+
+Task runtime is cumulative across retries. SQLite stores `runtime_seconds_used` and `runtime_last_accounted_at`; worker heartbeats and stale-worker recovery settle elapsed wall time. Claiming a retry does not reset the accumulated value. `max_steps` is the strict task-wide tool-call budget enforced by an atomic SQL update before each tool starts. LangGraph recursion_limit remains a separate graph-loop guard.
+
+The report validator is a deterministic structural/evidence gate, not a factuality oracle. It checks minimum body length, a Markdown title, a source section and at least one URL. Failed validation is recorded and fed back to the Agent for at most two bounded revisions; exhaustion fails the task and preserves the report and validation events for review.
+
+Agent builders are registered by `agent_type`. Shared task lifecycle, budgets, Worker, checkpoint, event journal and artifact storage remain in the runtime. Role packages own prompts, model/tool policy and output conventions. The MVP registers only `research`; additional roles can be added without changing the executor dispatch contract.

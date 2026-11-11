@@ -40,8 +40,14 @@ def system_overview(request: Request):
 @router.post("/tasks", response_model=TaskOut, status_code=202)
 def create_task(body: TaskCreate, request: Request):
     settings = _settings(request)
+    from app.agents.registry import get_agent_builder
+    try:
+        get_agent_builder(body.agent_type)
+    except ValueError as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
     task = _db(request).create_task(
         goal=body.goal,
+        agent_type=body.agent_type,
         max_attempts=body.max_attempts,
         max_steps=body.max_steps,
         max_runtime_seconds=body.max_runtime_seconds,

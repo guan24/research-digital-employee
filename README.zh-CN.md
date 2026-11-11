@@ -101,3 +101,13 @@ Markdown 支持渲染和源码两种模式。JSON 仅展示原始文本，不做
 ## MVP 边界
 
 当前是单机单 Worker MVP。SQLite 不适用于多主机高并发场景。取消采用协作式机制，正在进行的模型或网络请求可能需要运行到下一个控制点。系统不采集或展示隐藏的模型思维链，只记录模型生成的可观察输出和决策。
+
+
+## 可靠性与质量控制
+
+- `max_runtime_seconds` 是跨 Worker 重试累计的任务运行预算；Worker 心跳将已运行时间结算到 SQLite，暂停和重试不会重置预算。
+- `max_steps` 定义为任务生命周期内允许的工具调用次数，由 SQLite 原子计数保证；LangGraph recursion limit 仅作为图循环的第二道保护。
+- Agent 最终报告由独立 ReportValidator 检查 Markdown 标题、最低内容长度、来源章节和可核验 URL；失败时最多反馈 Agent 修订两轮，仍不合格则任务失败并保留诊断事件。
+- 支持公开 PDF 文本提取，扫描版 PDF 需要 OCR 时会明确报告无法提取，不会伪造正文。
+- Worker 在已有租约时等待租约释放或过期，再尝试接管。
+- Agent 通过 `agent_type` 注册表构建；当前默认并内置 `research`，新岗位提供独立 builder、提示词与工具集后可注册。

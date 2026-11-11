@@ -11,7 +11,7 @@ from pathlib import Path
 from app.config import Settings
 from app.infrastructure.database import Database
 from app.runtime.executor import ResearchExecutor
-from app.tools.research_tools import TaskCancelled, TaskDeadlineExceeded, TaskPaused, WorkerLeaseLost
+from app.tools.research_tools import TaskCancelled, TaskDeadlineExceeded, TaskPaused, TaskStepLimitExceeded, WorkerLeaseLost
 
 logging.basicConfig(
     level=logging.INFO,
@@ -66,10 +66,9 @@ class Worker:
             self._finalize_plan_if_terminal(task["task_id"])
         except WorkerLeaseLost as exc:
             self.db.add_event(task["task_id"], "worker_lease_lost", {"error": str(exc)})
-        except TaskDeadlineExceeded as exc:
-            outcome = self.db.schedule_retry(task, f"TaskDeadlineExceeded: {exc}", self._retry_delay(task), self.worker_id)
-            if outcome == "failed":
-                self._finalize_plan_if_terminal(task["task_id"])
+        except (TaskDeadlineExceeded, TaskStepLimitExceeded) as exc:
+            self.db.mark_failed(task["task_id"], f"{type(exc).__name__}: {exc}", self.worker_id)
+            self._finalize_plan_if_terminal(task["task_id"])
         except Exception as exc:
             logger.exception("task %s failed", task["task_id"])
             self.db.add_event(task["task_id"], "execution_exception", {"error_type": type(exc).__name__, "error": str(exc)[:3000]})
@@ -101,8 +100,12 @@ class Worker:
         return min(self.settings.retry_base_seconds * (2 ** (attempt - 1)), self.settings.retry_max_seconds)
 
     def run_once(self) -> bool:
-        if not self.db.acquire_worker_lease(self.worker_id, self.settings.worker_lease_seconds):
-            raise RuntimeError("another worker owns the single-worker lease")
+        while not self._stop.is_set():
+            if self.db.acquire_worker_lease(self.worker_id, self.settings.worker_lease_seconds):
+                break
+            self._stop.wait(self.settings.worker_poll_seconds)
+        if self._stop.is_set():
+            return False
         self._heartbeat_stop.clear()
         heartbeat = threading.Thread(target=self._heartbeat_loop, name="worker-heartbeat", daemon=True)
         heartbeat.start()
@@ -119,8 +122,11 @@ class Worker:
             self.db.release_worker_lease(self.worker_id)
 
     def run_forever(self) -> None:
-        if not self.db.acquire_worker_lease(self.worker_id, self.settings.worker_lease_seconds):
-            raise RuntimeError("another worker owns the single-worker lease")
+        while not self._stop.is_set() and not self.db.acquire_worker_lease(self.worker_id, self.settings.worker_lease_seconds):
+            logger.info("worker lease held by another process; waiting for lease expiry")
+            self._stop.wait(self.settings.worker_poll_seconds)
+        if self._stop.is_set():
+            return
         heartbeat = threading.Thread(target=self._heartbeat_loop, name="worker-heartbeat", daemon=True)
         heartbeat.start()
         logger.info("worker started: %s", self.worker_id)

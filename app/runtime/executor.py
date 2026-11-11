@@ -11,7 +11,7 @@ from typing import Any, Callable, Iterator
 from app.config import Settings
 from app.infrastructure.artifact_store import ArtifactStore
 from app.infrastructure.database import Database
-from app.tools.research_tools import ResearchToolService, TaskCancelled, TaskDeadlineExceeded, TaskPaused, WorkerLeaseLost
+from app.tools.research_tools import ResearchToolService, TaskCancelled, TaskDeadlineExceeded, TaskPaused, TaskStepLimitExceeded, WorkerLeaseLost
 
 logger = logging.getLogger(__name__)
 
@@ -145,8 +145,11 @@ class TaskEventCallback(BaseCallbackHandler):
     def _check_control(self) -> None:
         if self.worker_id and not self.db.owns_worker_lease(self.worker_id):
             raise WorkerLeaseLost("worker singleton lease was lost")
-        if time.monotonic() - self.started_monotonic > self.max_runtime_seconds:
-            raise TaskDeadlineExceeded("task exceeded max_runtime_seconds")
+        task = self.db.get_task(self.task_id)
+        used = float((task or {}).get("runtime_seconds_used", 0) or 0)
+        accounted_at = (task or {}).get("runtime_last_accounted_at") or (task or {}).get("heartbeat_at") or time.time()
+        if used + max(0.0, time.time() - float(accounted_at)) >= self.max_runtime_seconds:
+            raise TaskDeadlineExceeded("task exceeded cumulative max_runtime_seconds")
         flags = self.db.get_control_flags(self.task_id)
         if not flags:
             raise TaskCancelled("task record no longer exists")
@@ -211,6 +214,9 @@ class TaskEventCallback(BaseCallbackHandler):
 
     def on_tool_start(self, serialized, input_str, *, run_id, **kwargs):
         self._check_control()
+        step = self.db.consume_execution_step(self.task_id, self.worker_id)
+        if step is None:
+            raise TaskStepLimitExceeded("task exceeded max_steps tool-call budget")
         tool_name = (serialized or {}).get("name", "unknown")
         self._tool_started[str(run_id)] = time.monotonic()
         self._tool_names[str(run_id)] = tool_name
@@ -334,15 +340,18 @@ class ResearchExecutor:
     def _build_agent(self, task: dict[str, Any], checkpointer: Any, started: float):
         if self.agent_builder:
             return self.agent_builder(self.settings, self.db, task, checkpointer, started)
-        from app.agents.research.agent import build_research_agent
+        from app.agents.registry import get_agent_builder
 
-        return build_research_agent(self.settings, self.db, task, checkpointer, started)
+        return get_agent_builder(task.get("agent_type", "research"))(
+            self.settings, self.db, task, checkpointer, started
+        )
 
     def run(self, task: dict[str, Any], worker_id: str | None = None) -> str:
         task_id = task["task_id"]
         started = time.monotonic()
         artifacts = ArtifactStore(self.settings.workspace_dir, task_id)
         callback = TaskEventCallback(self.db, task_id, started, int(task["max_runtime_seconds"]), worker_id)
+        callback._check_control()
         config = {
             "configurable": {"thread_id": task_id},
             "recursion_limit": max(30, int(task["max_steps"]) * 5),
@@ -377,4 +386,28 @@ class ResearchExecutor:
             self.db.add_event(task_id, "report_materialized_from_final_answer", {"path": report_path})
         else:
             self.db.add_event(task_id, "report_saved_by_agent", {"path": report_path})
+        from app.runtime.report_validator import ReportValidator, validation_feedback
+
+        validator = ReportValidator()
+        max_revisions = 2
+        for revision in range(max_revisions + 1):
+            report = artifacts.read_text(report_path)
+            validation = validator.validate(report, task.get("goal", ""))
+            self.db.add_event(task_id, "report_validation_completed", {
+                "valid": validation.valid,
+                "errors": list(validation.errors),
+                "source_count": validation.source_count,
+                "word_count": validation.word_count,
+                "revision": revision,
+            })
+            if validation.valid:
+                break
+            if revision >= max_revisions:
+                raise RuntimeError("report validation failed after bounded revisions: " + "; ".join(validation.errors))
+            feedback = validation_feedback(validation)
+            self.db.add_event(task_id, "report_revision_requested", {
+                "revision": revision + 1, "feedback": feedback[:3000]
+            })
+            agent.invoke({"messages": [{"role": "user", "content": feedback}]}, config=config)
+
         return str((artifacts.workspace / report_path).resolve())

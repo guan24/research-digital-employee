@@ -5,6 +5,7 @@ pydantic==2.13.5
 python-dotenv==1.2.2
 httpx==0.28.1
 beautifulsoup4==4.14.3
+pypdf==6.6.2
 
 # Agent stack
 langchain==1.4.10
