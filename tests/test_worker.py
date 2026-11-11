@@ -28,3 +28,11 @@ def test_worker_processes_one_task_and_releases_lease(settings, db):
 def test_worker_run_once_returns_false_when_queue_empty(settings, db):
     worker = Worker(settings, db, executor=FakeExecutor(settings))
     assert worker.run_once() is False
+
+
+def test_worker_waits_for_expired_single_worker_lease(settings, db):
+    task = db.create_task("Research a topic with enough detail")
+    assert db.acquire_worker_lease("stale-worker", 0.05) is True
+    worker = Worker(settings, db, executor=FakeExecutor(settings))
+    assert worker.run_once() is True
+    assert db.get_task(task["task_id"])["status"] == "completed"
