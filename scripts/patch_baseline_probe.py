@@ -7,6 +7,8 @@ import tempfile
 from pathlib import Path
 from types import SimpleNamespace
 
+sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+
 from app.config import Settings
 from app.infrastructure.database import Database
 from app.runtime.executor import TaskEventCallback
