@@ -165,3 +165,28 @@ def test_worker_generation_increments_on_reclaim(db):
     db.schedule_retry(first, "transient", 0, "worker-a")
     second = db.claim_next_task("worker-b")
     assert second["worker_generation"] == 2
+
+
+def test_token_reservation_settlement_and_release_are_idempotent(db):
+    task = db.create_task("Research a sufficiently detailed topic", max_total_tokens=5000)
+    claimed = db.claim_next_task("worker-a")
+    reserved = db.reserve_tokens(task["task_id"], "call-1", 3000, "worker-a", claimed["worker_generation"])
+    assert reserved["allowed"] and reserved["reserved"] == 3000
+    assert db.get_task(task["task_id"])["reserved_tokens"] == 3000
+    assert db.settle_token_reservation(task["task_id"], "call-1", 1200, "worker-a", claimed["worker_generation"]) == 1200
+    assert db.settle_token_reservation(task["task_id"], "call-1", 1200, "worker-a", claimed["worker_generation"]) == 0
+    assert db.get_task(task["task_id"])["total_tokens_used"] == 1200
+    assert db.get_task(task["task_id"])["reserved_tokens"] == 0
+    assert db.reserve_tokens(task["task_id"], "call-2", 4000, "worker-a", claimed["worker_generation"])["allowed"] is False
+
+
+def test_error_history_preserves_first_root_cause(db):
+    import json
+    task = db.create_task("Research a sufficiently detailed topic")
+    db.record_classified_error(task["task_id"], "invalid API key", "terminal", "AUTH_FAILED", False, 1)
+    db.record_classified_error(task["task_id"], "second transient issue", "retryable", "UPSTREAM_TIMEOUT", True, 2)
+    current = db.get_task(task["task_id"])
+    history = json.loads(current["error_history_json"])
+    assert len(history) == 2
+    assert history[0]["error_code"] == "AUTH_FAILED"
+    assert json.loads(current["first_error_json"])["summary"] == "invalid API key"
