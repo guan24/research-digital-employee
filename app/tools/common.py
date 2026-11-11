@@ -14,7 +14,7 @@ except ImportError:
 
 from app.infrastructure.artifact_store import ArtifactStore
 from app.infrastructure.database import Database
-from app.runtime.control import TaskCancelled, TaskPaused, WorkerLeaseLost
+from app.runtime.control import TaskCancelled, TaskPaused, TaskDeadlineExceeded, WorkerLeaseLost
 
 
 class TaskToolService:
@@ -50,6 +50,14 @@ class TaskToolService:
             raise TaskCancelled("task cancellation requested")
         if flags["pause_requested"] or flags["status"] == "paused":
             raise TaskPaused("task pause requested")
+        budget = self.db.check_runtime_budget(
+            self.task_id, self.worker_id, self.worker_generation
+        )
+        if budget.get("exhausted"):
+            raise TaskDeadlineExceeded(
+                f"cumulative runtime budget exhausted: used={budget['used']:.2f}s "
+                f"limit={budget['limit']}s"
+            )
         self.db.emit_budget_alerts(self.task_id)
 
     def budget_tool_gate(self, tool_name: str) -> str | None:

@@ -118,11 +118,11 @@ Markdown 支持渲染和源码两种模式。JSON 仅展示原始文本，不做
 - **岗位注册表**：通过 `app/agents/registry.py` 注册岗位 Agent，定义岗位提示词、产物路径和质量门禁；API `GET /agents` 返回可用岗位。
 - **上下文压缩与长期记忆**：Deep Agents 的 `SummarizationMiddleware` 在上下文约 78% 时自动摘要并保留近期消息；LangGraph SQLite Checkpoint 负责运行状态恢复，任务工作区的 `notes/research_memory.md` 保存跨重启研究摘要。
 - **证据溯源**：成功读取的网页/PDF 自动写入 `evidence/registry.json` 和不可变内容快照，来源分配 `[S0001]` ID；Agent 可用 `record_finding` 将发现关联来源。报告质量门禁检查 URL、章节、来源 ID、快照和段落级引用覆盖率。
-- **任务预算强制执行**：工具调用步数与累计运行时长为硬上限，工具调用前由 SQLite 原子拦截；模型调用前预留输入估算量与输出额度，结束后按 Provider usage 结算，失败释放预留。达到 80% 告警、95% 禁止搜索/抓取并进入受限收敛、100% 要求利用已有材料完成交付。人工扩额采用叠加额度并保留已用量。API：`GET /tasks/{task_id}/budget`、`POST /tasks/{task_id}/budget/approve`。
+- **任务预算强制执行**：工具调用步数与累计运行时长是硬闸门，分别在工具调用前及模型/工具/控制回调边界检查；超时终止为终态失败，不进入自动重试。每次模型调用前预留 UTF-8 输入字节数启发式估算 + 2048 Token 输出上限 + 128 Token 固定开销，ChatOpenAI 同时设置 2048 Token 输出上限；成功后按 Provider usage 结算，异常时释放预留，重复回调幂等。预留不足时不发起模型请求，任务以 `TOKEN_BUDGET_EXHAUSTED` 终态失败。达到 80% 告警、95% 禁止搜索/抓取，但产物/证据/记忆工具仍可用。人工扩额叠加额度并从 Checkpoint 恢复。API：`GET /tasks/{task_id}/budget`、`POST /tasks/{task_id}/budget/approve`。
 - **可观测性**：`GET /tasks/{task_id}/evidence` 与 `GET /tasks/{task_id}/memory` 提供证据和记忆查看，控制台展示预算、证据数量和最新记忆。
 - **兼容性**：SQLite 使用增量迁移；既有任务、事件、Checkpoint 和工作区无需重建。
 
-Token 预留使用字符数启发式估算，结算以模型 Provider 返回的 usage metadata 为准；未提供 usage 时按 0 结算但会保留预留前置闸门。当前尚未接入金额成本界面。
+Token 预留采用保守的 UTF-8 字节数启发式估算，包含 2048 Token 输出上限和 128 Token 固定开销；结算以 Provider 返回的 usage metadata 为准，Provider 未提供 usage 时按 0 结算并释放剩余预留。研究岗位默认步数/运行时长/Token 配额唯一声明于 `app/agents/research/profile.toml`，API 创建任务直接使用该配置，显式任务参数优先。当前尚未接入金额成本界面。
 
 
 ## 岗位契约与错误策略

@@ -9,6 +9,7 @@ from app.config import Settings
 from app.infrastructure.artifact_store import ArtifactStore
 from app.infrastructure.database import Database
 from app.tools.research_tools import ResearchToolService
+from app.runtime.budget import MODEL_MAX_OUTPUT_TOKENS
 
 
 def build_research_agent(
@@ -50,6 +51,7 @@ def build_research_agent(
         temperature=0.1,
         timeout=settings.model_timeout_seconds,
         max_retries=1,
+        max_tokens=MODEL_MAX_OUTPUT_TOKENS,
     )
     backend = CompositeBackend(
         default=StateBackend(),

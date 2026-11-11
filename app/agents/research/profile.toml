@@ -1,7 +1,9 @@
 name = "research_agent"
 role = "Autonomous web research and report writing"
 output_format = "Markdown with inline source URLs and a Sources section"
-max_steps = 12
+max_steps = 30
 
 description = "自主检索、证据登记、长期记忆与研究报告"
 output_artifact = "report.md"
+max_runtime_seconds = 3600
+max_total_tokens = 100000

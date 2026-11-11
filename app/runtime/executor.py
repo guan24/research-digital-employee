@@ -13,7 +13,8 @@ from app.infrastructure.artifact_store import ArtifactStore
 from app.infrastructure.database import Database
 from app.infrastructure.evidence_registry import EvidenceRegistry
 from app.runtime.control import TaskPaused, TaskCancelled, TaskDeadlineExceeded, TaskStepLimitExceeded, WorkerLeaseLost
-from app.tools.research_tools import ResearchToolService, TaskCancelled, TaskDeadlineExceeded, TaskPaused, TaskStepLimitExceeded, WorkerLeaseLost
+from app.runtime.budget import estimate_model_call_reservation
+from app.runtime.errors import BudgetExhausted
 
 logger = logging.getLogger(__name__)
 
@@ -144,6 +145,7 @@ class TaskEventCallback(BaseCallbackHandler):
         self._llm_started: dict[str, float] = {}
         self._tool_started: dict[str, float] = {}
         self._tool_names: dict[str, str] = {}
+        self._token_reservations: set[str] = set()
 
     def _check_control(self) -> None:
         task = self.db.get_task(self.task_id)
@@ -163,9 +165,36 @@ class TaskEventCallback(BaseCallbackHandler):
             raise TaskCancelled("task cancellation requested")
         if flags["pause_requested"] or flags["status"] == "paused":
             raise TaskPaused("task pause requested")
+        budget = self.db.check_runtime_budget(
+            self.task_id, self.worker_id, self.worker_generation
+        )
+        if budget.get("exhausted"):
+            raise TaskDeadlineExceeded(
+                f"cumulative runtime budget exhausted: used={budget['used']:.2f}s "
+                f"limit={budget['limit']}s"
+            )
+
+    def _reserve_model_tokens(self, run_id, raw_request):
+        reservation_id = str(run_id)
+        if reservation_id in self._token_reservations:
+            return
+        estimate = estimate_model_call_reservation(raw_request)
+        result = self.db.reserve_tokens(
+            self.task_id, reservation_id, estimate,
+            self.worker_id, self.worker_generation,
+        )
+        if not result.get("allowed"):
+            raise BudgetExhausted(
+                "token budget exhausted before model call: "
+                f"requested={result.get('requested', estimate)}, "
+                f"used={result.get('used', 0)}, limit={result.get('limit', 0)}, "
+                f"remaining={result.get('remaining', 0)}"
+            )
+        self._token_reservations.add(reservation_id)
 
     def _on_model_start(self, serialized, run_id, input_summary="", raw_request=None):
         self._check_control()
+        self._reserve_model_tokens(run_id, raw_request if raw_request is not None else input_summary)
         self._llm_started[str(run_id)] = time.monotonic()
         model_name = (serialized or {}).get("name") or str((serialized or {}).get("id", ["unknown"])[-1])
         self.db.add_event(self.task_id, "model_call_started", {
@@ -178,7 +207,8 @@ class TaskEventCallback(BaseCallbackHandler):
 
     def on_llm_start(self, serialized, prompts, *, run_id, **kwargs):
         self._on_model_start(serialized, run_id, "Text completion request",
-                             {"prompt": [str(item)[:20000] for item in (prompts or [])]})
+                             {"prompt": [str(item)[:20000] for item in (prompts or [])],
+                              "callback_kwargs": kwargs})
 
     def on_chat_model_start(self, serialized, messages, *, run_id, **kwargs):
         request_messages = []
@@ -191,13 +221,25 @@ class TaskEventCallback(BaseCallbackHandler):
                 if role in {"human", "user"}:
                     user_parts.append(str(content))
         self._on_model_start(serialized, run_id, " | ".join(user_parts)[-1200:],
-                             {"messages": request_messages})
+                             {"messages": request_messages, "callback_kwargs": kwargs})
 
     def on_llm_end(self, response, *, run_id, **kwargs):
         started = self._llm_started.pop(str(run_id), time.monotonic())
         raw_response = _serialize_model_response(response)
         usage = _model_usage(response)
-        self.db.record_token_usage(self.task_id, usage, self.worker_id, self.worker_generation)
+        total_tokens = usage.get("total_tokens") or usage.get("totalTokens")
+        if total_tokens is None:
+            total_tokens = (usage.get("prompt_tokens") or usage.get("input_tokens") or 0) + (usage.get("completion_tokens") or usage.get("output_tokens") or 0)
+        try:
+            total_tokens = max(0, int(total_tokens))
+        except (TypeError, ValueError):
+            total_tokens = 0
+        reservation_id = str(run_id)
+        self.db.settle_token_reservation(
+            self.task_id, reservation_id, total_tokens,
+            self.worker_id, self.worker_generation,
+        )
+        self._token_reservations.discard(reservation_id)
         self.db.add_event(
             self.task_id,
             "model_call_completed",
@@ -210,14 +252,21 @@ class TaskEventCallback(BaseCallbackHandler):
                 "run_id": str(run_id),
             },
         )
+        self._check_control()
 
     def on_llm_error(self, error, *, run_id, **kwargs):
         started = self._llm_started.pop(str(run_id), time.monotonic())
+        reservation_id = str(run_id)
+        self.db.release_token_reservation(
+            self.task_id, reservation_id, self.worker_id, self.worker_generation
+        )
+        self._token_reservations.discard(reservation_id)
         self.db.add_event(
             self.task_id,
             "model_call_failed",
             {"duration_ms": int((time.monotonic() - started) * 1000), "error": str(error)[:2000], "run_id": str(run_id)},
         )
+        self._check_control()
 
     def on_tool_start(self, serialized, input_str, *, run_id, **kwargs):
         self._check_control()
@@ -241,6 +290,7 @@ class TaskEventCallback(BaseCallbackHandler):
             "tool_call_completed",
             {"output": str(output)[:20000], "duration_ms": int((time.monotonic() - started) * 1000), "run_id": str(run_id)},
         )
+        self._check_control()
 
     def on_tool_error(self, error, *, run_id, **kwargs):
         started = self._tool_started.pop(str(run_id), time.monotonic())
@@ -250,6 +300,7 @@ class TaskEventCallback(BaseCallbackHandler):
             "tool_call_failed",
             {"error": str(error)[:4000], "duration_ms": int((time.monotonic() - started) * 1000), "run_id": str(run_id)},
         )
+        self._check_control()
 
 
 def extract_final_text(state_or_result: Any) -> str:
@@ -374,6 +425,10 @@ class ResearchExecutor:
             else:
                 self.db.add_event(task_id, "agent_initial_run", {})
                 result = agent.invoke({"messages": [{"role": "user", "content": task["goal"]}]}, config=config)
+
+            # Re-check after graph execution so a provider call that ran past the
+            # deadline cannot be accepted as a successful final response.
+            callback._check_control()
 
             if not artifacts.exists(artifact_path):
                 final_text = extract_final_text(result)
