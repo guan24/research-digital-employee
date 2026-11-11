@@ -158,7 +158,8 @@ class Database:
         }
 
     def add_event(self, task_id: str, event_type: str, payload: dict[str, Any] | None = None) -> None:
-        from app.infrastructure.redaction import redact_value\n        safe_payload = json.dumps(redact_value(payload or {}), ensure_ascii=False, default=str)
+        from app.infrastructure.redaction import redact_value
+        safe_payload = json.dumps(redact_value(payload or {}), ensure_ascii=False, default=str)
         with closing(self.connect()) as conn:
             conn.execute(
                 "INSERT INTO events(task_id, timestamp, event_type, payload_json) VALUES (?, ?, ?, ?)",
