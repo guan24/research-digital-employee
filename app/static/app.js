@@ -21,7 +21,7 @@ const names = {
 const eventNames = {
   task_created: '任务创建', task_started: 'Worker 领取任务',
   agent_execution_started: 'Agent 开始执行', agent_initial_run: '首次运行',
-  agent_plan_started: '自主规划启动', research_plan_updated: '研究计划更新', research_plan_step_status: '计划步骤状态', research_plan_activity: '计划执行活动', checkpoint_resume: 'Checkpoint 恢复',
+  agent_plan_started: '自主规划启动', research_plan_updated: 'Agent 规划调整', research_plan_finalized: '最终计划归档', checkpoint_resume: 'Checkpoint 恢复',
   checkpoint_already_complete: '检查点已完成', model_call_started: '模型调用开始',
   model_call_completed: '模型调用完成', model_call_failed: '模型调用失败',
   tool_call_started: '工具调用开始', tool_call_completed: '工具调用完成',
@@ -259,48 +259,106 @@ function renderArtifacts() {
   });
 }
 
+function normalizedPlan(plan = {}) {
+  return {
+    title: String(plan.title || '研究执行计划'),
+    objective: String(plan.objective || ''),
+    steps: (Array.isArray(plan.steps) ? plan.steps : []).map((step, index) => ({
+      id: String(step.id || 'step-' + (index + 1)),
+      title: String(step.title || ''),
+      objective: String(step.objective || ''),
+      expected_output: String(step.expected_output || '')
+    }))
+  };
+}
+
 function planSnapshot() {
-  const versions = events.filter(event => event.event_type === 'research_plan_updated')
-    .map(event => ({version: event.payload.version || 1, plan: event.payload.plan || {}, event, changes: event.payload.change_reason || ''}));
-  const statuses = new Map();
+  const versions = [];
   for (const event of events) {
-    if (event.event_type !== 'research_plan_step_status') continue;
-    statuses.set(String(event.payload.step_id), event.payload.status);
+    if (event.event_type !== 'research_plan_updated') continue;
+    const payload = event.payload || {};
+    const plan = normalizedPlan(payload.plan || {});
+    if (!plan.steps.length) continue;
+    const signature = JSON.stringify(plan);
+    // Collapse legacy versions created solely by step-status changes.
+    if (versions.length && versions[versions.length - 1].signature === signature) continue;
+    versions.push({
+      version: versions.length + 1,
+      plan,
+      signature,
+      event,
+      changeType: payload.change_type || (versions.length ? 'replan' : 'initial'),
+      trigger: payload.trigger || payload.change_reason || '',
+      newInformation: payload.new_information || '',
+      problemAnalysis: payload.problem_analysis || '',
+      decision: payload.decision || '',
+      changes: payload.changes || payload.change_reason || '',
+      planDiff: payload.plan_diff || {}
+    });
   }
   const latest = versions.length ? versions[versions.length - 1] : null;
-  if (latest) latest.plan.steps = (latest.plan.steps || []).map(step => ({...step, status: statuses.get(String(step.id)) || step.status || 'pending'}));
-  return {versions, latest};
+  const finalizedEvent = latest
+    ? [...events].reverse().find(event =>
+        event.event_type === 'research_plan_finalized' &&
+        event.event_id > latest.event.event_id
+      ) || null
+    : null;
+  return {versions, latest, finalizedEvent};
+}
+
+function planHistoryEntry(version) {
+  const label = version.changeType === 'initial' ? '初始规划' : '基于新信息重新规划';
+  const fields = [
+    ['触发原因', version.trigger],
+    ['新获得的信息', version.newInformation],
+    ['原计划的问题分析', version.problemAnalysis],
+    ['调整决策', version.decision],
+    ['具体调整', version.changes]
+  ].filter(([, value]) => value);
+  const rationale = fields.map(([name, value]) =>
+    '<div class="plan-rationale-row"><b>' + esc(name) + '</b><p>' + esc(value) + '</p></div>'
+  ).join('');
+  const diff = Object.keys(version.planDiff || {}).length
+    ? '<details class="plan-version-detail"><summary>查看相对上一版本的结构变化</summary><pre>' +
+      esc(pretty(version.planDiff)) + '</pre></details>'
+    : '';
+  return '<section class="plan-history-entry"><div class="plan-history-heading"><b>v' +
+    version.version + ' · ' + label + '</b><time>' + time(version.event.timestamp) +
+    '</time></div>' + (rationale || '<p>根据用户目标建立整体研究路径。</p>') +
+    diff + '<details class="plan-version-detail"><summary>查看该版本的完整计划</summary><pre>' +
+    esc(pretty(version.plan)) + '</pre></details></section>';
 }
 
 function renderPlan() {
-  const {versions, latest} = planSnapshot();
+  const {versions, latest, finalizedEvent} = planSnapshot();
   planVersions = versions;
   const root = $('planPanel');
   if (!latest) {
-    root.innerHTML = '<div class="empty plan-empty">Agent 尚未提交结构化执行计划。计划生成后将在此处实时显示。</div>';
+    root.innerHTML = '<div class="empty plan-empty">Agent 尚未提交整体研究计划。计划生成后将在此处展示，实质性调整将形成新版本。</div>';
     return;
   }
-  const labels = {pending: '未开始', in_progress: '进行中', completed: '已完成', skipped: '已跳过'};
-  const classes = {pending: 'pending', in_progress: 'in-progress', completed: 'completed', skipped: 'skipped'};
-  const steps = latest.plan.steps || [];
-  const completed = steps.filter(step => step.status === 'completed').length;
-  root.innerHTML = '<div class="plan-top"><div><strong>' + esc(latest.plan.title || '研究执行计划') + '</strong><p>' +
-    esc(latest.plan.objective || '') + '</p></div><span class="plan-version">v' + latest.version + '</span></div>' +
-    '<div class="plan-progress"><span>' + completed + ' / ' + steps.length + ' 步已完成</span><div><i style="width:' +
-    (steps.length ? Math.round(completed / steps.length * 100) : 0) + '%"></i></div></div>' +
-    '<ol class="plan-steps">' + steps.map((step,index) => '<li class="plan-step ' + (classes[step.status] || 'pending') +
-    '"><span class="plan-index">' + (index + 1) + '</span><div><strong>' + esc(step.title) + '</strong><p>' +
-    esc(step.objective || step.expected_output || '') + '</p>' +
-    (step.expected_output ? '<small>预期成果：' + esc(step.expected_output) + '</small>' : '') +
-    '</div><span class="plan-state">' + (labels[step.status] || labels.pending) + '</span></li>').join('') +
-    '</ol>' + (latest.changes ? '<p class="plan-change">本次调整：' + esc(latest.changes) + '</p>' : '') +
-    (versions.length > 1 ? '<details class="plan-history"><summary>查看计划变更历史（' + versions.length + ' 个版本）</summary>' +
-    versions.slice(0,-1).reverse().map(version => '<section><b>v' + version.version + ' · ' + time(version.event.timestamp) +
-    '</b><p>' + esc(version.plan.title || '研究执行计划') + '</p>' +
-    (version.changes ? '<small>' + esc(version.changes) + '</small>' : '') + '</section>').join('') +
-    '</details>' : '') +
-    (latest.event.payload.original_plan_text ? '<details class="plan-history"><summary>查看 Agent 原始计划 JSON</summary><pre>' +
-    esc(latest.event.payload.original_plan_text) + '</pre></details>' : '');
+  const archiveLabel = finalizedEvent ? '最终计划已归档' : '规划执行中';
+  const archiveNote = finalizedEvent
+    ? '<p class="plan-archive-note">任务结束：' + esc(finalizedEvent.payload?.outcome || '已结束') +
+      ' · 完整历史已保存至 <code>notes/agent_execution_plan.json</code></p>'
+    : '<p class="plan-archive-note">步骤进度、工具调用和异常请查看下方执行轨迹；本区域只记录整体策略及实质性调整。</p>';
+  root.innerHTML = '<div class="plan-top"><div><strong>' + esc(latest.plan.title) +
+    '</strong><p>' + esc(latest.plan.objective) + '</p></div><span class="plan-version">' +
+    archiveLabel + ' · v' + latest.version + '</span></div>' +
+    '<div class="plan-section-label">当前整体执行计划</div><ol class="plan-steps">' +
+    latest.plan.steps.map((step, index) =>
+      '<li class="plan-step"><span class="plan-index">' + (index + 1) +
+      '</span><div><strong>' + esc(step.title) + '</strong>' +
+      (step.objective ? '<p>' + esc(step.objective) + '</p>' : '') +
+      (step.expected_output ? '<small>预期成果：' + esc(step.expected_output) + '</small>' : '') +
+      '</div></li>'
+    ).join('') + '</ol>' + archiveNote +
+    '<details class="plan-history" ' + (versions.length > 1 ? '' : 'hidden') +
+    '><summary>查看规划演进历史（' + versions.length + ' 个有效版本）</summary>' +
+    versions.map(planHistoryEntry).join('') + '</details>' +
+    (latest.event.payload.original_plan_text
+      ? '<details class="plan-version-detail"><summary>查看 Agent 提交的原始计划</summary><pre>' +
+        esc(latest.event.payload.original_plan_text) + '</pre></details>' : '');
 }
 
 function traceKey(event) {
@@ -313,6 +371,7 @@ function traceKey(event) {
 function traceItems() {
   const grouped = new Map();
   for (const event of events) {
+    if (['research_plan_step_status', 'research_plan_activity'].includes(event.event_type)) continue;
     const key = traceKey(event);
     let item = grouped.get(key);
     if (!item) {
@@ -356,7 +415,13 @@ function genericSummary(event) {
   const payload = event.payload || {};
   switch (event.event_type) {
     case 'agent_plan_started':
-      return 'Agent 已接收研究目标，后续规划通过模型输出与工具调用逐步展开。';
+      return 'Agent 已接收研究目标，正在制定整体研究策略。';
+    case 'research_plan_updated':
+      return payload.change_type === 'initial'
+        ? 'Agent 制定初始整体执行计划，共 ' + (payload.plan?.steps?.length || 0) + ' 个研究步骤。'
+        : 'Agent 根据新信息重新规划：' + compact(payload.trigger || payload.change_reason, 160);
+    case 'research_plan_finalized':
+      return '任务结束，最终执行计划及 ' + (payload.history_count || 0) + ' 个规划版本已归档。';
     case 'checkpoint_resume':
       return '从检查点继续执行' + (payload.pending_nodes?.length ? ' · 待执行节点：' + payload.pending_nodes.join(', ') : '');
     case 'checkpoint_already_complete':
@@ -563,28 +628,30 @@ function renderMarkdown(source) {
   return output.join('\n');
 }
 
-function highlightJson(source) {
-  let formatted;
-  try { formatted = JSON.stringify(JSON.parse(source), null, 2); }
-  catch { return '<pre class="source-code">' + esc(source) + '</pre>'; }
-  return '<pre class="source-code">' + esc(formatted) + '</pre>';
-}
-
 function renderArtifactPreview() {
   const preview = $('preview');
   const isJson = activeFile.toLowerCase().endsWith('.json');
   const isMarkdown = activeFile.toLowerCase().endsWith('.md');
-  const rendered = isJson ? highlightJson(fileText)
-    : isMarkdown ? renderMarkdown(fileText)
-    : '<pre class="source-code">' + esc(fileText) + '</pre>';
-  preview.innerHTML = previewMode === 'rendered' ? rendered : '<pre class="source-code">' + esc(fileText) + '</pre>';
-  $('previewRendered').classList.toggle('active', previewMode === 'rendered');
-  $('previewSource').classList.toggle('active', previewMode === 'source');
-  $('previewRendered').disabled = previewMode === 'rendered';
-  $('previewSource').disabled = previewMode === 'source';
-  $('previewModeHint').textContent = isJson ? 'JSON · ' + (previewMode === 'rendered' ? '格式化视图' : '原始源码')
-    : isMarkdown ? 'Markdown · ' + (previewMode === 'rendered' ? '文档渲染' : '原始源码')
-    : '文本 · 原始内容';
+
+  // JSON is shown as plain source text: no parsing, pretty-printing or highlighting.
+  if (isMarkdown) {
+    $('previewRendered').hidden = false;
+    $('previewSource').hidden = false;
+    preview.innerHTML = previewMode === 'rendered'
+      ? renderMarkdown(fileText)
+      : '<pre class="source-code">' + esc(fileText) + '</pre>';
+    $('previewRendered').classList.toggle('active', previewMode === 'rendered');
+    $('previewSource').classList.toggle('active', previewMode === 'source');
+    $('previewRendered').disabled = previewMode === 'rendered';
+    $('previewSource').disabled = previewMode === 'source';
+    $('previewModeHint').textContent = previewMode === 'rendered'
+      ? 'Markdown · 文档渲染' : 'Markdown · 原始源码';
+  } else {
+    $('previewRendered').hidden = true;
+    $('previewSource').hidden = true;
+    preview.innerHTML = '<pre class="source-code">' + esc(fileText) + '</pre>';
+    $('previewModeHint').textContent = isJson ? 'JSON · 原始文本' : '文本 · 原始内容';
+  }
 }
 
 async function action(name) {

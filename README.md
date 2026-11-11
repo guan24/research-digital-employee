@@ -4,7 +4,8 @@ A local, long-running autonomous research employee built with **Deep Agents, Lan
 
 ## Features
 
-- Agent-generated research planning and adaptive search/read/synthesis workflow.
+- Agent-generated overall research plan with evidence-driven strategic revisions. History records the trigger, new information, analysis of the previous approach, decision and concrete changes—not per-step progress.
+- The final plan and all material revisions are archived to `notes/agent_execution_plan.json` when a task reaches a terminal state.
 - Tavily search, public webpage fetching and task-scoped Markdown/JSON artifacts.
 - Durable task lifecycle and event journal in SQLite; LangGraph SQLite checkpoints keyed by task ID.
 - Live execution timeline over Server-Sent Events (SSE), with persisted event IDs and reconnect/replay. New events update the DOM locally instead of rebuilding the timeline, preserving expanded panels and detail scroll positions.
@@ -56,9 +57,10 @@ Open the Research Console at <http://127.0.0.1:8000/>. Create research tasks in 
 2. Select the task to inspect its status and chronological execution trace.
 3. The timeline streams persisted events over SSE. Reconnect uses the last event ID; historical events remain available through `GET /tasks/{task_id}/events`.
 4. The trace groups model/tool start and completion/failure events into one card. The default view shows concise decisions, status, duration and token usage. Raw model prompts/responses stay collapsed until “View full request / response” is opened; tool inputs/outputs are separately expandable. SSE updates only the affected card, preserving expanded panels and their scroll positions. Only observable generated model output is shown, never hidden chain-of-thought. Credentials are redacted before persistence.
-5. Browse task-scoped intermediate files and preview/download `report.md`.
-6. Retry failed tasks, pause/resume or cancel using the task controls.
-7. Delete a task permanently. For a running task, the UI shows the stopping/cleanup state while the API waits up to 60 seconds. If the Worker does not confirm stopping, deletion is aborted and task data remains.
+5. Inspect the Agent's overall plan and its strategic revision history. Routine step/tool progress remains in the execution trace; final plan history is archived to `notes/agent_execution_plan.json`.
+6. Browse task-scoped intermediate files. Markdown supports rendered/source modes; JSON is displayed as plain source text without parsing, reformatting or JSON rendering, inside a fixed-width preview frame.
+7. Retry failed tasks, pause/resume or cancel using the task controls.
+8. Delete a task permanently. For a running task, the UI shows the stopping/cleanup state while the API waits up to 60 seconds. If the Worker does not confirm stopping, deletion is aborted and task data remains.
 
 ## API
 
@@ -87,6 +89,12 @@ python -m pytest -v
 ```
 
 Tests do not require live OpenAI or Tavily credentials. They cover task persistence, UTF-8 round trips, event replay, credential redaction, deletion fencing/cascade and Worker lifecycle. A live research smoke test requires valid API keys.
+
+## Plan history and artifact preview
+
+The Agent plan panel describes the overall research strategy. Only the initial plan and material evidence-driven replans become versions; routine step progress remains in the execution trace. A replan records its trigger, new information, analysis of the previous approach, decision and concrete changes. At terminal task states, the final plan and all material revisions are archived in `notes/agent_execution_plan.json`. The archive stores concise decision rationale, not hidden chain-of-thought.
+
+Markdown supports rendered and raw-source preview modes. JSON is shown as original plain text only—no JSON parsing, pretty-printing, tree rendering or syntax highlighting. Both use the same fixed-width preview frame with internal scrolling for long lines.
 
 ## MVP boundaries
 

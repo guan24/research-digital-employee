@@ -4,7 +4,7 @@ import json
 from types import SimpleNamespace
 
 from app.infrastructure.artifact_store import ArtifactStore
-from app.runtime.executor import TaskEventCallback
+from app.runtime.executor import ResearchExecutor, TaskEventCallback
 from app.tools.research_tools import ResearchToolService
 
 
@@ -16,48 +16,110 @@ def make_service(settings, db):
     return task, service
 
 
-def test_structured_plan_is_versioned_and_preserves_step_status(settings, db):
+def test_plan_history_only_versions_material_replans(settings, db):
     task, service = make_service(settings, db)
-    first = {
-        "title": "研究计划",
-        "objective": "比较研究对象",
-        "steps": [
-            {"id": "scope", "title": "明确范围", "objective": "确定范围", "expected_output": "范围说明"},
-            {"id": "compare", "title": "开展比较", "objective": "比较架构", "expected_output": "比较表"},
-        ],
-    }
-    service.update_research_plan(json.dumps(first, ensure_ascii=False))
+    initial = {"title": "研究计划", "objective": "比较研究对象", "steps": [
+        {"id": "scope", "title": "明确范围", "objective": "确定范围", "expected_output": "范围说明"},
+        {"id": "compare", "title": "开展比较", "objective": "比较架构", "expected_output": "比较表"},
+    ]}
+    service.update_research_plan(json.dumps(initial, ensure_ascii=False))
     db.add_event(task["task_id"], "research_plan_step_status", {
-        "step_id": "scope", "status": "completed", "source": "agent"
+        "step_id": "scope", "status": "completed", "source": "system"
     })
-    second = {
-        "title": "调整后的研究计划",
-        "objective": "补充证据",
-        "steps": [
-            {"id": "scope", "title": "明确范围", "objective": "确定范围", "expected_output": "范围说明"},
-            {"id": "compare", "title": "开展比较", "objective": "比较架构", "expected_output": "比较表"},
-            {"id": "verify", "title": "交叉核验", "objective": "核验来源", "expected_output": "核验记录"},
-        ],
-    }
-    service.update_research_plan(json.dumps(second, ensure_ascii=False), "新增来源核验步骤")
-    plan_events = [event for event in db.get_events(task["task_id"]) if event["event_type"] == "research_plan_updated"]
+    status_only = json.loads(json.dumps(initial, ensure_ascii=False))
+    status_only["steps"][0]["status"] = "completed"
+    result = service.update_research_plan(json.dumps(status_only, ensure_ascii=False))
+    assert "No material plan change" in result
+    revised = {"title": "补充证据核验后的研究计划", "objective": "比较并验证", "steps": [
+        {"id": "scope", "title": "明确范围"},
+        {"id": "compare", "title": "开展架构比较"},
+        {"id": "verify", "title": "交叉核验关键结论"},
+    ]}
+    service.update_research_plan(
+        json.dumps(revised, ensure_ascii=False),
+        trigger="初步检索发现官方资料披露程度差异较大",
+        new_information="部分项目只能从仓库和发布说明确认工具机制",
+        problem_analysis="原计划无法充分区分已验证能力与推断",
+        decision="增加独立证据核验工作流",
+        changes="新增官方资料交叉核验步骤并标注证据等级",
+    )
+    plan_events = [e for e in db.get_events(task["task_id"]) if e["event_type"] == "research_plan_updated"]
     assert len(plan_events) == 2
-    assert plan_events[0]["payload"]["version"] == 1
-    assert plan_events[1]["payload"]["version"] == 2
-    assert plan_events[1]["payload"]["change_reason"] == "新增来源核验步骤"
-    assert plan_events[1]["payload"]["plan"]["steps"][0]["status"] == "completed"
-    assert service.artifacts.exists("notes/research_plan.json")
+    payload = plan_events[1]["payload"]
+    assert payload["version"] == 2
+    assert payload["change_type"] == "replan"
+    assert payload["trigger"].startswith("初步检索")
+    assert payload["new_information"].startswith("部分项目")
+    assert payload["problem_analysis"].startswith("原计划")
+    assert payload["decision"].startswith("增加独立")
+    assert payload["changes"].startswith("新增官方资料")
+    assert payload["plan_diff"]["added_steps"] == [{"id": "verify", "title": "交叉核验关键结论"}]
+    assert all("status" not in step for step in payload["plan"]["steps"])
+    assert service.artifacts.exists("notes/agent_execution_plan.json")
 
 
-def test_structured_plan_rejects_invalid_status(settings, db):
+def test_material_replan_requires_audit_rationale(settings, db):
     _, service = make_service(settings, db)
-    invalid = {"steps": [{"id": "one", "title": "step", "status": "unknown"}]}
+    initial = {"title": "初始计划", "objective": "研究", "steps": [{"id": "one", "title": "收集资料"}]}
+    service.update_research_plan(json.dumps(initial, ensure_ascii=False))
+    revised = {"title": "调整计划", "objective": "研究并核验", "steps": [
+        {"id": "one", "title": "收集资料"}, {"id": "two", "title": "核验结论"}
+    ]}
     try:
-        service.update_research_plan(json.dumps(invalid))
+        service.update_research_plan(json.dumps(revised, ensure_ascii=False), trigger="发现新问题")
     except ValueError as exc:
-        assert "invalid status" in str(exc)
+        assert "new_information" in str(exc)
+        assert "problem_analysis" in str(exc)
+        assert "decision" in str(exc)
+        assert "changes" in str(exc)
     else:
-        raise AssertionError("invalid plan status must be rejected")
+        raise AssertionError("material replan without an audit trail must be rejected")
+
+
+def test_final_plan_archive_preserves_all_material_versions(settings, db):
+    task, service = make_service(settings, db)
+    initial = {"title": "初始计划", "objective": "初始目标", "steps": [
+        {"id": "scope", "title": "明确范围"}, {"id": "research", "title": "收集证据"}
+    ]}
+    service.update_research_plan(json.dumps(initial, ensure_ascii=False))
+    revised = {"title": "修订计划", "objective": "补充核验", "steps": [
+        {"id": "scope", "title": "明确范围"},
+        {"id": "research", "title": "收集证据"},
+        {"id": "verify", "title": "交叉核验"},
+    ]}
+    service.update_research_plan(
+        json.dumps(revised, ensure_ascii=False),
+        trigger="新证据显示需要交叉核验",
+        new_information="部分来源存在版本差异",
+        problem_analysis="单一来源无法支持版本相关结论",
+        decision="增加第二来源核验",
+        changes="新增交叉核验步骤并将版本信息纳入比较维度",
+    )
+    executor = ResearchExecutor(settings, db)
+    archive_path = executor.finalize_plan(task["task_id"], "completed")
+    assert archive_path == "notes/agent_execution_plan.json"
+    archive = json.loads(service.artifacts.read_text(archive_path))
+    assert archive["status"] == "finalized"
+    assert archive["outcome"] == "completed"
+    assert archive["current_version"] == 2
+    assert archive["final_plan"]["title"] == "修订计划"
+    assert [item["version"] for item in archive["history"]] == [1, 2]
+    assert archive["history"][1]["problem_analysis"] == "单一来源无法支持版本相关结论"
+    finalized = [e for e in db.get_events(task["task_id"]) if e["event_type"] == "research_plan_finalized"]
+    assert len(finalized) == 1
+    assert finalized[0]["payload"]["history_count"] == 2
+
+
+def test_tool_callbacks_do_not_mutate_plan_step_status(settings, db):
+    task, _ = make_service(settings, db)
+    callback = TaskEventCallback(db, task["task_id"], __import__("time").monotonic(), 3600)
+    callback.on_tool_start({"name": "web_search"}, '{"query":"new evidence"}', run_id="tool-1")
+    callback.on_tool_end('{"results":[]}', run_id="tool-1")
+    event_types = [event["event_type"] for event in db.get_events(task["task_id"])]
+    assert "tool_call_started" in event_types
+    assert "tool_call_completed" in event_types
+    assert "research_plan_step_status" not in event_types
+    assert "research_plan_activity" not in event_types
 
 
 def test_model_callback_persists_tool_only_chat_response(settings, db):
@@ -101,7 +163,17 @@ def test_artifact_preview_has_markdown_json_render_and_source_modes():
     source = (Path(__file__).resolve().parents[1] / "app" / "static" / "app.js").read_text(encoding="utf-8")
     assert "function renderMarkdown(source)" in source
     assert "preview-table-wrap" in source
-    assert "JSON.stringify(JSON.parse(source), null, 2)" in source
+    assert "function highlightJson(source)" not in source
+    assert "JSON.stringify(JSON.parse(source), null, 2)" not in source
+    assert "JSON · 原始文本" in source
+    assert "previewRendered.hidden = true" in source
+    assert "function planHistoryEntry(version)" in source
+    assert "problemAnalysis" in source
+    assert "newInformation" in source
+    assert "research_plan_finalized" in source
+    css = (Path(__file__).resolve().parents[1] / "app" / "static" / "style.css").read_text(encoding="utf-8")
+    assert "#preview{display:block;width:100%;min-width:0;max-width:100%" in css
+    assert "#preview>pre.source-code{display:block;width:100%;min-width:0;max-width:100%" in css
     assert "previewMode === 'rendered'" in source
     assert "previewMode === 'source'" in source
     assert "async function refreshArtifacts(taskId)" in source

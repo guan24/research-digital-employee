@@ -482,101 +482,320 @@ class ResearchToolService:
         self.check_control()
         return json.dumps(self.artifacts.list_files(), ensure_ascii=False)
 
-    def update_research_plan(self, plan_json: str, change_reason: str = "") -> str:
-        """Persist a structured, versioned Agent plan and its step states."""
+    @staticmethod
+    def _normalize_plan_structure(plan: dict) -> dict:
+        """Strip execution telemetry from a plan; only strategic structure is versioned."""
+        return {
+            "title": str(plan.get("title") or "研究执行计划").strip(),
+            "objective": str(plan.get("objective") or "").strip(),
+            "steps": [
+                {
+                    "id": str(step.get("id") or f"step-{index}").strip(),
+                    "title": str(step.get("title") or "").strip(),
+                    "objective": str(step.get("objective") or "").strip(),
+                    "expected_output": str(step.get("expected_output") or "").strip(),
+                }
+                for index, step in enumerate(plan.get("steps") or [], start=1)
+                if isinstance(step, dict)
+            ],
+        }
+
+    @staticmethod
+    def _plan_diff(previous: dict, current: dict) -> dict:
+        previous_steps = {step["id"]: step for step in previous.get("steps", [])}
+        current_steps = {step["id"]: step for step in current.get("steps", [])}
+        added = [
+            {"id": step["id"], "title": step["title"]}
+            for step in current.get("steps", [])
+            if step["id"] not in previous_steps
+        ]
+        removed = [
+            {"id": step["id"], "title": step["title"]}
+            for step in previous.get("steps", [])
+            if step["id"] not in current_steps
+        ]
+        modified = []
+        for step in current.get("steps", []):
+            step_id = step["id"]
+            if step_id not in previous_steps:
+                continue
+            changed_fields = [
+                field
+                for field in ("title", "objective", "expected_output")
+                if step.get(field) != previous_steps[step_id].get(field)
+            ]
+            if changed_fields:
+                modified.append({
+                    "id": step_id,
+                    "title": step["title"],
+                    "changed_fields": changed_fields,
+                })
+        previous_order = [
+            step["id"] for step in previous.get("steps", [])
+            if step["id"] in current_steps
+        ]
+        current_order = [
+            step["id"] for step in current.get("steps", [])
+            if step["id"] in previous_steps
+        ]
+        return {
+            "title_changed": previous.get("title") != current.get("title"),
+            "objective_changed": previous.get("objective") != current.get("objective"),
+            "added_steps": added,
+            "removed_steps": removed,
+            "modified_steps": modified,
+            "order_changed": previous_order != current_order,
+        }
+
+    @staticmethod
+    def persist_plan_archive(
+        db: Database,
+        task_id: str,
+        artifacts: ArtifactStore,
+        status: str = "in_progress",
+        outcome: str | None = None,
+        finalized_at: str | None = None,
+    ) -> str | None:
+        """Write a durable, deduplicated history of strategic plan versions."""
+        events = db.get_events(task_id, limit=5000)
+        plan_events = [
+            event for event in events
+            if event["event_type"] == "research_plan_updated"
+        ]
+        history = []
+        previous_signature = None
+        for event in plan_events:
+            payload = event.get("payload", {})
+            plan = ResearchToolService._normalize_plan_structure(
+                payload.get("plan") or {}
+            )
+            signature = json.dumps(plan, ensure_ascii=False, sort_keys=True)
+            # Older releases emitted a new plan event for every step-status change.
+            # Collapse those records so the archive represents only strategic revisions.
+            if signature == previous_signature:
+                continue
+            previous_signature = signature
+            history.append({
+                "version": len(history) + 1,
+                "timestamp": event.get("timestamp"),
+                "change_type": payload.get("change_type") or ("initial" if not history else "replan"),
+                "trigger": payload.get("trigger") or payload.get("change_reason") or "",
+                "new_information": payload.get("new_information") or "",
+                "problem_analysis": payload.get("problem_analysis") or "",
+                "decision": payload.get("decision") or "",
+                "changes": payload.get("changes") or payload.get("change_reason") or "",
+                "plan_diff": payload.get("plan_diff") or {},
+                "plan": plan,
+            })
+
+        if not history:
+            return None
+
+        task = db.get_task(task_id) or {}
+        archive = {
+            "schema_version": 1,
+            "task_id": task_id,
+            "goal": task.get("goal", ""),
+            "status": status,
+            "outcome": outcome,
+            "finalized_at": finalized_at,
+            "current_version": history[-1]["version"],
+            "final_plan": history[-1]["plan"],
+            "history": history,
+            "note": "Only initial planning and material strategic replans are versioned; step progress belongs to the execution trace.",
+        }
+        return artifacts.write_text(
+            "notes/agent_execution_plan.json",
+            json.dumps(archive, ensure_ascii=False, indent=2),
+        )
+
+    def update_research_plan(
+        self,
+        plan_json: str,
+        change_reason: str = "",
+        trigger: str = "",
+        new_information: str = "",
+        problem_analysis: str = "",
+        decision: str = "",
+        changes: str = "",
+    ) -> str:
+        """Create the initial plan or record a material, evidence-driven replan."""
         self.check_control()
+        plan_text = str(plan_json or "")
         try:
-            raw_plan = json.loads(plan_json)
+            raw_plan = json.loads(plan_text)
         except (TypeError, json.JSONDecodeError) as exc:
-            extracted = [re.sub(r"^\s*(?:[-*+]\s+|\d+[.)、]\s*)", "", line.strip()).strip() for line in plan_json.splitlines() if line.strip() and not line.lstrip().startswith("#")]
+            extracted = [
+                re.sub(r"^\s*(?:[-*+]\s+|\d+[.)、]\s*)", "", line.strip()).strip()
+                for line in plan_text.splitlines()
+                if line.strip() and not line.lstrip().startswith("#")
+            ]
             if not extracted:
-                raise ValueError("plan_json must be valid JSON or contain extractable plan steps") from exc
+                raise ValueError(
+                    "plan_json must be valid JSON or contain extractable plan steps"
+                ) from exc
             raw_plan = {
                 "title": "执行计划（文本提取）",
                 "objective": "从 Agent 原始规划文本中提取",
-                "steps": [{"id": f"step-{index}", "title": title} for index, title in enumerate(extracted[:20], start=1)],
+                "steps": [
+                    {"id": f"step-{index}", "title": title}
+                    for index, title in enumerate(extracted[:20], start=1)
+                ],
             }
+
         if not isinstance(raw_plan, dict) or not isinstance(raw_plan.get("steps"), list):
             raise ValueError("plan_json must be an object containing a steps array")
         if not 1 <= len(raw_plan["steps"]) <= 20:
             raise ValueError("a research plan must contain between 1 and 20 steps")
+        if any(not isinstance(step, dict) for step in raw_plan["steps"]):
+            raise ValueError("every plan step must be an object")
 
-        history = self.db.get_events(self.task_id, limit=2000)
-        plan_events = [event for event in history if event["event_type"] == "research_plan_updated"]
-        previous_event = plan_events[-1] if plan_events else None
-        previous_plan = (previous_event or {}).get("payload", {}).get("plan") or {}
-        previous_steps = {
-            str(step.get("id")): step
-            for step in previous_plan.get("steps", [])
-            if isinstance(step, dict) and step.get("id") is not None
-        }
-        if previous_event:
-            for event in history:
-                if event["event_id"] <= previous_event["event_id"] or event["event_type"] != "research_plan_step_status":
-                    continue
-                payload = event.get("payload", {})
-                step_id = str(payload.get("step_id", ""))
-                if step_id in previous_steps and payload.get("status"):
-                    previous_steps[step_id] = {**previous_steps[step_id], "status": payload["status"]}
-
-        allowed_statuses = {"pending", "in_progress", "completed", "skipped"}
-        aliases = {
-            "not_started": "pending", "未开始": "pending",
-            "进行中": "in_progress", "已完成": "completed", "已跳过": "skipped",
-        }
-        normalized_steps = []
+        plan = self._normalize_plan_structure(raw_plan)
         seen_ids = set()
-        for index, raw_step in enumerate(raw_plan["steps"], start=1):
-            if not isinstance(raw_step, dict):
-                raise ValueError(f"plan step {index} must be an object")
-            step_id = str(raw_step.get("id") or f"step-{index}").strip()
-            title = str(raw_step.get("title") or "").strip()
-            if not step_id or not title or step_id in seen_ids:
-                raise ValueError(f"plan step {index} requires a unique id and non-empty title")
-            seen_ids.add(step_id)
-            status = raw_step.get("status")
-            if status is None:
-                status = previous_steps.get(step_id, {}).get("status", "pending")
-            status = aliases.get(str(status), str(status))
-            if status not in allowed_statuses:
-                raise ValueError(f"invalid status for {step_id}: {status}")
-            normalized_steps.append({
-                "id": step_id,
-                "title": title,
-                "objective": str(raw_step.get("objective") or "").strip(),
-                "expected_output": str(raw_step.get("expected_output") or "").strip(),
-                "status": status,
-            })
+        for index, step in enumerate(plan["steps"], start=1):
+            if not step["id"] or not step["title"] or step["id"] in seen_ids:
+                raise ValueError(
+                    f"plan step {index} requires a unique id and non-empty title"
+                )
+            seen_ids.add(step["id"])
 
-        version = int((previous_event or {}).get("payload", {}).get("version", 0)) + 1
-        plan = {
-            "title": str(raw_plan.get("title") or "研究执行计划").strip(),
-            "objective": str(raw_plan.get("objective") or "").strip(),
-            "steps": normalized_steps,
-        }
+        history = self.db.get_events(self.task_id, limit=5000)
+        plan_events = [
+            event for event in history
+            if event["event_type"] == "research_plan_updated"
+        ]
+        previous_event = plan_events[-1] if plan_events else None
+        previous_plan = self._normalize_plan_structure(
+            (previous_event or {}).get("payload", {}).get("plan") or {}
+        )
+
+        unique_signatures = []
+        for event in plan_events:
+            existing_plan = self._normalize_plan_structure(
+                event.get("payload", {}).get("plan") or {}
+            )
+            signature = json.dumps(
+                existing_plan, ensure_ascii=False, sort_keys=True
+            )
+            if not unique_signatures or unique_signatures[-1] != signature:
+                unique_signatures.append(signature)
+
+        if previous_event:
+            previous_signature = json.dumps(
+                previous_plan, ensure_ascii=False, sort_keys=True
+            )
+            current_signature = json.dumps(
+                plan, ensure_ascii=False, sort_keys=True
+            )
+            if current_signature == previous_signature:
+                return (
+                    "No material plan change detected. "
+                    f"Kept strategic plan version {len(unique_signatures)}."
+                )
+
+        trigger_text = str(trigger or change_reason or "").strip()
+        new_information_text = str(new_information or "").strip()
+        problem_analysis_text = str(problem_analysis or "").strip()
+        decision_text = str(decision or "").strip()
+        changes_text = str(changes or "").strip()
+
+        if previous_event:
+            required = {
+                "trigger": trigger_text,
+                "new_information": new_information_text,
+                "problem_analysis": problem_analysis_text,
+                "decision": decision_text,
+                "changes": changes_text,
+            }
+            missing = [field for field, value in required.items() if not value]
+            if missing:
+                raise ValueError(
+                    "a material replan must explain: " + ", ".join(missing)
+                )
+            change_type = "replan"
+            plan_diff = self._plan_diff(previous_plan, plan)
+            version = len(unique_signatures) + 1
+        else:
+            change_type = "initial"
+            trigger_text = trigger_text or "任务启动"
+            new_information_text = new_information_text or "用户提供的研究目标与交付要求"
+            problem_analysis_text = problem_analysis_text or "尚无执行期证据，先建立可验证的研究路径"
+            decision_text = decision_text or "将研究目标拆解为有序、可执行且可验证的工作步骤"
+            changes_text = changes_text or "建立初始研究执行计划"
+            plan_diff = {
+                "title_changed": False,
+                "objective_changed": False,
+                "added_steps": [
+                    {"id": step["id"], "title": step["title"]}
+                    for step in plan["steps"]
+                ],
+                "removed_steps": [],
+                "modified_steps": [],
+                "order_changed": False,
+            }
+            version = 1
+
         saved_path = self.artifacts.write_text(
             "notes/research_plan.json",
-            json.dumps({"version": version, **plan}, ensure_ascii=False, indent=2),
+            json.dumps(
+                {"schema_version": 1, "version": version, **plan},
+                ensure_ascii=False,
+                indent=2,
+            ),
         )
         self.db.add_event(
             self.task_id,
             "research_plan_updated",
             {
                 "version": version,
+                "change_type": change_type,
                 "source": "agent",
-                "change_reason": change_reason[:1000],
+                "trigger": trigger_text[:1200],
+                "new_information": new_information_text[:4000],
+                "problem_analysis": problem_analysis_text[:4000],
+                "decision": decision_text[:3000],
+                "changes": changes_text[:3000],
+                "change_reason": (change_reason or trigger_text)[:1200],
+                "plan_diff": plan_diff,
                 "artifact_path": saved_path,
                 "plan": plan,
-                "original_plan_text": plan_json[:12000],
+                "original_plan_text": plan_text[:12000],
             },
         )
-        return f"Research plan version {version} saved to {saved_path}."
+        archive_path = self.persist_plan_archive(
+            self.db, self.task_id, self.artifacts, status="in_progress"
+        )
+        return (
+            f"Saved {'initial' if change_type == 'initial' else 'revised'} "
+            f"research plan version {version} to {saved_path}; "
+            f"full plan history: {archive_path}."
+        )
 
     def as_langchain_tools(self):
         @tool("update_research_plan")
-        def update_research_plan_tool(plan_json: str, change_reason: str = "") -> str:
-            """Create or revise the visible research plan. Pass JSON with title, objective and steps [{id,title,objective,expected_output,status}]. Status must be pending, in_progress, completed or skipped. Call this before research and whenever a step starts/completes or the plan changes."""
-            return self.update_research_plan(plan_json, change_reason)
+        def update_research_plan_tool(
+            plan_json: str,
+            change_reason: str = "",
+            trigger: str = "",
+            new_information: str = "",
+            problem_analysis: str = "",
+            decision: str = "",
+            changes: str = "",
+        ) -> str:
+            """Create the initial overall research plan or record a material strategic replan.
+            Pass plan_json as JSON with title, objective and ordered steps [{id,title,objective,expected_output}].
+            Do NOT call this tool for routine step progress, searches, reads, or step completion.
+            For every later replan, explain trigger, new_information, problem_analysis, decision and changes.
+            The system records only meaningful plan revisions, not per-step status updates."""
+            return self.update_research_plan(
+                plan_json,
+                change_reason,
+                trigger,
+                new_information,
+                problem_analysis,
+                decision,
+                changes,
+            )
 
         @tool("web_search")
         def web_search_tool(query: str, max_results: int = 5) -> str:

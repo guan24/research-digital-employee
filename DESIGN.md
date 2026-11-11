@@ -46,3 +46,19 @@ Task data is retained indefinitely until explicit deletion. Back up all three st
 ## Current limits
 
 Single machine, one active Worker, SQLite, Tavily search and HTTP/BeautifulSoup extraction. Cancellation is cooperative and cannot interrupt a blocking provider call mid-request. The UI reports observable model output and decisions, not hidden chain-of-thought.
+
+## Strategic plan versioning and final archive
+
+The plan is the Agent's overall research strategy, not a step-progress tracker.
+
+- The first update_research_plan call records version 1.
+- A later call creates a version only when the normalized plan structure materially changes. Per-step status fields are stripped and never create plan versions.
+- A material replan must record five audit fields: trigger, new_information, problem_analysis, decision, and changes. The complete revised plan and a structural diff (added/removed/modified/reordered workstreams) are stored with the event.
+- Routine tool calls, reads, searches, and step completion remain in the execution event journal and do not mutate the plan history.
+- Legacy step-status-only plan events are collapsed when building the archive and rendering the history.
+- On terminal outcomes (completed, failed, cancelled), the Worker freezes the current plan and all material revisions in notes/agent_execution_plan.json, then emits research_plan_finalized.
+- The rationale is a concise evidence-based decision record, not hidden chain-of-thought. Model outputs and tool inputs/results remain in the separate execution trace.
+
+## Artifact preview layout
+
+Markdown has rendered and raw-source modes. JSON is intentionally shown as original source text only: no JSON parsing, pretty-printing, tree rendering, or syntax highlighting. The preview panel and grid item use min-width: 0, fixed width: 100% constraints, and internal horizontal scrolling for long source lines/tables so switching between Markdown and JSON does not resize the outer preview frame.

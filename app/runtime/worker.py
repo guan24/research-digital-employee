@@ -52,25 +52,49 @@ class Worker:
             current = self.db.get_task(task["task_id"])
             if current and current["cancel_requested"]:
                 self.db.mark_cancelled(task["task_id"], self.worker_id)
+                self._finalize_plan_if_terminal(task["task_id"])
             elif current and current["pause_requested"]:
                 self.db.mark_paused(task["task_id"], self.worker_id)
             else:
                 relative = str(Path(report_path).resolve().relative_to(self.settings.app_home)) if Path(report_path).resolve().is_relative_to(self.settings.app_home) else report_path
-                self.db.mark_completed(task["task_id"], relative, self.worker_id)
+                if self.db.mark_completed(task["task_id"], relative, self.worker_id):
+                    self._finalize_plan_if_terminal(task["task_id"])
         except TaskPaused:
             self.db.mark_paused(task["task_id"], self.worker_id)
         except TaskCancelled:
             self.db.mark_cancelled(task["task_id"], self.worker_id)
+            self._finalize_plan_if_terminal(task["task_id"])
         except WorkerLeaseLost as exc:
             self.db.add_event(task["task_id"], "worker_lease_lost", {"error": str(exc)})
         except TaskDeadlineExceeded as exc:
-            self.db.schedule_retry(task, f"TaskDeadlineExceeded: {exc}", self._retry_delay(task), self.worker_id)
+            outcome = self.db.schedule_retry(task, f"TaskDeadlineExceeded: {exc}", self._retry_delay(task), self.worker_id)
+            if outcome == "failed":
+                self._finalize_plan_if_terminal(task["task_id"])
         except Exception as exc:
             logger.exception("task %s failed", task["task_id"])
             self.db.add_event(task["task_id"], "execution_exception", {"error_type": type(exc).__name__, "error": str(exc)[:3000]})
-            self.db.schedule_retry(task, f"{type(exc).__name__}: {exc}", self._retry_delay(task), self.worker_id)
+            outcome = self.db.schedule_retry(task, f"{type(exc).__name__}: {exc}", self._retry_delay(task), self.worker_id)
+            if outcome == "failed":
+                self._finalize_plan_if_terminal(task["task_id"])
         finally:
             self._current_task_id = None
+
+    def _finalize_plan_if_terminal(self, task_id: str) -> None:
+        task = self.db.get_task(task_id)
+        if not task or task.get("status") not in {"completed", "failed", "cancelled"}:
+            return
+        finalizer = getattr(self.executor, "finalize_plan", None)
+        if not callable(finalizer):
+            return
+        try:
+            finalizer(task_id, task["status"])
+        except Exception as exc:
+            logger.exception("could not archive final Agent plan for task %s", task_id)
+            self.db.add_event(
+                task_id,
+                "research_plan_archive_failed",
+                {"error_type": type(exc).__name__, "error": str(exc)[:1000]},
+            )
 
     def _retry_delay(self, task: dict) -> int:
         attempt = max(1, int(task["attempts"]))

@@ -70,3 +70,37 @@
 .preview th,.preview td{border:1px solid #354a65;padding:8px 10px;text-align:left;vertical-align:top}
 .preview th{background:#23364e;color:#dce9fa;font-weight:650}
 .preview tr:nth-child(even){background:#1b2a3e}
+
+
+/* Strategic plan history: revisions are decisions, not step-status events. */
+.plan-section-label{margin:12px 0 7px;color:#8fa7c5;font-size:10px;letter-spacing:.4px}
+.plan-version{white-space:nowrap}
+.plan-step{display:grid;grid-template-columns:24px minmax(0,1fr);gap:9px;align-items:start;padding:9px;background:#1b2a3e;border:1px solid #2b3e57;border-radius:7px;min-width:0}
+.plan-step strong{font-size:11px;color:#dce8f7}
+.plan-step p{color:#91a4bd;font-size:11px;line-height:1.6;margin:5px 0}
+.plan-step small{font-size:10px;color:#7f96b4;overflow-wrap:anywhere}
+.plan-archive-note{margin:10px 0 0;color:#8298b5;font-size:10px;line-height:1.6;overflow-wrap:anywhere}
+.plan-archive-note code{color:#b8cbea}
+.plan-history[hidden]{display:none}
+.plan-history-entry{padding:10px;border-top:1px solid #2d4059;font-size:10px;color:#a9bad0}
+.plan-history-heading{display:flex;justify-content:space-between;gap:10px;align-items:center}
+.plan-history-heading b{color:#d5e3f6}
+.plan-history-heading time{color:#748aa6;white-space:nowrap}
+.plan-rationale-row{margin-top:8px}
+.plan-rationale-row b{color:#9bb8df}
+.plan-rationale-row p{margin:4px 0 0;line-height:1.65;white-space:pre-wrap;overflow-wrap:anywhere}
+.plan-version-detail{margin-top:8px;border:1px solid #2c405a;border-radius:6px;background:#111d2d}
+.plan-version-detail summary{cursor:pointer;padding:7px 9px;color:#91b7ef}
+.plan-version-detail pre{max-height:220px;overflow:auto;white-space:pre-wrap;overflow-wrap:anywhere;padding:9px;margin:0;color:#c6d5e9}
+.plan-history-entry .plan-version-detail{margin-top:7px}
+
+/* Stable outer preview dimensions across Markdown and JSON. */
+.columns.bottom{grid-template-columns:minmax(0,1fr) minmax(0,1.5fr)}
+.columns.bottom>.panel{min-width:0;width:100%;max-width:100%}
+#preview{display:block;width:100%;min-width:0;max-width:100%;box-sizing:border-box;overflow-x:hidden;contain:inline-size}
+#preview>*{max-width:100%;min-width:0;box-sizing:border-box}
+#preview>pre.source-code{display:block;width:100%;min-width:0;max-width:100%;margin:0;padding:13px;box-sizing:border-box;overflow-x:auto;overflow-y:auto;white-space:pre;overflow-wrap:normal}
+#preview .preview-table-wrap{display:block;width:100%;min-width:0;max-width:100%;overflow-x:auto}
+#preview table{width:100%;min-width:100%;max-width:100%;table-layout:fixed}
+#preview th,#preview td{overflow-wrap:anywhere;word-break:break-word}
+.preview-controls button[hidden]{display:none}

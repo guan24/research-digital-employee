@@ -5,12 +5,13 @@ import logging
 import time
 from contextlib import contextmanager
 from pathlib import Path
+from datetime import datetime, timezone
 from typing import Any, Callable, Iterator
 
 from app.config import Settings
 from app.infrastructure.artifact_store import ArtifactStore
 from app.infrastructure.database import Database
-from app.tools.research_tools import TaskCancelled, TaskDeadlineExceeded, TaskPaused, WorkerLeaseLost
+from app.tools.research_tools import ResearchToolService, TaskCancelled, TaskDeadlineExceeded, TaskPaused, WorkerLeaseLost
 
 logger = logging.getLogger(__name__)
 
@@ -208,47 +209,6 @@ class TaskEventCallback(BaseCallbackHandler):
             {"duration_ms": int((time.monotonic() - started) * 1000), "error": str(error)[:2000], "run_id": str(run_id)},
         )
 
-    def _record_plan_activity(self, tool_name: str, phase: str, run_id: str) -> None:
-        if tool_name == "update_research_plan":
-            return
-        self.db.add_event(
-            self.task_id,
-            "research_plan_activity",
-            {"tool": tool_name, "phase": phase, "run_id": run_id},
-        )
-        if phase != "started":
-            return
-        history = self.db.get_events(self.task_id, limit=2000)
-        plan_events = [event for event in history if event["event_type"] == "research_plan_updated"]
-        if not plan_events:
-            return
-        latest = plan_events[-1]
-        plan = latest.get("payload", {}).get("plan") or {}
-        steps = plan.get("steps") or []
-        statuses = {str(step.get("id")): step.get("status", "pending") for step in steps}
-        for event in history:
-            if event["event_id"] <= latest["event_id"] or event["event_type"] != "research_plan_step_status":
-                continue
-            payload = event.get("payload", {})
-            step_id = str(payload.get("step_id", ""))
-            if step_id in statuses:
-                statuses[step_id] = payload.get("status", statuses[step_id])
-        if any(status == "in_progress" for status in statuses.values()):
-            return
-        next_step = next((step for step in steps if statuses.get(str(step.get("id"))) == "pending"), None)
-        if next_step:
-            self.db.add_event(
-                self.task_id,
-                "research_plan_step_status",
-                {
-                    "step_id": str(next_step["id"]),
-                    "status": "in_progress",
-                    "source": "system",
-                    "reason": f"Observed tool execution: {tool_name}",
-                    "tool": tool_name,
-                },
-            )
-
     def on_tool_start(self, serialized, input_str, *, run_id, **kwargs):
         self._check_control()
         tool_name = (serialized or {}).get("name", "unknown")
@@ -259,7 +219,6 @@ class TaskEventCallback(BaseCallbackHandler):
             "tool_call_started",
             {"tool": tool_name, "input": str(input_str)[:2500], "run_id": str(run_id)},
         )
-        self._record_plan_activity(tool_name, "started", str(run_id))
 
     def on_tool_end(self, output, *, run_id, **kwargs):
         started = self._tool_started.pop(str(run_id), time.monotonic())
@@ -269,7 +228,6 @@ class TaskEventCallback(BaseCallbackHandler):
             "tool_call_completed",
             {"output": str(output)[:20000], "duration_ms": int((time.monotonic() - started) * 1000), "run_id": str(run_id)},
         )
-        self._record_plan_activity(tool_name, "completed", str(run_id))
 
     def on_tool_error(self, error, *, run_id, **kwargs):
         started = self._tool_started.pop(str(run_id), time.monotonic())
@@ -279,7 +237,6 @@ class TaskEventCallback(BaseCallbackHandler):
             "tool_call_failed",
             {"error": str(error)[:4000], "duration_ms": int((time.monotonic() - started) * 1000), "run_id": str(run_id)},
         )
-        self._record_plan_activity(tool_name, "failed", str(run_id))
 
 
 def extract_final_text(state_or_result: Any) -> str:
@@ -331,6 +288,41 @@ class ResearchExecutor:
         self.db = db
         self.agent_builder = agent_builder
         self.checkpointer_factory = checkpointer_factory
+
+    def finalize_plan(self, task_id: str, outcome: str) -> str | None:
+        """Freeze the final strategic plan and all material revisions at task termination."""
+        artifacts = ArtifactStore(self.settings.workspace_dir, task_id)
+        finalized_at = datetime.now(timezone.utc).isoformat(timespec="seconds")
+        archive_path = ResearchToolService.persist_plan_archive(
+            self.db,
+            task_id,
+            artifacts,
+            status="finalized",
+            outcome=outcome,
+            finalized_at=finalized_at,
+        )
+        if not archive_path:
+            return None
+        events = self.db.get_events(task_id, limit=5000)
+        plan_events = [
+            event for event in events
+            if event["event_type"] == "research_plan_updated"
+        ]
+        latest = plan_events[-1] if plan_events else None
+        payload = latest.get("payload", {}) if latest else {}
+        archive = json.loads(artifacts.read_text(archive_path))
+        self.db.add_event(
+            task_id,
+            "research_plan_finalized",
+            {
+                "version": archive.get("current_version", payload.get("version", 1)),
+                "outcome": outcome,
+                "history_count": len(archive.get("history", [])),
+                "artifact_path": archive_path,
+                "finalized_at": finalized_at,
+            },
+        )
+        return archive_path
 
     def _build_agent(self, task: dict[str, Any], checkpointer: Any, started: float):
         if self.agent_builder:
