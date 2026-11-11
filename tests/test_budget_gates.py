@@ -249,3 +249,115 @@ def test_runtime_has_no_research_package_imports_and_imports_without_fetch_depen
     )
     assert completed.returncode == 0, completed.stderr
     assert "minimal-runtime-import-ok" in completed.stdout
+
+
+def test_callback_settlement_and_provider_error_release_reservations(db):
+    success_task = db.create_task("Model callback settlement", max_total_tokens=10000)
+    db.claim_next_task("callback-worker")
+    success_callback = TaskEventCallback(db, success_task["task_id"], time.monotonic(), 60)
+    success_callback.on_chat_model_start(
+        {"name": "fake-model"},
+        [[SimpleNamespace(type="human", content="short prompt")]],
+        run_id="callback-settlement",
+    )
+    reserved_before = db.get_task(success_task["task_id"])["reserved_tokens"]
+    assert reserved_before > 0
+    response = SimpleNamespace(
+        llm_output={"token_usage": {"total_tokens": 1200}},
+        generations=[],
+    )
+    success_callback.on_llm_end(response, run_id="callback-settlement")
+    success_callback.on_llm_end(response, run_id="callback-settlement")
+    settled = db.get_task(success_task["task_id"])
+    assert settled["total_tokens_used"] == 1200
+    assert settled["reserved_tokens"] == 0
+
+    failed_task = db.create_task("Model callback failure release", max_total_tokens=10000)
+    db.claim_next_task("callback-error-worker")
+    failed_callback = TaskEventCallback(db, failed_task["task_id"], time.monotonic(), 60)
+    failed_callback.on_chat_model_start(
+        {"name": "fake-model"},
+        [[SimpleNamespace(type="human", content="short prompt")]],
+        run_id="callback-failure",
+    )
+    assert db.get_task(failed_task["task_id"])["reserved_tokens"] > 0
+    failed_callback.on_llm_error(RuntimeError("simulated provider failure"), run_id="callback-failure")
+    released = db.get_task(failed_task["task_id"])
+    assert released["reserved_tokens"] == 0
+    assert released["total_tokens_used"] == 0
+
+
+def test_token_budget_exhaustion_fails_worker_without_provider_call_or_retry(settings, db):
+    task = db.create_task("Worker token exhaustion", max_total_tokens=1000)
+    provider_calls = []
+
+    class ProviderExecutor:
+        def run(self, claimed, worker_id=None):
+            callback = TaskEventCallback(
+                db, claimed["task_id"], time.monotonic(),
+                claimed["max_runtime_seconds"], worker_id, claimed["worker_generation"],
+            )
+            callback.on_chat_model_start(
+                {"name": "fake-model"},
+                [[SimpleNamespace(type="human", content="large prompt " * 1000)]],
+                run_id="worker-token-exhaustion",
+            )
+            provider_calls.append("called")
+
+    worker = Worker(settings, db, executor=ProviderExecutor())
+    assert worker.run_once() is True
+    current = db.get_task(task["task_id"])
+    events = db.get_events(task["task_id"])
+    assert current["status"] == "failed"
+    assert current["error_code"] == "TOKEN_BUDGET_EXHAUSTED"
+    assert current["total_tokens_used"] == 0
+    assert current["reserved_tokens"] == 0
+    assert provider_calls == []
+    assert not any(event["event_type"] == "retry_scheduled" for event in events)
+
+
+def test_delivery_validation_two_repairs_exhausts_terminally_without_retry(settings, db):
+    role = "two_repair_probe_" + uuid.uuid4().hex[:8]
+    validation_calls = []
+    repair_calls = []
+    finalizer_calls = []
+
+    class FakeAgent:
+        def get_state(self, config):
+            return None
+
+        def invoke(self, payload, config):
+            return {"messages": [{"role": "assistant", "content": "Invalid but materialized report"}]}
+
+    def validator(content, task, artifacts):
+        validation_calls.append(content)
+        return False
+
+    def postprocessor(agent, result, config, task, artifacts, validation):
+        repair_calls.append(len(repair_calls) + 1)
+        agent.invoke({"messages": [{"role": "user", "content": "repair based on validation"}]}, config=config)
+
+    def finalizer(_db, task_id, artifacts, outcome, task):
+        finalizer_calls.append((task_id, outcome, artifacts.exists("reports/custom.md")))
+
+    register_agent(
+        role, lambda *_args: FakeAgent(),
+        output_artifact="reports/custom.md",
+        validator=validator, postprocessor=postprocessor, max_revisions=2,
+        finalizer=finalizer,
+    )
+    task = db.create_task("Exercise two bounded delivery repairs", agent_type=role)
+    worker = Worker(
+        settings, db,
+        executor=ResearchExecutor(settings, db, checkpointer_factory=lambda _path: _fake_checkpointer()),
+    )
+    assert worker.run_once() is True
+    current = db.get_task(task["task_id"])
+    events = db.get_events(task["task_id"])
+    assert current["status"] == "failed"
+    assert current["error_code"] == "DELIVERY_VALIDATION_EXHAUSTED"
+    assert len(validation_calls) == 3
+    assert repair_calls == [1, 2]
+    assert finalizer_calls == [(task["task_id"], "failed", True)]
+    assert sum(event["event_type"] == "delivery_validation_completed" for event in events) == 3
+    assert not any(event["event_type"] == "retry_scheduled" for event in events)

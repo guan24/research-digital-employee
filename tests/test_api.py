@@ -270,3 +270,39 @@ def test_task_creation_uses_one_role_budget_source_and_explicit_values_override(
         assert overridden.status_code == 202
         task = overridden.json()
         assert (task["max_steps"], task["max_runtime_seconds"], task["max_total_tokens"]) == (7, 900, 12000)
+
+
+def test_runtime_budget_extension_adds_quota_and_requeues_checkpoint(tmp_path, monkeypatch):
+    monkeypatch.setenv("APP_HOME", str(tmp_path))
+    monkeypatch.setenv("DATA_DIR", str(tmp_path / "data"))
+    monkeypatch.setenv("WORKSPACE_DIR", str(tmp_path / "workspaces"))
+    with TestClient(app) as client:
+        created = client.post("/tasks", json={
+            "goal": "Research a runtime-budget extension recovery scenario",
+            "max_runtime_seconds": 60,
+        })
+        assert created.status_code == 202
+        task_id = created.json()["task_id"]
+        db = client.app.state.db
+        claimed = db.claim_next_task("runtime-extension-worker")
+        db.record_classified_error(
+            task_id, "cumulative runtime budget exhausted",
+            "control", "RUNTIME_BUDGET_EXHAUSTED", False, claimed["attempts"],
+        )
+        assert db.mark_failed(task_id, "RUNTIME_BUDGET_EXHAUSTED", "runtime-extension-worker")
+
+        approved = client.post(f"/tasks/{task_id}/budget/approve", json={
+            "reason": "Resume after operator-approved runtime extension",
+            "additional_runtime_seconds": 600,
+        })
+        assert approved.status_code == 200
+        assert approved.json()["new_limits"]["runtime_seconds"] == 660
+        assert approved.json()["resumed_from_checkpoint"] is True
+        current = db.get_task(task_id)
+        assert current["status"] == "queued"
+        assert current["resume_mode"] == 1
+        assert current["runtime_seconds_used"] >= 0
+        assert current["max_runtime_seconds"] == 660
+        events = db.get_events(task_id)
+        assert any(event["event_type"] == "budget_checkpoint_resume_requested" for event in events)
+        assert any(event["event_type"] == "task_manually_requeued" for event in events)
