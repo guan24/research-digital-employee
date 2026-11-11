@@ -12,7 +12,7 @@ from fastapi import APIRouter, HTTPException, Request
 from fastapi.responses import PlainTextResponse, StreamingResponse
 
 from app.infrastructure.artifact_store import ArtifactError, ArtifactStore
-from app.schemas.task import EventOut, TaskCreate, TaskOut, TaskRetry, TaskRetryOut
+from app.schemas.task import BudgetExtensionApproval, EventOut, TaskCreate, TaskOut, TaskRetry, TaskRetryOut
 
 router = APIRouter()
 
@@ -83,6 +83,19 @@ def get_task_budget(task_id: str, request: Request):
     if not db.get_task(task_id):
         raise HTTPException(status_code=404, detail="task not found")
     return db.get_budget_status(task_id)
+
+
+@router.post("/tasks/{task_id}/budget/approve")
+def approve_task_budget_extension(task_id: str, body: BudgetExtensionApproval, request: Request):
+    db = _db(request)
+    result = db.approve_budget_extension(
+        task_id, reason=body.reason, additional_steps=body.additional_steps,
+        additional_runtime_seconds=body.additional_runtime_seconds,
+        additional_tokens=body.additional_tokens,
+    )
+    if result is None:
+        raise HTTPException(status_code=404, detail="task not found")
+    return result
 
 
 @router.get("/tasks/{task_id}/evidence")

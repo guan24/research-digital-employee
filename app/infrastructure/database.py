@@ -479,6 +479,35 @@ class Database:
             "预算达到 80%；只执行高价值核验并开始收敛。" if peak >= .8 else "预算正常。")
         return {"enabled": enabled, "state": state, "policy": "soft_limit_agent_autonomy", "dimensions": dimensions, "instruction": instruction}
 
+    def approve_budget_extension(self, task_id: str, *, reason: str,
+                                 additional_steps: int = 0,
+                                 additional_runtime_seconds: int = 0,
+                                 additional_tokens: int = 0) -> dict[str, Any] | None:
+        additions = {
+            "steps": max(0, min(int(additional_steps), 100)),
+            "runtime_seconds": max(0, min(int(additional_runtime_seconds), 86_400)),
+            "tokens": max(0, min(int(additional_tokens), 5_000_000)),
+        }
+        if not any(additions.values()):
+            raise ValueError("at least one positive budget extension is required")
+        if not str(reason or "").strip():
+            raise ValueError("approval reason is required")
+        with self.transaction() as conn:
+            row = conn.execute("SELECT status,max_steps,max_runtime_seconds,max_total_tokens FROM tasks WHERE task_id=?", (task_id,)).fetchone()
+            if not row:
+                return None
+            conn.execute("""UPDATE tasks SET max_steps=max_steps+?, max_runtime_seconds=max_runtime_seconds+?,
+                max_total_tokens=max_total_tokens+?, updated_at=? WHERE task_id=?""",
+                (additions["steps"], additions["runtime_seconds"], additions["tokens"], utc_now(), task_id))
+            updated = conn.execute("SELECT max_steps,max_runtime_seconds,max_total_tokens FROM tasks WHERE task_id=?", (task_id,)).fetchone()
+            conn.execute("INSERT INTO events(task_id,timestamp,event_type,payload_json) VALUES(?,?,?,?)",
+                (task_id,utc_now(),"budget_extension_approved",json.dumps({
+                    "reason":reason.strip()[:1200],"additions":additions,
+                    "new_limits":{"tool_calls":updated["max_steps"],"runtime_seconds":updated["max_runtime_seconds"],"tokens":updated["max_total_tokens"]}
+                },ensure_ascii=False)))
+        return {"task_id":task_id,"additions":additions,"new_limits":{
+            "tool_calls":updated["max_steps"],"runtime_seconds":updated["max_runtime_seconds"],"tokens":updated["max_total_tokens"]}}
+
     def emit_budget_alerts(self, task_id: str) -> None:
         budget = self.get_budget_status(task_id)
         if not budget.get("enabled"):

@@ -64,3 +64,10 @@ class TaskRetryOut(BaseModel):
     workspace_preserved: bool
     previous_attempts: int
     message: str
+
+
+class BudgetExtensionApproval(BaseModel):
+    reason: str = Field(min_length=3, max_length=1200)
+    additional_steps: int = Field(default=0, ge=0, le=100)
+    additional_runtime_seconds: int = Field(default=0, ge=0, le=86400)
+    additional_tokens: int = Field(default=0, ge=0, le=5_000_000)
