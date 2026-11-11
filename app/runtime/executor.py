@@ -56,6 +56,7 @@ class TaskEventCallback(BaseCallbackHandler):
         self.db.add_event(self.task_id, "model_call_started", {
             "model": model_name,
             "purpose": "research planning / evidence synthesis",
+            "run_id": str(run_id),
             "input_summary": input_summary[:1200],
             "raw_request": raw_request,
         })
@@ -94,7 +95,7 @@ class TaskEventCallback(BaseCallbackHandler):
         self.db.add_event(
             self.task_id, "model_call_completed",
             {"duration_ms": int((time.monotonic() - started) * 1000),
-             "usage": usage, "decision_summary": output[:1200], "raw_response": output[:20000]},
+             "usage": usage, "decision_summary": output[:1200], "raw_response": output[:20000], "run_id": str(run_id)},
         )
 
     def on_llm_error(self, error, *, run_id, **kwargs):
@@ -102,7 +103,7 @@ class TaskEventCallback(BaseCallbackHandler):
         self.db.add_event(
             self.task_id,
             "model_call_failed",
-            {"duration_ms": int((time.monotonic() - started) * 1000), "error": str(error)[:2000]},
+            {"duration_ms": int((time.monotonic() - started) * 1000), "error": str(error)[:2000], "run_id": str(run_id)},
         )
 
     def on_tool_start(self, serialized, input_str, *, run_id, **kwargs):
