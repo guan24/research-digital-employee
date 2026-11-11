@@ -45,14 +45,16 @@ def create_task(body: TaskCreate, request: Request):
         get_agent_builder(body.agent_type)
     except ValueError as exc:
         raise HTTPException(status_code=422, detail=str(exc)) from exc
+    from app.agents.registry import get_agent_registration
+    defaults = get_agent_registration(body.agent_type).budget_defaults
     task = _db(request).create_task(
         goal=body.goal,
         agent_type=body.agent_type,
         max_attempts=body.max_attempts,
-        max_steps=body.max_steps,
-        max_runtime_seconds=body.max_runtime_seconds,
+        max_steps=body.max_steps if body.max_steps is not None else defaults.max_steps,
+        max_runtime_seconds=body.max_runtime_seconds if body.max_runtime_seconds is not None else defaults.max_runtime_seconds,
         budget_enabled=body.budget_enabled,
-        max_total_tokens=body.max_total_tokens,
+        max_total_tokens=body.max_total_tokens if body.max_total_tokens is not None else defaults.max_total_tokens,
     )
     ArtifactStore(settings.workspace_dir, task["task_id"])
     return task

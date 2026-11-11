@@ -523,10 +523,9 @@ class Database:
         now=time.time(); accounted=task.get("runtime_last_accounted_at") or task.get("heartbeat_at") or now
         runtime=float(task.get("runtime_seconds_used") or 0)
         if task.get("status")=="running": runtime+=max(0.0,now-float(accounted))
-        dimensions={
-            "tool_calls":{"used":int(task.get("execution_steps") or 0),"limit":int(task.get("max_steps") or 0)},
-            "runtime_seconds":{"used":round(runtime,2),"limit":int(task.get("max_runtime_seconds") or 0)},
-            "tokens":{"used":int(task.get("total_tokens_used") or 0),"reserved":int(task.get("reserved_tokens") or 0),"limit":int(task.get("max_total_tokens") or 0)}}
+        dimensions={"tool_calls":{"used":int(task.get("execution_steps") or 0),"limit":int(task.get("max_steps") or 0)},
+          "runtime_seconds":{"used":round(runtime,2),"limit":int(task.get("max_runtime_seconds") or 0)},
+          "tokens":{"used":int(task.get("total_tokens_used") or 0),"reserved":int(task.get("reserved_tokens") or 0),"limit":int(task.get("max_total_tokens") or 0)}}
         for item in dimensions.values():
             item["remaining"]=max(0,item["limit"]-item["used"]-int(item.get("reserved",0)))
             item["ratio"]=(item["used"]+int(item.get("reserved",0)))/item["limit"] if item["limit"] else 0
@@ -534,8 +533,8 @@ class Database:
         trigger=max(ratios,key=ratios.get); peak=max(ratios.values(),default=0)
         state="disabled" if not enabled else ("soft_limit" if peak>=1 else ("restricted" if peak>=.95 else ("warning" if peak>=.8 else "normal")))
         return {"enabled":enabled,"state":state,"trigger_dimension":trigger,"dimensions":dimensions,
-                "policy":"hard tool/runtime gates; token reservation before provider call",
-                "instruction":"Stop exploration and finish using saved evidence." if state in {"restricted","soft_limit"} else "Budget warning; converge." if state=="warning" else "Budget normal."}
+          "policy":"hard tool/runtime gates; token reservation before provider call",
+          "instruction":"Stop exploration and finish using saved evidence." if state in {"restricted","soft_limit"} else "Budget warning; converge." if state=="warning" else "Budget normal."}
 
     def approve_budget_extension(self, task_id: str, *, reason: str,
                                  additional_steps: int = 0,
@@ -573,10 +572,10 @@ class Database:
         for name, item in budget["dimensions"].items():
             if not item["limit"]:
                 continue
-            for threshold in (80, 100):
+            for threshold in (80, 95, 100):
                 if item["ratio"] < threshold / 100:
                     continue
-                event_type = "budget_warning" if threshold == 80 else "budget_soft_limit_reached"
+                event_type = "budget_warning" if threshold == 80 else ("budget_restricted" if threshold == 95 else "budget_soft_limit_reached")
                 key = "budget:" + name + ":" + str(threshold)
                 with self.transaction() as conn:
                     exists = conn.execute(

@@ -364,6 +364,13 @@ class ResearchExecutor:
             elif snapshot is not None and getattr(snapshot, "values", None):
                 self.db.add_event(task_id, "checkpoint_already_complete", {})
                 result = snapshot.values
+                if task.get("resume_mode"):
+                    events = self.db.get_events(task_id, limit=5000)
+                    failed_validation = next((event for event in reversed(events) if event["event_type"] == "delivery_validation_completed" and not event["payload"].get("valid")), None)
+                    if failed_validation:
+                        repair = "上次交付校验未通过，请基于已保存的报告和以下校验反馈进行定向修复，不要重新执行已完成的研究：\\n" + str(failed_validation["payload"].get("errors", "")) + "\\n修复后覆盖岗位声明的产物文件。"
+                        self.db.add_event(task_id, "delivery_repair_resumed", {"source_event_id": failed_validation["event_id"]})
+                        result = agent.invoke({"messages": [{"role": "user", "content": repair}]}, config=config)
             else:
                 self.db.add_event(task_id, "agent_initial_run", {})
                 result = agent.invoke({"messages": [{"role": "user", "content": task["goal"]}]}, config=config)
