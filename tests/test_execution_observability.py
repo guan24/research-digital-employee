@@ -166,7 +166,7 @@ def test_artifact_preview_has_markdown_json_render_and_source_modes():
     assert "function highlightJson(source)" not in source
     assert "JSON.stringify(JSON.parse(source), null, 2)" not in source
     assert "JSON · 原始文本" in source
-    assert "previewRendered.hidden = true" in source
+    assert "$('previewRendered').hidden = true" in source
     assert "function planHistoryEntry(version)" in source
     assert "problemAnalysis" in source
     assert "newInformation" in source

@@ -604,10 +604,11 @@ class ResearchToolService:
             "history": history,
             "note": "Only initial planning and material strategic replans are versioned; step progress belongs to the execution trace.",
         }
-        return artifacts.write_text(
+        artifacts.write_text(
             "notes/agent_execution_plan.json",
             json.dumps(archive, ensure_ascii=False, indent=2),
         )
+        return "notes/agent_execution_plan.json"
 
     def update_research_plan(
         self,
