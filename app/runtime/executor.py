@@ -207,7 +207,8 @@ class TaskEventCallback(BaseCallbackHandler):
 
     def on_llm_start(self, serialized, prompts, *, run_id, **kwargs):
         self._on_model_start(serialized, run_id, "Text completion request",
-                             {"prompt": [str(item)[:20000] for item in (prompts or [])]})
+                             {"prompt": [str(item)[:20000] for item in (prompts or [])],
+                              "callback_kwargs": kwargs})
 
     def on_chat_model_start(self, serialized, messages, *, run_id, **kwargs):
         request_messages = []
@@ -220,7 +221,7 @@ class TaskEventCallback(BaseCallbackHandler):
                 if role in {"human", "user"}:
                     user_parts.append(str(content))
         self._on_model_start(serialized, run_id, " | ".join(user_parts)[-1200:],
-                             {"messages": request_messages})
+                             {"messages": request_messages, "callback_kwargs": kwargs})
 
     def on_llm_end(self, response, *, run_id, **kwargs):
         started = self._llm_started.pop(str(run_id), time.monotonic())
