@@ -25,7 +25,8 @@ def build_research_agent(
     os.environ.setdefault("LANGGRAPH_STRICT_MSGPACK", "true")
 
     from deepagents import create_deep_agent
-    from deepagents.backends import StateBackend
+    from deepagents.backends import CompositeBackend, FilesystemBackend, StateBackend
+    from deepagents.middleware.summarization import SummarizationMiddleware
     from deepagents.profiles import GeneralPurposeSubagentProfile, HarnessProfile, register_harness_profile
     from langchain_openai import ChatOpenAI
 
@@ -40,7 +41,8 @@ def build_research_agent(
 
     profile: AgentProfile = load_research_profile()
     artifacts = ArtifactStore(settings.workspace_dir, task["task_id"])
-    tool_service = ResearchToolService(settings, db, task["task_id"], artifacts, started_monotonic)
+    tool_service = ResearchToolService(settings, db, task["task_id"], artifacts, started_monotonic,
+        task.get("worker_id"), task.get("worker_generation"))
     model = ChatOpenAI(
         model=settings.openai_model,
         api_key=settings.openai_api_key,
@@ -49,13 +51,21 @@ def build_research_agent(
         timeout=settings.model_timeout_seconds,
         max_retries=1,
     )
+    backend = CompositeBackend(
+        default=StateBackend(),
+        routes={"/research_memory/": FilesystemBackend(root_dir=str(artifacts.workspace), virtual_mode=True)},
+    )
+    summarization = SummarizationMiddleware(
+        model=model, backend=backend, trigger=("fraction", 0.78), keep=("fraction", 0.18)
+    )
     return create_deep_agent(
         model=model,
         tools=tool_service.as_langchain_tools(),
-        system_prompt=profile.system_prompt,
+        system_prompt=profile.system_prompt + "\\n\\nTask memory: call read_research_memory at the start and after context compaction; save concise verified progress with save_research_memory before major phase transitions and before final synthesis. The task-scoped filesystem under /research_memory/ is durable across process restarts.",
+        middleware=[summarization],
         checkpointer=checkpointer,
         subagents=[],
-        backend=StateBackend(),
+        backend=backend,
         name=profile.name,
         debug=False,
     )

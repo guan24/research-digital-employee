@@ -9,6 +9,8 @@ class TaskCreate(BaseModel):
     agent_type: str = Field(default="research", min_length=1, max_length=64, pattern=r"^[a-z][a-z0-9_-]*$")
     max_steps: int = Field(default=12, ge=2, le=40)
     max_runtime_seconds: int = Field(default=3600, ge=60, le=14_400)
+    budget_enabled: bool = True
+    max_total_tokens: int = Field(default=100_000, ge=1000, le=2_000_000)
     max_attempts: int = Field(default=3, ge=1, le=5)
 
 
@@ -35,6 +37,10 @@ class TaskOut(BaseModel):
     max_attempts: int
     max_steps: int
     max_runtime_seconds: int
+    budget_enabled: bool = True
+    max_total_tokens: int = 100_000
+    total_tokens_used: int = 0
+    worker_generation: int = 0
     last_error: str | None = None
     result_path: str | None = None
 
@@ -58,3 +64,10 @@ class TaskRetryOut(BaseModel):
     workspace_preserved: bool
     previous_attempts: int
     message: str
+
+
+class BudgetExtensionApproval(BaseModel):
+    reason: str = Field(min_length=3, max_length=1200)
+    additional_steps: int = Field(default=0, ge=0, le=100)
+    additional_runtime_seconds: int = Field(default=0, ge=0, le=86400)
+    additional_tokens: int = Field(default=0, ge=0, le=5_000_000)

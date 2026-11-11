@@ -30,33 +30,12 @@ except (
 from app.config import Settings
 from app.infrastructure.artifact_store import ArtifactStore
 from app.infrastructure.database import Database
+from app.infrastructure.evidence_registry import EvidenceRegistry
+from app.runtime.control import TaskControlSignal, TaskPaused, TaskCancelled, TaskDeadlineExceeded, TaskStepLimitExceeded, WorkerLeaseLost
+from app.tools.common import TaskToolService
 
 
-class TaskControlSignal(RuntimeError):
-    pass
-
-
-class TaskPaused(TaskControlSignal):
-    pass
-
-
-class TaskCancelled(TaskControlSignal):
-    pass
-
-
-class TaskDeadlineExceeded(TaskControlSignal):
-    pass
-
-
-class TaskStepLimitExceeded(TaskControlSignal):
-    pass
-
-
-class WorkerLeaseLost(TaskControlSignal):
-    pass
-
-
-class ResearchToolService:
+class ResearchToolService(TaskToolService):
     def __init__(
         self,
         settings: Settings,
@@ -64,34 +43,10 @@ class ResearchToolService:
         task_id: str,
         artifacts: ArtifactStore,
         started_monotonic: float,
+        worker_id: str | None = None,
+        worker_generation: int | None = None,
     ):
-        self.settings = settings
-        self.db = db
-        self.task_id = task_id
-        self.artifacts = artifacts
-        self.started_monotonic = started_monotonic
-
-    def check_control(self) -> None:
-        task = self.db.get_task(self.task_id)
-        used = float((task or {}).get("runtime_seconds_used", 0) or 0)
-        accounted_at = (task or {}).get("runtime_last_accounted_at") or (task or {}).get("heartbeat_at") or time.time()
-        if used + max(0.0, time.time() - float(accounted_at)) >= self._task_runtime_limit():
-            raise TaskDeadlineExceeded("task exceeded cumulative max_runtime_seconds")
-        flags = self.db.get_control_flags(self.task_id)
-        if not flags:
-            raise TaskCancelled("task record no longer exists")
-        if flags["cancel_requested"] or flags["status"] == "cancelled":
-            raise TaskCancelled("task cancellation requested")
-        if flags["pause_requested"] or flags["status"] == "paused":
-            raise TaskPaused("task pause requested")
-
-    def _task_runtime_limit(self) -> int:
-        task = self.db.get_task(self.task_id)
-        return (
-            int(task["max_runtime_seconds"])
-            if task
-            else self.settings.default_max_runtime_seconds
-        )
+        super().__init__(settings, db, task_id, artifacts, started_monotonic, worker_id, worker_generation)
 
     @staticmethod
     def _slug(value: str) -> str:
@@ -372,7 +327,8 @@ class ResearchToolService:
                         final_url,
                     )
 
-                digest = hashlib.sha256(final_url.encode("utf-8")).hexdigest()[:12]
+                evidence = EvidenceRegistry(self.artifacts).register_source(url=final_url, title=title or final_url, content=text, source_type="webpage")
+                digest = hashlib.sha256((final_url + evidence["content_hash"]).encode("utf-8")).hexdigest()[:12]
                 content = (
                     f"# {title or final_url}\n\nSource: {final_url}\n\n{text}\n"
                 )
@@ -397,6 +353,7 @@ class ResearchToolService:
                         "title": title,
                         "text": text[:14_000],
                         "saved_to": artifact_path,
+                        "source_id": evidence["source_id"],
                         "attempts": attempt,
                     },
                     ensure_ascii=False,
@@ -497,16 +454,17 @@ class ResearchToolService:
             extracted = "\n\n".join(pages)
             if len(extracted) < 80:
                 raise ValueError("PDF contains insufficient extractable text; OCR may be required")
-            digest = hashlib.sha256(requested.encode("utf-8")).hexdigest()[:12]
+            evidence = EvidenceRegistry(self.artifacts).register_source(url=requested, title="PDF source", content=extracted, source_type="pdf")
+            digest = hashlib.sha256((requested + evidence["content_hash"]).encode("utf-8")).hexdigest()[:12]
             path = self.artifacts.write_text(
                 f"sources/pdf_{digest}.md",
                 f"# PDF source\n\nSource: {requested}\n\n{extracted[:60000]}\n",
             )
             self.db.add_event(self.task_id, "research_pdf_fetched", {
-                "url": requested, "pages": len(reader.pages), "characters": len(extracted), "artifact": path
+                "url": requested, "pages": len(reader.pages), "characters": len(extracted), "artifact": path, "source_id": evidence["source_id"]
             })
             return json.dumps({"success": True, "url": requested, "pages": len(reader.pages),
-                               "characters": len(extracted), "saved_to": path}, ensure_ascii=False)
+                               "characters": len(extracted), "saved_to": path, "source_id": evidence["source_id"]}, ensure_ascii=False)
         except TaskControlSignal:
             raise
         except Exception as exc:
@@ -516,23 +474,13 @@ class ResearchToolService:
             return json.dumps({"success": False, "url": requested, "error": str(exc)[:1000]}, ensure_ascii=False)
 
     def save_artifact(self, path: str, content: str) -> str:
-        self.check_control()
-        saved = self.artifacts.write_text(path, content)
-        self.db.add_event(
-            self.task_id,
-            "artifact_saved",
-            {"path": saved, "bytes": len(content.encode("utf-8"))},
-        )
-        return f"Saved artifact: {saved}"
+        return super().save_artifact(path, content)
 
     def read_artifact(self, path: str) -> str:
-        self.check_control()
-        content = self.artifacts.read_text(path)
-        return content[:20_000]
+        return super().read_artifact(path)
 
     def list_artifacts(self) -> str:
-        self.check_control()
-        return json.dumps(self.artifacts.list_files(), ensure_ascii=False)
+        return super().list_artifacts()
 
     @staticmethod
     def _normalize_plan_structure(plan: dict) -> dict:
@@ -1063,6 +1011,20 @@ class ResearchToolService:
             This records progress separately and does not create a new strategic plan version."""
             return self.update_plan_step_status(step_id, status, note)
 
+        @tool("record_finding")
+        def record_finding_tool(claim: str, source_ids: list[str], rationale: str = "", confidence: str = "medium") -> str:
+            """Record an evidence-linked claim with source IDs such as S0001."""
+            self.check_control()
+            finding = EvidenceRegistry(self.artifacts).record_finding(claim=claim, source_ids=source_ids, rationale=rationale, confidence=confidence)
+            self.db.add_event(self.task_id, "research_finding_recorded", finding)
+            return json.dumps(finding, ensure_ascii=False)
+
+        @tool("get_evidence_registry")
+        def get_evidence_registry_tool() -> str:
+            """Read registered evidence sources, immutable snapshots and findings."""
+            self.check_control()
+            return json.dumps(EvidenceRegistry(self.artifacts).summary(), ensure_ascii=False, indent=2)
+
         @tool("web_search")
         def web_search_tool(query: str, max_results: int = 5) -> str:
             """Search the public web using Tavily. Returns titles, URLs, snippets and a saved JSON source file."""
@@ -1094,12 +1056,12 @@ class ResearchToolService:
             return self.list_artifacts()
 
         return [
+            *self.as_common_tools(),
+            record_finding_tool,
+            get_evidence_registry_tool,
             update_research_plan_tool,
             update_plan_step_status_tool,
             web_search_tool,
             fetch_url_tool,
             fetch_pdf_tool,
-            save_artifact_tool,
-            read_artifact_tool,
-            list_artifacts_tool,
         ]

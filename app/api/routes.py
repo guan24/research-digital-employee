@@ -12,7 +12,7 @@ from fastapi import APIRouter, HTTPException, Request
 from fastapi.responses import PlainTextResponse, StreamingResponse
 
 from app.infrastructure.artifact_store import ArtifactError, ArtifactStore
-from app.schemas.task import EventOut, TaskCreate, TaskOut, TaskRetry, TaskRetryOut
+from app.schemas.task import BudgetExtensionApproval, EventOut, TaskCreate, TaskOut, TaskRetry, TaskRetryOut
 
 router = APIRouter()
 
@@ -51,6 +51,8 @@ def create_task(body: TaskCreate, request: Request):
         max_attempts=body.max_attempts,
         max_steps=body.max_steps,
         max_runtime_seconds=body.max_runtime_seconds,
+        budget_enabled=body.budget_enabled,
+        max_total_tokens=body.max_total_tokens,
     )
     ArtifactStore(settings.workspace_dir, task["task_id"])
     return task
@@ -67,6 +69,51 @@ def get_task(task_id: str, request: Request):
     if not task:
         raise HTTPException(status_code=404, detail="task not found")
     return task
+
+
+@router.get("/agents")
+def list_agents():
+    from app.agents.registry import list_agent_profiles
+    return {"agents": list_agent_profiles()}
+
+
+@router.get("/tasks/{task_id}/budget")
+def get_task_budget(task_id: str, request: Request):
+    db = _db(request)
+    if not db.get_task(task_id):
+        raise HTTPException(status_code=404, detail="task not found")
+    return db.get_budget_status(task_id)
+
+
+@router.post("/tasks/{task_id}/budget/approve")
+def approve_task_budget_extension(task_id: str, body: BudgetExtensionApproval, request: Request):
+    db = _db(request)
+    result = db.approve_budget_extension(
+        task_id, reason=body.reason, additional_steps=body.additional_steps,
+        additional_runtime_seconds=body.additional_runtime_seconds,
+        additional_tokens=body.additional_tokens,
+    )
+    if result is None:
+        raise HTTPException(status_code=404, detail="task not found")
+    return result
+
+
+@router.get("/tasks/{task_id}/evidence")
+def get_task_evidence(task_id: str, request: Request):
+    if not _db(request).get_task(task_id):
+        raise HTTPException(status_code=404, detail="task not found")
+    from app.infrastructure.evidence_registry import EvidenceRegistry
+    store = ArtifactStore(_settings(request).workspace_dir, task_id)
+    return EvidenceRegistry(store).summary()
+
+
+@router.get("/tasks/{task_id}/memory")
+def get_task_memory(task_id: str, request: Request):
+    if not _db(request).get_task(task_id):
+        raise HTTPException(status_code=404, detail="task not found")
+    store = ArtifactStore(_settings(request).workspace_dir, task_id)
+    path = "notes/research_memory.md"
+    return {"path": path, "content": store.read_text(path) if store.exists(path) else ""}
 
 
 @router.get("/tasks/{task_id}/events", response_model=list[EventOut])

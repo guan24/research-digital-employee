@@ -191,3 +191,49 @@ def test_task_api_rejects_unregistered_agent_type(tmp_path, monkeypatch):
             "agent_type": "unknown-role",
         })
         assert response.status_code == 422
+
+
+def test_api_exposes_agents_budget_evidence_and_memory(tmp_path, monkeypatch):
+    monkeypatch.setenv("APP_HOME", str(tmp_path))
+    monkeypatch.setenv("DATA_DIR", str(tmp_path / "data"))
+    monkeypatch.setenv("WORKSPACE_DIR", str(tmp_path / "workspaces"))
+    with TestClient(app) as client:
+        agents = client.get("/agents")
+        assert agents.status_code == 200
+        assert "research" in [item["agent_type"] for item in agents.json()["agents"]]
+        created = client.post("/tasks", json={
+            "goal": "Research a sufficiently detailed autonomous system",
+            "budget_enabled": True, "max_total_tokens": 20000
+        })
+        assert created.status_code == 202
+        task_id = created.json()["task_id"]
+        budget = client.get(f"/tasks/{task_id}/budget")
+        evidence = client.get(f"/tasks/{task_id}/evidence")
+        memory = client.get(f"/tasks/{task_id}/memory")
+        assert budget.status_code == evidence.status_code == memory.status_code == 200
+        assert budget.json()["dimensions"]["tokens"]["limit"] == 20000
+        assert evidence.json()["source_count"] == 0
+        assert memory.json()["content"] == ""
+
+
+def test_budget_extension_requires_reason_and_records_approval(tmp_path, monkeypatch):
+    monkeypatch.setenv("APP_HOME", str(tmp_path))
+    monkeypatch.setenv("DATA_DIR", str(tmp_path / "data"))
+    monkeypatch.setenv("WORKSPACE_DIR", str(tmp_path / "workspaces"))
+    with TestClient(app) as client:
+        created = client.post("/tasks", json={
+            "goal": "Research a sufficiently detailed autonomous system",
+            "max_total_tokens": 10000, "max_steps": 10, "max_runtime_seconds": 600
+        })
+        task_id = created.json()["task_id"]
+        response = client.post(f"/tasks/{task_id}/budget/approve", json={
+            "reason": "A primary-source validation phase is still necessary",
+            "additional_steps": 5, "additional_runtime_seconds": 300,
+            "additional_tokens": 20000
+        })
+        assert response.status_code == 200
+        assert response.json()["new_limits"] == {
+            "tool_calls": 15, "runtime_seconds": 900, "tokens": 30000
+        }
+        events = client.get(f"/tasks/{task_id}/events").json()
+        assert events[-1]["event_type"] == "budget_extension_approved"

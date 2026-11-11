@@ -78,3 +78,12 @@ Task runtime is cumulative across retries. SQLite stores `runtime_seconds_used` 
 The report validator is a deterministic structural/evidence gate, not a factuality oracle. It checks minimum body length, a Markdown title, a source section and at least one URL. Failed validation is recorded and fed back to the Agent for at most two bounded revisions; exhaustion fails the task and preserves the report and validation events for review.
 
 Agent builders are registered by `agent_type`. Shared task lifecycle, budgets, Worker, checkpoint, event journal and artifact storage remain in the runtime. Role packages own prompts, model/tool policy and output conventions. The MVP registers only `research`; additional roles can be added without changing the executor dispatch contract.
+
+
+## Long-running execution enhancements
+
+The runtime separates role registration, shared task tools, evidence registration, durable memory and deterministic report validation. Deep Agents summarization compacts long conversations while the SQLite checkpointer preserves graph execution state. Research memory and source snapshots are stored in each task workspace.
+
+Task budgets track tool calls, cumulative runtime and provider-reported tokens. They are soft convergence signals: 80% produces warnings; 100% asks the agent to stop low-value exploration and deliver a scoped report. Operator-approved extensions are auditable. API endpoints expose budget, evidence and memory state.
+
+Evidence IDs map to immutable content snapshots and source URLs. Findings link claims to known source IDs. The final report gate validates structure, source URLs, registered IDs and paragraph-level citation coverage; this is a deterministic provenance check, not a semantic truth proof.
