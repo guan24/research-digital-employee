@@ -273,13 +273,14 @@ function renderTaskSummary() {
 function renderInstanceDiagnostics() {
   const root=$('instanceDiagnostics');
   if(!root||!detail)return;
+  const wasOpen = root.querySelector('details.instance-diagnostics')?.open ?? false;
   const count=type=>events.filter(e=>e.event_type===type).length;
   const recovery=events.filter(e=>['checkpoint_resume','worker_recovery_scheduled','checkpoint_already_complete'].includes(e.event_type)).length;
   const errors=events.filter(e=>['execution_exception','model_call_failed','tool_call_failed','research_page_fetch_failed','worker_recovery_scheduled','retry_scheduled','task_failed','research_plan_archive_failed'].includes(e.event_type)).slice(-8).reverse();
   const attempts=events.filter(e=>e.event_type==='task_started').slice(-8).reverse();
   const heartbeat=detail.heartbeat_at?new Date(Number(detail.heartbeat_at)*1000).toLocaleString():'当前无 Worker 心跳';
   const next=detail.next_run_at>0?new Date(Number(detail.next_run_at)*1000).toLocaleString():'—';
-  root.innerHTML='<details class="instance-diagnostics" open><summary>运行实例与故障诊断</summary><div class="instance-grid">'+
+  root.innerHTML='<details class="instance-diagnostics" '+(wasOpen?'open':'')+'><summary>运行实例与故障诊断</summary><div class="instance-grid">'+
     '<div><small>状态</small><b>'+esc(detail.status)+'</b></div><div><small>Worker</small><b>'+esc(detail.worker_id||'尚未分配')+'</b></div>'+
     '<div><small>最近心跳</small><b>'+esc(heartbeat)+'</b></div><div><small>Checkpoint</small><b>'+(detail.resume_mode?'等待恢复 / 请求复用':'常规执行')+'</b></div>'+
     '<div><small>下次运行</small><b>'+esc(next)+'</b></div><div><small>恢复事件</small><b>'+recovery+' 次</b></div></div>'+

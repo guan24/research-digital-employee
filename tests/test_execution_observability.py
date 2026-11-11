@@ -16,6 +16,16 @@ def make_service(settings, db):
     return task, service
 
 
+def test_instance_diagnostics_defaults_collapsed_and_preserves_user_toggle():
+    source = (Path(__file__).resolve().parents[1] / "app" / "static" / "app.js").read_text(encoding="utf-8")
+    start = source.index("function renderInstanceDiagnostics()")
+    end = source.index("\nfunction renderArtifacts()", start)
+    renderer = source[start:end]
+    assert "const wasOpen = root.querySelector('details.instance-diagnostics')?.open ?? false;" in renderer
+    assert "'<details class=\\"instance-diagnostics\\" '+(wasOpen?'open':'')" in renderer
+    assert '<details class="instance-diagnostics" open>' not in renderer
+
+
 def test_plan_history_only_versions_material_replans(settings, db):
     task, service = make_service(settings, db)
     initial = {"title": "研究计划", "objective": "比较研究对象", "steps": [
