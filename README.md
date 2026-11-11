@@ -120,3 +120,5 @@ Errors are classified as retryable, terminal, control-signal or unknown. Authent
 Budget semantics: tool calls and cumulative runtime are hard gates; tool calls are atomically rejected before tool execution. Model calls reserve estimated input plus an output allowance before the provider request, then settle actual provider usage or release the reservation on failure. At 80% a warning is emitted; at 95% exploration tools are denied while artifact, evidence and memory tools remain available; at 100% the Agent must converge using saved work. Budget extension approval adds quota instead of resetting usage. Token estimation is heuristic; provider-reported usage is authoritative for settlement. Dollar cost is not yet exposed in the console.
 
 Additional endpoints: `GET /tasks/{task_id}/budget` and role discovery through `GET /agents`. Budget approvals use `POST /tasks/{task_id}/budget/approve`.
+
+<!-- baseline validation trigger -->
