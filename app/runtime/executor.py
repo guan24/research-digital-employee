@@ -424,6 +424,10 @@ class ResearchExecutor:
                 self.db.add_event(task_id, "agent_initial_run", {})
                 result = agent.invoke({"messages": [{"role": "user", "content": task["goal"]}]}, config=config)
 
+            # Re-check after graph execution so a provider call that ran past the
+            # deadline cannot be accepted as a successful final response.
+            callback._check_control()
+
             if not artifacts.exists(artifact_path):
                 final_text = extract_final_text(result)
                 if not final_text.strip():
