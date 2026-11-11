@@ -77,7 +77,7 @@ Task runtime is cumulative across retries. SQLite stores `runtime_seconds_used` 
 
 The report validator is a deterministic structural/evidence gate, not a factuality oracle. It checks minimum body length, a Markdown title, a source section and at least one URL. Failed validation is recorded and fed back to the Agent for at most two bounded revisions; exhaustion fails the task and preserves the report and validation events for review.
 
-Agent builders are registered by `agent_type`. Shared task lifecycle, budgets, Worker, checkpoint, event journal and artifact storage remain in the runtime. Role packages own prompts, model/tool policy and output conventions. The MVP registers only `research`; additional roles can be added without changing the executor dispatch contract.
+Roles register a builder plus optional artifact path, validator, bounded postprocessor, finalizer and default budgets. Missing optional hooks have safe defaults. The executor is role-agnostic and never imports research modules. The research registration preserves report.md, the original evidence-coverage validator, two targeted revisions and plan archival.
 
 
 ## Long-running execution enhancements
@@ -87,3 +87,12 @@ The runtime separates role registration, shared task tools, evidence registratio
 Task budgets track tool calls, cumulative runtime and provider-reported tokens. They are soft convergence signals: 80% produces warnings; 100% asks the agent to stop low-value exploration and deliver a scoped report. Operator-approved extensions are auditable. API endpoints expose budget, evidence and memory state.
 
 Evidence IDs map to immutable content snapshots and source URLs. Findings link claims to known source IDs. The final report gate validates structure, source URLs, registered IDs and paragraph-level citation coverage; this is a deterministic provenance check, not a semantic truth proof.
+
+
+## Error classification
+
+Worker routes retryable provider/network failures through backoff, fails terminal authentication/permission/invalid-request/delivery-validation errors immediately, and handles control signals without retry. Unknown exceptions default to retryable but use the explicit UNKNOWN_EXCEPTION class. SQLite preserves latest error, first root cause and append-only per-attempt history.
+
+## Enforced task budgets
+
+Tool calls are consumed atomically before tool execution and cannot exceed max_steps. Model requests reserve estimated input plus a fixed output allowance before invocation; completion settles provider-reported usage and failures release the reservation. Stale worker generations cannot settle reservations. Runtime is cumulative across attempts and pauses are excluded when the task is marked paused. At 80% the system warns; at 95% exploration tools are blocked; at 100% the role converges with saved evidence. Hard gate failures are terminal and preserve checkpoint/workspace for approved quota extension and recovery. Token estimates are heuristic; dollar-cost UI is not implemented.

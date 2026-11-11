@@ -51,6 +51,12 @@ class Database:
                     max_total_tokens INTEGER NOT NULL DEFAULT 100000,
                     total_tokens_used INTEGER NOT NULL DEFAULT 0,
                     worker_generation INTEGER NOT NULL DEFAULT 0,
+                    error_category TEXT,
+                    error_code TEXT,
+                    first_error_json TEXT,
+                    error_history_json TEXT NOT NULL DEFAULT '[]',
+                    reserved_tokens INTEGER NOT NULL DEFAULT 0,
+                    budget_state TEXT NOT NULL DEFAULT 'normal',
                     runtime_seconds_used REAL NOT NULL DEFAULT 0,
                     runtime_last_accounted_at REAL,
                     execution_steps INTEGER NOT NULL DEFAULT 0,
@@ -75,6 +81,7 @@ class Database:
                     FOREIGN KEY(task_id) REFERENCES tasks(task_id) ON DELETE CASCADE
                 );
                 CREATE INDEX IF NOT EXISTS idx_events_task ON events(task_id, event_id);
+                CREATE TABLE IF NOT EXISTS token_reservations (task_id TEXT NOT NULL, reservation_id TEXT NOT NULL, reserved_tokens INTEGER NOT NULL, generation INTEGER NOT NULL DEFAULT 0, settled INTEGER NOT NULL DEFAULT 0, actual_tokens INTEGER NOT NULL DEFAULT 0, PRIMARY KEY(task_id,reservation_id), FOREIGN KEY(task_id) REFERENCES tasks(task_id) ON DELETE CASCADE);
                 CREATE TABLE IF NOT EXISTS worker_lease (
                     lock_id INTEGER PRIMARY KEY CHECK(lock_id = 1),
                     owner TEXT,
@@ -94,6 +101,12 @@ class Database:
                 "max_total_tokens": "ALTER TABLE tasks ADD COLUMN max_total_tokens INTEGER NOT NULL DEFAULT 100000",
                 "total_tokens_used": "ALTER TABLE tasks ADD COLUMN total_tokens_used INTEGER NOT NULL DEFAULT 0",
                 "worker_generation": "ALTER TABLE tasks ADD COLUMN worker_generation INTEGER NOT NULL DEFAULT 0",
+                "error_category": "ALTER TABLE tasks ADD COLUMN error_category TEXT",
+                "error_code": "ALTER TABLE tasks ADD COLUMN error_code TEXT",
+                "first_error_json": "ALTER TABLE tasks ADD COLUMN first_error_json TEXT",
+                "error_history_json": "ALTER TABLE tasks ADD COLUMN error_history_json TEXT NOT NULL DEFAULT '[]'",
+                "reserved_tokens": "ALTER TABLE tasks ADD COLUMN reserved_tokens INTEGER NOT NULL DEFAULT 0",
+                "budget_state": "ALTER TABLE tasks ADD COLUMN budget_state TEXT NOT NULL DEFAULT 'normal'",
             }
             for column, statement in migrations.items():
                 if column not in columns:
@@ -325,7 +338,7 @@ class Database:
                     """UPDATE tasks SET status='completed', completed_at=?, updated_at=?,
                        runtime_seconds_used=runtime_seconds_used+MAX(0.0, ?-COALESCE(runtime_last_accounted_at, heartbeat_at, ?)),
                        runtime_last_accounted_at=NULL, worker_id=NULL, heartbeat_at=NULL,
-                       result_path=?, last_error=NULL WHERE task_id=?""",
+                       result_path=?, last_error=NULL, error_category=NULL, error_code=NULL WHERE task_id=?""",
                     (now_iso, now_iso, now_ts, now_ts, result_path, task_id),
                 )
             else:
@@ -411,24 +424,31 @@ class Database:
         if not cur.rowcount:
             self.add_event(task["task_id"], "stale_worker_update_ignored", {"attempted_status": status})
             return "lease_lost"
+        current = self.get_task(task["task_id"]) or {}
         self.add_event(
             task["task_id"],
             "task_failed" if terminal else "retry_scheduled",
             {"error": error[:2000], "next_status": status, "delay_seconds": delay_seconds,
-             "attempt": task["attempts"], "max_attempts": task["max_attempts"]},
+             "attempt": task["attempts"], "max_attempts": task["max_attempts"],
+             "category": current.get("error_category") or "unknown",
+             "error_code": current.get("error_code") or "UNKNOWN_EXCEPTION"},
         )
         return status
 
     def consume_execution_step(self, task_id: str, worker_id: str | None = None) -> int | None:
-        """Atomically consume a tool call; soft limits are observed, never hard-stopped."""
+        """Consume hard tool-call quota atomically before invoking the tool."""
         with self.transaction() as conn:
-            sql = "UPDATE tasks SET execution_steps=execution_steps+1 WHERE task_id=? AND status='running'"
+            sql = "UPDATE tasks SET execution_steps=execution_steps+1 WHERE task_id=? AND status='running' AND (budget_enabled=0 OR execution_steps < max_steps)"
             args = [task_id]
             if worker_id:
                 sql += " AND worker_id=?"
                 args.append(worker_id)
             cur = conn.execute(sql, tuple(args))
             if cur.rowcount != 1:
+                row = conn.execute("SELECT execution_steps,max_steps,worker_generation FROM tasks WHERE task_id=?", (task_id,)).fetchone()
+                if row:
+                    payload = {"dimension":"tool_calls","gate":"before_tool","used":row["execution_steps"],"limit":row["max_steps"],"generation":row["worker_generation"]}
+                    conn.execute("INSERT INTO events(task_id,timestamp,event_type,payload_json) VALUES(?,?,?,?)",(task_id,utc_now(),"budget_call_rejected",json.dumps(payload)))
                 return None
             row = conn.execute("SELECT execution_steps FROM tasks WHERE task_id=?", (task_id,)).fetchone()
             return int(row["execution_steps"]) if row else None
@@ -455,29 +475,69 @@ class Database:
             cur = conn.execute(sql, tuple(args))
         return total if cur.rowcount == 1 else 0
 
+    def record_classified_error(self, task_id: str, error: str, category: str, code: str, retryable: bool, attempt: int) -> dict[str, Any]:
+        entry={"category":category,"error_code":code,"retryable":bool(retryable),"attempt":attempt,"timestamp":utc_now(),"summary":str(error)[:2000]}
+        with self.transaction() as conn:
+            row=conn.execute("SELECT first_error_json,error_history_json FROM tasks WHERE task_id=?",(task_id,)).fetchone()
+            history=json.loads(row["error_history_json"] or "[]"); history.append(entry)
+            first=row["first_error_json"] or json.dumps(entry,ensure_ascii=False)
+            conn.execute("UPDATE tasks SET error_category=?,error_code=?,first_error_json=?,error_history_json=?,last_error=? WHERE task_id=?",(category,code,first,json.dumps(history,ensure_ascii=False),str(error)[:4000],task_id))
+        return {"first_error":json.loads(first),"error_history":history}
+
+    def reserve_tokens(self, task_id: str, reservation_id: str, estimate: int, worker_id: str | None = None, generation: int | None = None) -> dict[str, Any]:
+        amount=max(1,int(estimate))
+        with self.transaction() as conn:
+            row=conn.execute("SELECT * FROM tasks WHERE task_id=?",(task_id,)).fetchone()
+            if not row: return {"allowed":False,"reason":"task_missing"}
+            if worker_id and (row["worker_id"]!=worker_id or (generation is not None and row["worker_generation"]!=generation)): return {"allowed":False,"reason":"stale_generation"}
+            remaining=int(row["max_total_tokens"])-int(row["total_tokens_used"])-int(row["reserved_tokens"])
+            if row["budget_enabled"] and amount>remaining:
+                payload={"dimension":"tokens","gate":"before_model","requested":amount,"used":row["total_tokens_used"],"reserved":row["reserved_tokens"],"limit":row["max_total_tokens"],"remaining":max(0,remaining),"generation":row["worker_generation"]}
+                conn.execute("INSERT INTO events(task_id,timestamp,event_type,payload_json) VALUES(?,?,?,?)",(task_id,utc_now(),"budget_call_rejected",json.dumps(payload)))
+                return {"allowed":False,"reason":"token_budget_exhausted",**payload}
+            cur=conn.execute("INSERT OR IGNORE INTO token_reservations(task_id,reservation_id,reserved_tokens,generation) VALUES(?,?,?,?)",(task_id,reservation_id,amount,generation or 0))
+            if cur.rowcount: conn.execute("UPDATE tasks SET reserved_tokens=reserved_tokens+? WHERE task_id=?",(amount,task_id))
+            return {"allowed":True,"reserved":amount,"remaining":remaining-amount}
+
+    def settle_token_reservation(self, task_id: str, reservation_id: str, actual: int, worker_id: str | None = None, generation: int | None = None) -> int:
+        with self.transaction() as conn:
+            row=conn.execute("SELECT * FROM token_reservations WHERE task_id=? AND reservation_id=?",(task_id,reservation_id)).fetchone()
+            task=conn.execute("SELECT worker_id,worker_generation FROM tasks WHERE task_id=?",(task_id,)).fetchone()
+            if not row or row["settled"] or not task: return 0
+            if worker_id and task["worker_id"]!=worker_id: return 0
+            if generation is not None and task["worker_generation"]!=generation: return 0
+            actual=max(0,int(actual)); reserved=int(row["reserved_tokens"])
+            conn.execute("UPDATE token_reservations SET settled=1,actual_tokens=? WHERE task_id=? AND reservation_id=?",(actual,task_id,reservation_id))
+            conn.execute("UPDATE tasks SET reserved_tokens=MAX(0,reserved_tokens-?),total_tokens_used=total_tokens_used+? WHERE task_id=?",(reserved,actual,task_id))
+            return actual
+
+    def release_token_reservation(self, task_id: str, reservation_id: str) -> int:
+        with self.transaction() as conn:
+            row=conn.execute("SELECT reserved_tokens,settled FROM token_reservations WHERE task_id=? AND reservation_id=?",(task_id,reservation_id)).fetchone()
+            if not row or row["settled"]: return 0
+            amount=int(row["reserved_tokens"])
+            conn.execute("UPDATE token_reservations SET settled=1 WHERE task_id=? AND reservation_id=?",(task_id,reservation_id))
+            conn.execute("UPDATE tasks SET reserved_tokens=MAX(0,reserved_tokens-?) WHERE task_id=?",(amount,task_id))
+            return amount
+
     def get_budget_status(self, task_id: str) -> dict[str, Any]:
-        task = self.get_task(task_id)
-        if not task:
-            return {"enabled": False, "state": "missing", "dimensions": {}}
-        now = time.time()
-        accounted = task.get("runtime_last_accounted_at") or task.get("heartbeat_at") or now
-        runtime = float(task.get("runtime_seconds_used") or 0)
-        if task.get("status") == "running":
-            runtime += max(0.0, now - float(accounted))
-        dimensions = {
-            "tool_calls": {"used": int(task.get("execution_steps") or 0), "limit": int(task.get("max_steps") or 0)},
-            "runtime_seconds": {"used": round(runtime, 2), "limit": int(task.get("max_runtime_seconds") or 0)},
-            "tokens": {"used": int(task.get("total_tokens_used") or 0), "limit": int(task.get("max_total_tokens") or 0)},
-        }
+        task=self.get_task(task_id)
+        if not task: return {"enabled":False,"state":"missing","dimensions":{}}
+        now=time.time(); accounted=task.get("runtime_last_accounted_at") or task.get("heartbeat_at") or now
+        runtime=float(task.get("runtime_seconds_used") or 0)
+        if task.get("status")=="running": runtime+=max(0.0,now-float(accounted))
+        dimensions={"tool_calls":{"used":int(task.get("execution_steps") or 0),"limit":int(task.get("max_steps") or 0)},
+          "runtime_seconds":{"used":round(runtime,2),"limit":int(task.get("max_runtime_seconds") or 0)},
+          "tokens":{"used":int(task.get("total_tokens_used") or 0),"reserved":int(task.get("reserved_tokens") or 0),"limit":int(task.get("max_total_tokens") or 0)}}
         for item in dimensions.values():
-            item["ratio"] = item["used"] / item["limit"] if item["limit"] else 0
-        enabled = bool(task.get("budget_enabled", 1))
-        peak = max((item["ratio"] for item in dimensions.values()), default=0)
-        state = "disabled" if not enabled else ("exhausted" if peak >= 1 else ("warning" if peak >= .8 else "normal"))
-        instruction = ("预算关闭；安全限制、服务超时和用户控制仍然生效。" if not enabled else
-            "软预算已达到：停止低价值检索，优先使用已有证据并完成报告，披露证据缺口。" if peak >= 1 else
-            "预算达到 80%；只执行高价值核验并开始收敛。" if peak >= .8 else "预算正常。")
-        return {"enabled": enabled, "state": state, "policy": "soft_limit_agent_autonomy", "dimensions": dimensions, "instruction": instruction}
+            item["remaining"]=max(0,item["limit"]-item["used"]-int(item.get("reserved",0)))
+            item["ratio"]=(item["used"]+int(item.get("reserved",0)))/item["limit"] if item["limit"] else 0
+        enabled=bool(task.get("budget_enabled",1)); ratios={k:v["ratio"] for k,v in dimensions.items()}
+        trigger=max(ratios,key=ratios.get); peak=max(ratios.values(),default=0)
+        state="disabled" if not enabled else ("soft_limit" if peak>=1 else ("restricted" if peak>=.95 else ("warning" if peak>=.8 else "normal")))
+        return {"enabled":enabled,"state":state,"trigger_dimension":trigger,"dimensions":dimensions,
+          "policy":"hard tool/runtime gates; token reservation before provider call",
+          "instruction":"Stop exploration and finish using saved evidence." if state in {"restricted","soft_limit"} else "Budget warning; converge." if state=="warning" else "Budget normal."}
 
     def approve_budget_extension(self, task_id: str, *, reason: str,
                                  additional_steps: int = 0,
@@ -515,10 +575,10 @@ class Database:
         for name, item in budget["dimensions"].items():
             if not item["limit"]:
                 continue
-            for threshold in (80, 100):
+            for threshold in (80, 95, 100):
                 if item["ratio"] < threshold / 100:
                     continue
-                event_type = "budget_warning" if threshold == 80 else "budget_soft_limit_reached"
+                event_type = "budget_warning" if threshold == 80 else ("budget_restricted" if threshold == 95 else "budget_soft_limit_reached")
                 key = "budget:" + name + ":" + str(threshold)
                 with self.transaction() as conn:
                     exists = conn.execute(
@@ -553,10 +613,9 @@ class Database:
                     (now_iso, now_iso, now_ts, now_ts, error[:4000], task_id, worker_id),
                 )
             if cur.rowcount:
-                conn.execute(
-                    "INSERT INTO events(task_id,timestamp,event_type,payload_json) VALUES(?,?,?,?)",
-                    (task_id, now_iso, "task_failed", json.dumps({"error": error[:2000], "terminal": True}, ensure_ascii=False)),
-                )
+                detail = conn.execute("SELECT error_category,error_code FROM tasks WHERE task_id=?", (task_id,)).fetchone()
+                payload = {"error": error[:2000], "terminal": True, "category": detail["error_category"] if detail else "unknown", "error_code": detail["error_code"] if detail else "UNKNOWN_EXCEPTION"}
+                conn.execute("INSERT INTO events(task_id,timestamp,event_type,payload_json) VALUES(?,?,?,?)",(task_id,now_iso,"task_failed",json.dumps(payload,ensure_ascii=False)))
         return cur.rowcount == 1
 
     def request_pause(self, task_id: str) -> bool:
@@ -623,6 +682,8 @@ class Database:
                        updated_at=?,
                        completed_at=NULL,
                        last_error=NULL,
+                       error_category=NULL,
+                       error_code=NULL,
                        result_path=NULL
                    WHERE task_id=? AND status='failed'""",
                 (now, task_id),

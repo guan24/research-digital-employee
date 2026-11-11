@@ -143,3 +143,28 @@ def test_real_sqlite_checkpoint_resumes_after_interrupted_node(tmp_path):
         result = app.invoke(None, config=config)
         assert result["final"] == "resumed"
     assert calls == {"completed_node": 1, "interrupted_node": 2}
+
+
+def test_minimal_second_role_owns_artifact_and_finalizer(settings, db):
+    from app.agents.registry import register_agent
+    from app.runtime.executor import ResearchExecutor
+
+    class MinimalAgent(FakeAgent):
+        def __init__(self):
+            super().__init__(snapshot=None, result={"messages":[{"role":"assistant","content":"A concise operations brief."}]})
+
+    calls = []
+    register_agent(
+        "operations_test_role",
+        lambda *_args: MinimalAgent(),
+        output_artifact="deliverables/operations.txt",
+        finalizer=lambda _db, task_id, artifacts, status, task: calls.append((task_id, status, artifacts.exists("deliverables/operations.txt"))),
+    )
+    task = db.create_task("Research a topic with enough detail", agent_type="operations_test_role")
+    task = db.claim_next_task("worker-a")
+    runner = ResearchExecutor(settings, db, checkpointer_factory=fake_checkpointer)
+    output = runner.run(task)
+    assert output.endswith("deliverables/operations.txt")
+    assert Path(output).read_text(encoding="utf-8") == "A concise operations brief.\n"
+    runner.finalize_task(task["task_id"], "completed")
+    assert calls == [(task["task_id"], "completed", True)]

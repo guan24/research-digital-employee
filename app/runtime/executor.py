@@ -290,134 +290,125 @@ def sqlite_checkpointer(checkpoint_path: Path) -> Iterator[Any]:
 
 
 class ResearchExecutor:
-    def __init__(
-        self,
-        settings: Settings,
-        db: Database,
-        agent_builder: Callable[..., Any] | None = None,
-        checkpointer_factory: Callable[[Path], Any] = sqlite_checkpointer,
-    ):
+    def __init__(self, settings: Settings, db: Database,
+                 agent_builder: Callable[..., Any] | None = None,
+                 checkpointer_factory: Callable[[Path], Any] = sqlite_checkpointer):
         self.settings = settings
         self.db = db
         self.agent_builder = agent_builder
         self.checkpointer_factory = checkpointer_factory
 
-    def finalize_plan(self, task_id: str, outcome: str) -> str | None:
-        """Freeze the final strategic plan and all material revisions at task termination."""
-        artifacts = ArtifactStore(self.settings.workspace_dir, task_id)
-        finalized_at = datetime.now(timezone.utc).isoformat(timespec="seconds")
-        task = self.db.get_task(task_id) or {}
-        if outcome == "failed":
-            ResearchToolService.mark_open_plan_steps_failed(
-                self.db,
-                task_id,
-                task.get("last_error") or "任务达到最大重试次数，当前步骤未能完成",
-            )
-        archive_path = ResearchToolService.persist_plan_archive(
-            self.db,
-            task_id,
-            artifacts,
-            status="finalized",
-            outcome=outcome,
-            finalized_at=finalized_at,
-        )
-        if not archive_path:
-            return None
-        events = self.db.get_events(task_id, limit=5000)
-        plan_events = [
-            event for event in events
-            if event["event_type"] == "research_plan_updated"
-        ]
-        latest = plan_events[-1] if plan_events else None
-        payload = latest.get("payload", {}) if latest else {}
-        archive = json.loads(artifacts.read_text(archive_path))
-        self.db.add_event(
-            task_id,
-            "research_plan_finalized",
-            {
-                "version": archive.get("current_version", payload.get("version", 1)),
-                "outcome": outcome,
-                "history_count": len(archive.get("history", [])),
-                "artifact_path": archive_path,
-                "finalized_at": finalized_at,
-            },
-        )
-        return archive_path
+    def _registration(self, task):
+        from app.agents.registry import get_agent_registration
+        return get_agent_registration(task.get("agent_type", "research"))
 
-    def _build_agent(self, task: dict[str, Any], checkpointer: Any, started: float):
+    def _build_agent(self, task, checkpointer, started, registration):
         if self.agent_builder:
             return self.agent_builder(self.settings, self.db, task, checkpointer, started)
-        from app.agents.registry import get_agent_builder
+        return registration.builder(self.settings, self.db, task, checkpointer, started)
 
-        return get_agent_builder(task.get("agent_type", "research"))(
-            self.settings, self.db, task, checkpointer, started
-        )
+    def finalize_task(self, task_id: str, outcome: str) -> Any:
+        task = self.db.get_task(task_id) or {}
+        registration = self._registration(task)
+        if registration.finalizer:
+            artifacts = ArtifactStore(self.settings.workspace_dir, task_id)
+            return registration.finalizer(self.db, task_id, artifacts, outcome, task)
+        return None
+
+    def finalize_plan(self, task_id: str, outcome: str) -> Any:
+        # Backward-compatible alias; lifecycle is now dispatched by role.
+        return self.finalize_task(task_id, outcome)
+
+    @staticmethod
+    def _validation_ok(result: Any) -> bool:
+        if result is None:
+            return True
+        if isinstance(result, bool):
+            return result
+        return bool(getattr(result, "valid", True))
+
+    @staticmethod
+    def _validation_errors(result: Any) -> str:
+        if result is None or isinstance(result, bool):
+            return "delivery validation failed"
+        errors = getattr(result, "errors", ())
+        if isinstance(errors, str):
+            return errors
+        return "; ".join(str(item) for item in errors) or "delivery validation failed"
 
     def run(self, task: dict[str, Any], worker_id: str | None = None) -> str:
+        from app.runtime.errors import DeliveryValidationExhausted
         task_id = task["task_id"]
+        registration = self._registration(task)
+        artifact_path = registration.output_artifact or "result.md"
         started = time.monotonic()
         artifacts = ArtifactStore(self.settings.workspace_dir, task_id)
-        callback = TaskEventCallback(self.db, task_id, started, int(task["max_runtime_seconds"]), worker_id, task.get("worker_generation"))
+        callback = TaskEventCallback(self.db, task_id, started,
+            int(task["max_runtime_seconds"]), worker_id, task.get("worker_generation"))
         callback._check_control()
         config = {
             "configurable": {"thread_id": task_id},
             "recursion_limit": max(30, int(task["max_steps"]) * 5),
             "callbacks": [callback],
         }
-        self.db.add_event(task_id, "agent_execution_started", {"thread_id": task_id})
-        self.db.add_event(task_id, "agent_plan_started", {"goal": task["goal"], "note": "Agent-generated plan and plan revisions are observable in subsequent model outputs and artifact saves."})
-
+        self.db.add_event(task_id, "agent_execution_started", {
+            "thread_id": task_id, "agent_type": registration.agent_type,
+            "output_artifact": artifact_path,
+        })
         with self.checkpointer_factory(self.settings.checkpoint_path) as checkpointer:
-            agent = self._build_agent(task, checkpointer, started)
+            agent = self._build_agent(task, checkpointer, started, registration)
             snapshot = agent.get_state(config)
             if snapshot is not None and getattr(snapshot, "next", ()):
                 self.db.add_event(task_id, "checkpoint_resume", {"pending_nodes": list(snapshot.next)})
                 result = agent.invoke(None, config=config)
             elif snapshot is not None and getattr(snapshot, "values", None):
-                # The graph finished but the worker may have died before updating the task row.
                 self.db.add_event(task_id, "checkpoint_already_complete", {})
                 result = snapshot.values
+                if task.get("resume_mode"):
+                    events = self.db.get_events(task_id, limit=5000)
+                    failed_validation = next((event for event in reversed(events) if event["event_type"] == "delivery_validation_completed" and not event["payload"].get("valid")), None)
+                    if failed_validation:
+                        repair = "上次交付校验未通过，请基于已保存的报告和以下校验反馈进行定向修复，不要重新执行已完成的研究：\\n" + str(failed_validation["payload"].get("errors", "")) + "\\n修复后覆盖岗位声明的产物文件。"
+                        self.db.add_event(task_id, "delivery_repair_resumed", {"source_event_id": failed_validation["event_id"]})
+                        result = agent.invoke({"messages": [{"role": "user", "content": repair}]}, config=config)
             else:
                 self.db.add_event(task_id, "agent_initial_run", {})
-                result = agent.invoke(
-                    {"messages": [{"role": "user", "content": task["goal"]}]},
-                    config=config,
-                )
+                result = agent.invoke({"messages": [{"role": "user", "content": task["goal"]}]}, config=config)
 
-        report_path = "report.md"
-        if not artifacts.exists(report_path):
-            final_text = extract_final_text(result)
-            if not final_text.strip():
-                raise RuntimeError("agent finished without a final answer or report.md")
-            artifacts.write_text(report_path, final_text.strip() + "\n")
-            self.db.add_event(task_id, "report_materialized_from_final_answer", {"path": report_path})
-        else:
-            self.db.add_event(task_id, "report_saved_by_agent", {"path": report_path})
-        from app.runtime.report_validator import ReportValidator, validation_feedback
+            if not artifacts.exists(artifact_path):
+                final_text = extract_final_text(result)
+                if not final_text.strip():
+                    raise RuntimeError(f"agent finished without final answer or {artifact_path}")
+                artifacts.write_text(artifact_path, final_text.strip() + "\n")
+                self.db.add_event(task_id, "artifact_materialized_from_final_answer", {"path": artifact_path})
+            else:
+                self.db.add_event(task_id, "artifact_saved_by_agent", {"path": artifact_path})
 
-        validator = ReportValidator()
-        max_revisions = 2
-        for revision in range(max_revisions + 1):
-            report = artifacts.read_text(report_path)
-            validation = validator.validate(report, task.get("goal", ""), EvidenceRegistry(artifacts).summary())
-            self.db.add_event(task_id, "report_validation_completed", {
-                "valid": validation.valid,
-                "errors": list(validation.errors),
-                "source_count": validation.source_count,
-                "word_count": validation.word_count,
-                "evidence_coverage": validation.evidence_coverage,
-                "cited_source_ids": list(validation.cited_source_ids),
-                "finding_count": validation.finding_count,
-                "revision": revision,
-            })
-            if validation.valid:
-                break
-            if revision >= max_revisions:
-                raise RuntimeError("report validation failed after bounded revisions: " + "; ".join(validation.errors))
-            feedback = validation_feedback(validation)
-            self.db.add_event(task_id, "report_revision_requested", {
-                "revision": revision + 1, "feedback": feedback[:3000]
-            })
-            agent.invoke({"messages": [{"role": "user", "content": feedback}]}, config=config)
-
-        return str((artifacts.workspace / report_path).resolve())
+            if registration.validator is not None:
+                valid = False
+                feedback = None
+                for revision in range(registration.max_revisions + 1):
+                    report = artifacts.read_text(artifact_path)
+                    validation = registration.validator(report, task, artifacts)
+                    valid = self._validation_ok(validation)
+                    errors = self._validation_errors(validation)
+                    self.db.add_event(task_id, "delivery_validation_completed", {
+                        "agent_type": registration.agent_type, "valid": valid,
+                        "errors": errors[:4000], "revision": revision,
+                        "artifact_path": artifact_path,
+                    })
+                    if valid:
+                        break
+                    if revision >= registration.max_revisions:
+                        raise DeliveryValidationExhausted(
+                            f"delivery validation failed after {registration.max_revisions} revisions: {errors}"
+                        )
+                    if registration.postprocessor:
+                        registration.postprocessor(agent, result, config, task, artifacts, validation)
+                    else:
+                        raise DeliveryValidationExhausted(
+                            f"delivery validation failed and role has no repair handler: {errors}"
+                        )
+                if not valid:
+                    raise DeliveryValidationExhausted("delivery validation did not pass")
+        return str((artifacts.workspace / artifact_path).resolve())

@@ -7,10 +7,10 @@ from pydantic import BaseModel, Field, ConfigDict
 class TaskCreate(BaseModel):
     goal: str = Field(min_length=10, max_length=12_000)
     agent_type: str = Field(default="research", min_length=1, max_length=64, pattern=r"^[a-z][a-z0-9_-]*$")
-    max_steps: int = Field(default=12, ge=2, le=40)
-    max_runtime_seconds: int = Field(default=3600, ge=60, le=14_400)
+    max_steps: int | None = Field(default=None, ge=2, le=100)
+    max_runtime_seconds: int | None = Field(default=None, ge=60, le=86_400)
     budget_enabled: bool = True
-    max_total_tokens: int = Field(default=100_000, ge=1000, le=2_000_000)
+    max_total_tokens: int | None = Field(default=None, ge=1000, le=5_000_000)
     max_attempts: int = Field(default=3, ge=1, le=5)
 
 
@@ -42,6 +42,10 @@ class TaskOut(BaseModel):
     total_tokens_used: int = 0
     worker_generation: int = 0
     last_error: str | None = None
+    error_category: str | None = None
+    error_code: str | None = None
+    first_error_json: str | None = None
+    error_history_json: str = "[]"
     result_path: str | None = None
 
 

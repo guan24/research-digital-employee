@@ -45,14 +45,16 @@ def create_task(body: TaskCreate, request: Request):
         get_agent_builder(body.agent_type)
     except ValueError as exc:
         raise HTTPException(status_code=422, detail=str(exc)) from exc
+    from app.agents.registry import get_agent_registration
+    defaults = get_agent_registration(body.agent_type).budget_defaults
     task = _db(request).create_task(
         goal=body.goal,
         agent_type=body.agent_type,
         max_attempts=body.max_attempts,
-        max_steps=body.max_steps,
-        max_runtime_seconds=body.max_runtime_seconds,
+        max_steps=body.max_steps if body.max_steps is not None else defaults.max_steps,
+        max_runtime_seconds=body.max_runtime_seconds if body.max_runtime_seconds is not None else defaults.max_runtime_seconds,
         budget_enabled=body.budget_enabled,
-        max_total_tokens=body.max_total_tokens,
+        max_total_tokens=body.max_total_tokens if body.max_total_tokens is not None else defaults.max_total_tokens,
     )
     ArtifactStore(settings.workspace_dir, task["task_id"])
     return task
@@ -88,6 +90,7 @@ def get_task_budget(task_id: str, request: Request):
 @router.post("/tasks/{task_id}/budget/approve")
 def approve_task_budget_extension(task_id: str, body: BudgetExtensionApproval, request: Request):
     db = _db(request)
+    current = db.get_task(task_id)
     result = db.approve_budget_extension(
         task_id, reason=body.reason, additional_steps=body.additional_steps,
         additional_runtime_seconds=body.additional_runtime_seconds,
@@ -95,6 +98,16 @@ def approve_task_budget_extension(task_id: str, body: BudgetExtensionApproval, r
     )
     if result is None:
         raise HTTPException(status_code=404, detail="task not found")
+    if current and current.get("status") == "failed" and current.get("error_code") in {
+        "TOOL_STEP_BUDGET_EXHAUSTED", "RUNTIME_BUDGET_EXHAUSTED", "TOKEN_BUDGET_EXHAUSTED"
+    }:
+        resumed = db.requeue_failed_task(task_id, reason="Budget extension approved: " + body.reason)
+        if resumed and resumed.get("requeued"):
+            db.add_event(task_id, "budget_checkpoint_resume_requested", {
+                "reason": body.reason, "checkpoint_reuse_requested": True,
+                "workspace_preserved": True, "additions": result["additions"],
+            })
+            result["resumed_from_checkpoint"] = True
     return result
 
 

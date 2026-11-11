@@ -126,14 +126,14 @@ def test_runtime_budget_is_accounted_across_heartbeats_and_retries(db):
     assert after_retry["runtime_last_accounted_at"] is None
 
 
-def test_tool_call_budget_is_a_soft_convergence_signal(db):
+def test_tool_call_budget_is_a_hard_pre_call_gate(db):
     task = db.create_task("Research a topic with enough detail", max_steps=2)
     db.claim_next_task("worker-a")
     assert db.consume_execution_step(task["task_id"], "worker-a") == 1
     assert db.consume_execution_step(task["task_id"], "worker-a") == 2
-    assert db.consume_execution_step(task["task_id"], "worker-a") == 3
-    assert db.get_task(task["task_id"])["execution_steps"] == 3
-    assert db.get_budget_status(task["task_id"])["state"] == "exhausted"
+    assert db.consume_execution_step(task["task_id"], "worker-a") is None
+    assert db.get_task(task["task_id"])["execution_steps"] == 2
+    assert any(event["event_type"] == "budget_call_rejected" for event in db.get_events(task["task_id"]))
 
 
 def test_agent_type_and_step_counter_are_persisted(db):
@@ -141,8 +141,8 @@ def test_agent_type_and_step_counter_are_persisted(db):
     assert task["agent_type"] == "research"
     claimed = db.claim_next_task("worker-a")
     assert db.consume_execution_step(task["task_id"], "worker-a") == 1
-    assert db.consume_execution_step(task["task_id"], "worker-a") == 2
-    assert db.get_task(task["task_id"])["execution_steps"] == 2
+    assert db.consume_execution_step(task["task_id"], "worker-a") is None
+    assert db.get_task(task["task_id"])["execution_steps"] == 1
 
 
 def test_token_budget_and_warning_alerts_are_persisted(db):
@@ -165,3 +165,28 @@ def test_worker_generation_increments_on_reclaim(db):
     db.schedule_retry(first, "transient", 0, "worker-a")
     second = db.claim_next_task("worker-b")
     assert second["worker_generation"] == 2
+
+
+def test_token_reservation_settlement_and_release_are_idempotent(db):
+    task = db.create_task("Research a sufficiently detailed topic", max_total_tokens=5000)
+    claimed = db.claim_next_task("worker-a")
+    reserved = db.reserve_tokens(task["task_id"], "call-1", 3000, "worker-a", claimed["worker_generation"])
+    assert reserved["allowed"] and reserved["reserved"] == 3000
+    assert db.get_task(task["task_id"])["reserved_tokens"] == 3000
+    assert db.settle_token_reservation(task["task_id"], "call-1", 1200, "worker-a", claimed["worker_generation"]) == 1200
+    assert db.settle_token_reservation(task["task_id"], "call-1", 1200, "worker-a", claimed["worker_generation"]) == 0
+    assert db.get_task(task["task_id"])["total_tokens_used"] == 1200
+    assert db.get_task(task["task_id"])["reserved_tokens"] == 0
+    assert db.reserve_tokens(task["task_id"], "call-2", 4000, "worker-a", claimed["worker_generation"])["allowed"] is False
+
+
+def test_error_history_preserves_first_root_cause(db):
+    import json
+    task = db.create_task("Research a sufficiently detailed topic")
+    db.record_classified_error(task["task_id"], "invalid API key", "terminal", "AUTH_FAILED", False, 1)
+    db.record_classified_error(task["task_id"], "second transient issue", "retryable", "UPSTREAM_TIMEOUT", True, 2)
+    current = db.get_task(task["task_id"])
+    history = json.loads(current["error_history_json"])
+    assert len(history) == 2
+    assert history[0]["error_code"] == "AUTH_FAILED"
+    assert json.loads(current["first_error_json"])["summary"] == "invalid API key"

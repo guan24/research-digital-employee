@@ -55,6 +55,9 @@ class ResearchToolService(TaskToolService):
 
     def web_search(self, query: str, max_results: int = 5) -> str:
         self.check_control()
+        blocked = self.budget_tool_gate("web_search")
+        if blocked:
+            return blocked
         if not self.settings.tavily_api_key:
             raise RuntimeError(
                 "TAVILY_API_KEY is required for web search; add it to .env"
@@ -169,6 +172,9 @@ class ResearchToolService(TaskToolService):
         Windows system proxy settings remain available.
         """
         self.check_control()
+        blocked = self.budget_tool_gate("fetch_url")
+        if blocked:
+            return blocked
         requested_url = url.strip()
         if not requested_url:
             return json.dumps(
@@ -430,6 +436,9 @@ class ResearchToolService(TaskToolService):
     def fetch_pdf(self, url: str) -> str:
         """Download and extract a public PDF into the task evidence workspace."""
         self.check_control()
+        blocked = self.budget_tool_gate("fetch_pdf")
+        if blocked:
+            return blocked
         from io import BytesIO
         from pypdf import PdfReader
 

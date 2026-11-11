@@ -52,6 +52,18 @@ class TaskToolService:
             raise TaskPaused("task pause requested")
         self.db.emit_budget_alerts(self.task_id)
 
+    def budget_tool_gate(self, tool_name: str) -> str | None:
+        status = self.db.get_budget_status(self.task_id)
+        if not status.get("enabled"):
+            return None
+        if status.get("state") in {"restricted", "soft_limit", "hard_limit"}:
+            allowed = {"save_artifact", "read_artifact", "list_artifacts", "save_research_memory", "read_research_memory", "get_budget_status", "get_evidence_registry", "record_finding"}
+            if tool_name not in allowed:
+                payload = {"success": False, "error_type": "budget_intercept", "reason": "task is in restricted convergence mode", "dimension": status.get("trigger_dimension"), "remaining": status.get("dimensions", {}), "tool": tool_name}
+                self.db.add_event(self.task_id, "budget_tool_rejected", payload)
+                return __import__("json").dumps(payload, ensure_ascii=False)
+        return None
+
     def save_artifact(self, path: str, content: str) -> str:
         self.check_control()
         saved = self.artifacts.write_text(path, content)
