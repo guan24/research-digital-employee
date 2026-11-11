@@ -338,7 +338,7 @@ class Database:
                     """UPDATE tasks SET status='completed', completed_at=?, updated_at=?,
                        runtime_seconds_used=runtime_seconds_used+MAX(0.0, ?-COALESCE(runtime_last_accounted_at, heartbeat_at, ?)),
                        runtime_last_accounted_at=NULL, worker_id=NULL, heartbeat_at=NULL,
-                       result_path=?, last_error=NULL WHERE task_id=?""",
+                       result_path=?, last_error=NULL, error_category=NULL, error_code=NULL WHERE task_id=?""",
                     (now_iso, now_iso, now_ts, now_ts, result_path, task_id),
                 )
             else:
@@ -679,6 +679,8 @@ class Database:
                        updated_at=?,
                        completed_at=NULL,
                        last_error=NULL,
+                       error_category=NULL,
+                       error_code=NULL,
                        result_path=NULL
                    WHERE task_id=? AND status='failed'""",
                 (now, task_id),
