@@ -109,3 +109,14 @@ This is a single-machine, single-Worker MVP. SQLite is not intended for multi-ho
 - Public PDF text extraction is supported through `fetch_pdf`; scanned PDFs that need OCR are reported as non-extractable.
 - Worker startup waits for an active lease to be released or expire before taking over.
 - Agent builders are registered by `agent_type`. The MVP registers `research`; additional roles can provide their own builder, prompt and tools without changing the runtime executor.
+
+
+## Role contracts, failure policy and enforced budgets
+
+Each registered role declares an artifact path (default `result.md`), optional validator, bounded postprocessor/revision count, optional terminal finalizer, and default budget policy. The shared executor only invokes the role contract, materializes a missing artifact from the final answer, validates it and dispatches terminal cleanup. Research keeps `report.md`, its evidence validator, two targeted revisions and plan archival.
+
+Errors are classified as retryable, terminal, control-signal or unknown. Authentication/permission/request rejection and exhausted delivery validation fail immediately without retrying. Transient network/provider errors use the configured retry backoff. Unknown exceptions are retryable but explicitly tagged `UNKNOWN_EXCEPTION`. Task metadata stores the latest classification, immutable first root cause and append-only error history.
+
+Budget semantics: tool calls and cumulative runtime are hard gates; tool calls are atomically rejected before tool execution. Model calls reserve estimated input plus an output allowance before the provider request, then settle actual provider usage or release the reservation on failure. At 80% a warning is emitted; at 95% exploration tools are denied while artifact, evidence and memory tools remain available; at 100% the Agent must converge using saved work. Budget extension approval adds quota instead of resetting usage. Token estimation is heuristic; provider-reported usage is authoritative for settlement. Dollar cost is not yet exposed in the console.
+
+Additional endpoints: `GET /tasks/{task_id}/budget` and role discovery through `GET /agents`. Budget approvals use `POST /tasks/{task_id}/budget/approve`.

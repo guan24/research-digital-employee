@@ -118,8 +118,15 @@ Markdown 支持渲染和源码两种模式。JSON 仅展示原始文本，不做
 - **岗位注册表**：通过 `app/agents/registry.py` 注册岗位 Agent，定义岗位提示词、产物路径和质量门禁；API `GET /agents` 返回可用岗位。
 - **上下文压缩与长期记忆**：Deep Agents 的 `SummarizationMiddleware` 在上下文约 78% 时自动摘要并保留近期消息；LangGraph SQLite Checkpoint 负责运行状态恢复，任务工作区的 `notes/research_memory.md` 保存跨重启研究摘要。
 - **证据溯源**：成功读取的网页/PDF 自动写入 `evidence/registry.json` 和不可变内容快照，来源分配 `[S0001]` ID；Agent 可用 `record_finding` 将发现关联来源。报告质量门禁检查 URL、章节、来源 ID、快照和段落级引用覆盖率。
-- **资源软预算**：工具调用、累计运行时间、Token 三个维度均持久化。达到 80% 发出预警，达到 100% 要求 Agent 收敛研究并完成报告，不会因软预算自动中止；可审计请求额外预算。API：`GET /tasks/{task_id}/budget`。
+- **任务预算强制执行**：工具调用步数与累计运行时长为硬上限，工具调用前由 SQLite 原子拦截；模型调用前预留输入估算量与输出额度，结束后按 Provider usage 结算，失败释放预留。达到 80% 告警、95% 禁止搜索/抓取并进入受限收敛、100% 要求利用已有材料完成交付。人工扩额采用叠加额度并保留已用量。API：`GET /tasks/{task_id}/budget`、`POST /tasks/{task_id}/budget/approve`。
 - **可观测性**：`GET /tasks/{task_id}/evidence` 与 `GET /tasks/{task_id}/memory` 提供证据和记忆查看，控制台展示预算、证据数量和最新记忆。
 - **兼容性**：SQLite 使用增量迁移；既有任务、事件、Checkpoint 和工作区无需重建。
 
-预算是资源治理信号，不是模型 Token 精确计费。Token 使用量以模型返回的 usage metadata 为准；服务未提供 usage 时不会虚构估算值。
+Token 预留使用字符数启发式估算，结算以模型 Provider 返回的 usage metadata 为准；未提供 usage 时按 0 结算但会保留预留前置闸门。当前尚未接入金额成本界面。
+
+
+## 岗位契约与错误策略
+
+岗位注册可选声明产物路径（默认 `result.md`）、校验器、受控后处理/修订次数、终态收尾函数和默认预算。公共 Executor 不再固定研究报告文件名或研究校验器；研究岗位保留 `report.md`、原证据覆盖率判据、最多两次定向修订及终态计划归档。
+
+错误分为可重试、终态、控制信号和未知类。鉴权/权限/非法请求/交付校验耗尽直接失败，不消耗自动重试；网络与上游临时错误按退避策略重试；未知错误标记为 `UNKNOWN_EXCEPTION` 并默认可重试。任务保存最新错误、首个根因及完整错误历史。

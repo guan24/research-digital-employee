@@ -43,10 +43,10 @@ def classify_exception(exc: BaseException) -> tuple[str, str, bool]:
         return exc.category, exc.code, exc.retryable
     name = type(exc).__name__.lower()
     message = str(exc).lower()
-    if any(x in name for x in ("authentication", "permission", "validation", "badrequest")):
-        return "terminal", "PROVIDER_REQUEST_REJECTED", False
-    if any(x in message for x in ("401", "403", "unauthorized", "forbidden", "invalid api key", "authentication failed")):
+    if any(x in name for x in ("authentication", "permission")) or any(x in message for x in ("401", "403", "unauthorized", "forbidden", "invalid api key", "authentication failed")):
         return "terminal", "PROVIDER_AUTH_OR_PERMISSION", False
+    if any(x in name for x in ("validation", "badrequest")):
+        return "terminal", "PROVIDER_REQUEST_REJECTED", False
     if any(x in message for x in ("context length", "maximum context", "too many tokens")):
         return "terminal", "CONTEXT_TOO_LONG", False
     if any(x in message for x in ("content policy", "moderation", "safety system")):
