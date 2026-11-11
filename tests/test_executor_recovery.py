@@ -18,12 +18,14 @@ class FakeAgent:
         self.snapshot = snapshot
         self.result = result or {"messages": [{"role": "assistant", "content": "# Research report\n\nEvidence-backed result."}]}
         self.invocations = []
+        self.configs = []
 
     def get_state(self, config):
         return self.snapshot
 
     def invoke(self, payload, config):
         self.invocations.append(payload)
+        self.configs.append(config)
         return self.result
 
 
@@ -67,3 +69,29 @@ def test_executor_recovers_completed_checkpoint_without_reinvoking(settings, db)
     report_path = runner.run(task)
     assert agent.invocations == []
     assert "Already completed" in Path(report_path).read_text(encoding="utf-8")
+
+
+
+def test_manual_retry_resumes_original_checkpoint_thread_id(settings, db):
+    task = db.create_task("Research a topic with enough detail", max_attempts=1)
+    claimed = db.claim_next_task("worker-a")
+    assert db.schedule_retry(
+        claimed, "OpenAI API quota exhausted", 0, "worker-a"
+    ) == "failed"
+    retry_result = db.requeue_failed_task(
+        task["task_id"], reason="OpenAI API quota replenished"
+    )
+    assert retry_result is not None and retry_result["requeued"] is True
+
+    resumed_task = db.claim_next_task("worker-b")
+    snapshot = SimpleNamespace(next=("agent",), values={"messages": []})
+    agent = FakeAgent(snapshot=snapshot)
+    runner = _make_runner(settings, db, agent)
+    runner.run(resumed_task)
+
+    assert agent.invocations == [None]
+    assert agent.configs[0]["configurable"]["thread_id"] == task["task_id"]
+    assert any(
+        event["event_type"] == "checkpoint_resume"
+        for event in db.get_events(task["task_id"])
+    )

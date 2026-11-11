@@ -6,7 +6,7 @@ from fastapi import APIRouter, HTTPException, Request
 from fastapi.responses import PlainTextResponse
 
 from app.infrastructure.artifact_store import ArtifactError, ArtifactStore
-from app.schemas.task import EventOut, TaskCreate, TaskOut
+from app.schemas.task import EventOut, TaskCreate, TaskOut, TaskRetry, TaskRetryOut
 
 router = APIRouter()
 
@@ -56,6 +56,36 @@ def get_events(task_id: str, request: Request, limit: int = 500):
     if not _db(request).get_task(task_id):
         raise HTTPException(status_code=404, detail="task not found")
     return _db(request).get_events(task_id, max(1, min(limit, 2000)))
+
+
+@router.post(
+    "/tasks/{task_id}/retry",
+    response_model=TaskRetryOut,
+    status_code=202,
+)
+def retry_task(task_id: str, body: TaskRetry, request: Request):
+    reason = body.reason.strip() if body.reason and body.reason.strip() else None
+    result = _db(request).requeue_failed_task(task_id, reason=reason)
+    if result is None:
+        raise HTTPException(status_code=404, detail="task not found")
+    if not result["requeued"]:
+        current_status = result["current_status"]
+        raise HTTPException(
+            status_code=409,
+            detail=f"only failed tasks can be retried; current status is '{current_status}'",
+        )
+
+    return {
+        "task_id": task_id,
+        "status": "queued",
+        "checkpoint_reuse_requested": True,
+        "workspace_preserved": True,
+        "previous_attempts": result["previous_attempts"],
+        "message": (
+            "Task requeued. The Worker will reuse the existing LangGraph checkpoint "
+            "when one is available."
+        ),
+    }
 
 
 @router.post("/tasks/{task_id}/pause")

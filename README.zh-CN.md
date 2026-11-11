@@ -6,7 +6,7 @@
 
 - 由 Deep Agents 驱动的自主研究循环（而非固定的搜索/阅读/总结脚本）。
 - 外部工具：Tavily 网页搜索、公开网页抓取/阅读、任务作用域内的作品读取/写入/列表。
-- FastAPI 任务 API：创建、查看、列出事件、暂停、恢复、取消、列出/下载作品。
+- FastAPI 任务 API：创建、查看、列出事件、暂停、恢复、手动重试失败任务、取消、列出/下载作品。
 - SQLite 任务生命周期管理、事件日志、单 Worker 租约、心跳、重试调度。
 - 以 `task_id` 为键的 LangGraph SQLite 检查点；过期的 `RUNNING` 任务会被重新排队，并从最新的图检查点恢复。
 - 在 `workspaces/<task_id>/` 下以原子方式写入作品。
@@ -110,9 +110,16 @@ curl -X POST http://127.0.0.1:8000/tasks/<task_id>/pause
 # 从其 LangGraph 检查点恢复一个已暂停的任务
 curl -X POST http://127.0.0.1:8000/tasks/<task_id>/resume
 
+# 手动重试失败任务（保留 task_id、检查点线程和工作区）
+curl -X POST http://127.0.0.1:8000/tasks/<task_id>/retry \
+  -H "Content-Type: application/json" \
+  -d '{"reason":"OpenAI API 额度已恢复"}'
+
 # 协作式取消
 curl -X POST http://127.0.0.1:8000/tasks/<task_id>/cancel
 ```
+
+手动重试接口仅接受 `failed` 状态的任务，成功后返回 **202**。接口会原子地将任务重新放入队列，重置尝试次数并清除终态错误，同时保留任务工作区，并使用原 `task_id` 对应的 LangGraph 检查点继续执行。如果不存在检查点，Executor 会从原始目标开始执行。其他状态返回 **409**，不存在的任务返回 **404**。`task_manually_requeued` 事件记录重试原因和此前的尝试次数。
 
 暂停/取消是协作式的：在到达下一个控制点之前，正在进行的 HTTP 请求或模型生成可能会先执行完毕。
 

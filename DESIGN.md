@@ -54,6 +54,7 @@ This split makes a role replaceable without rewriting platform concerns.
 5. A heartbeat thread renews both the worker lease and task heartbeat while a long synchronous model call is running.
 6. On Worker restart, a task still marked `running` whose heartbeat is older than the lease threshold is moved to `queued` with `resume_mode=1`. The same LangGraph `thread_id` allows the executor to inspect and continue its checkpoint.
 7. Transient or unexpected failures are recorded and scheduled with bounded exponential backoff. After `max_attempts`, the task becomes `failed`.
+8. An operator can call `POST /tasks/{task_id}/retry` for a failed task. Within one `BEGIN IMMEDIATE` SQLite transaction, the task returns to `queued` and a `task_manually_requeued` event records the reason and previous attempt count. The original `task_id`, LangGraph `thread_id`, checkpoint database, and task workspace are preserved. The executor resumes pending graph work from the existing checkpoint, or starts from the original goal when no checkpoint exists.
 
 Task rows and LangGraph checkpoints solve different problems. A task row answers “is this job queued/running/completed and who owns it?” A checkpoint answers “what state and graph node should this Agent continue from?” Neither replaces the other.
 
@@ -74,7 +75,7 @@ The event journal records task transitions, model call boundaries, tool inputs/o
 ## 5. Reliability controls
 
 - Model timeout and bounded model retry configured on `ChatOpenAI`.
-- Worker-level bounded retries with exponential backoff.
+- Worker-level bounded retries with exponential backoff; failed tasks can be manually re-queued through an audited API without deleting their checkpoint or workspace.
 - Single-worker SQLite lease prevents accidental concurrent Worker processes.
 - Heartbeat allows recovery of stale `running` tasks.
 - Graph recursion limit bounds the number of internal graph transitions.
