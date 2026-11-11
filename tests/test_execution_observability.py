@@ -100,6 +100,7 @@ def test_artifact_preview_has_markdown_json_render_and_source_modes():
 
     source = (Path(__file__).resolve().parents[1] / "app" / "static" / "app.js").read_text(encoding="utf-8")
     assert "function renderMarkdown(source)" in source
+    assert "preview-table-wrap" in source
     assert "JSON.stringify(JSON.parse(source), null, 2)" in source
     assert "previewMode === 'rendered'" in source
     assert "previewMode === 'source'" in source

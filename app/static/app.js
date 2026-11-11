@@ -518,7 +518,10 @@ function renderMarkdown(source) {
     .replace(/\*\*([^*]+)\*\*/g, '<strong>$1</strong>')
     .replace(/\*([^*]+)\*/g, '<em>$1</em>')
     .replace(/\[([^\]]+)\]\((https?:\/\/[^ )]+)\)/g, '<a href="$2" target="_blank" rel="noopener noreferrer">$1</a>');
-  for (const line of lines) {
+  const isTableSeparator = line => /^\s*\|?\s*:?-{3,}:?\s*(\|\s*:?-{3,}:?\s*)+\|?\s*$/.test(line);
+  const tableCells = line => line.trim().replace(/^\|/, '').replace(/\|$/, '').split('|').map(cell => cell.trim());
+  for (let index = 0; index < lines.length; index += 1) {
+    const line = lines[index];
     if (line.trim().startsWith(String.fromCharCode(96).repeat(3))) {
       closeList();
       if (inCode) { output.push('<pre><code>' + esc(code.join('\n')) + '</code></pre>'); code = []; }
@@ -526,6 +529,23 @@ function renderMarkdown(source) {
     }
     if (inCode) { code.push(line); continue; }
     if (!line.trim()) { closeList(); continue; }
+    if (index + 1 < lines.length && line.includes('|') && isTableSeparator(lines[index + 1])) {
+      closeList();
+      const headers = tableCells(line);
+      const rows = [];
+      index += 2;
+      while (index < lines.length && lines[index].includes('|') && lines[index].trim()) {
+        rows.push(tableCells(lines[index]));
+        index += 1;
+      }
+      index -= 1;
+      output.push('<div class="preview-table-wrap"><table><thead><tr>' +
+        headers.map(cell => '<th>' + inline(cell) + '</th>').join('') +
+        '</tr></thead><tbody>' + rows.map(row => '<tr>' +
+        headers.map((_, column) => '<td>' + inline(row[column] || '') + '</td>').join('') +
+        '</tr>').join('') + '</tbody></table></div>');
+      continue;
+    }
     const heading = line.match(/^(#{1,6})\s+(.+)$/);
     const unordered = line.match(/^\s*[-*+]\s+(.+)$/);
     const ordered = line.match(/^\s*\d+[.)]\s+(.+)$/);
