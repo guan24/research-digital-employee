@@ -510,9 +510,11 @@ class Database:
             ):
                 return {"allowed": False, "reason": "stale_generation"}
             existing = conn.execute(
-                "SELECT reserved_tokens,settled FROM token_reservations WHERE task_id=? AND reservation_id=?",
+                "SELECT reserved_tokens,settled,generation FROM token_reservations WHERE task_id=? AND reservation_id=?",
                 (task_id, reservation_id),
             ).fetchone()
+            if existing and generation is not None and int(existing["generation"]) != int(generation):
+                return {"allowed": False, "reason": "stale_reservation_generation"}
             remaining = int(row["max_total_tokens"]) - int(row["total_tokens_used"]) - int(row["reserved_tokens"])
             if existing:
                 return {
@@ -626,7 +628,10 @@ class Database:
                 return 0
             if worker_id and task["worker_id"] != worker_id:
                 return 0
-            if generation is not None and task["worker_generation"] != generation:
+            if generation is not None and (
+                task["worker_generation"] != generation
+                or int(row["generation"] or 0) != int(generation)
+            ):
                 return 0
             actual = max(0, int(actual))
             reserved = int(row["reserved_tokens"])
@@ -640,13 +645,35 @@ class Database:
             )
             return actual
 
-    def release_token_reservation(self, task_id: str, reservation_id: str) -> int:
+    def release_token_reservation(self, task_id: str, reservation_id: str,
+                                  worker_id: str | None = None, generation: int | None = None) -> int:
         with self.transaction() as conn:
-            row=conn.execute("SELECT reserved_tokens,settled FROM token_reservations WHERE task_id=? AND reservation_id=?",(task_id,reservation_id)).fetchone()
-            if not row or row["settled"]: return 0
-            amount=int(row["reserved_tokens"])
-            conn.execute("UPDATE token_reservations SET settled=1 WHERE task_id=? AND reservation_id=?",(task_id,reservation_id))
-            conn.execute("UPDATE tasks SET reserved_tokens=MAX(0,reserved_tokens-?) WHERE task_id=?",(amount,task_id))
+            row = conn.execute(
+                "SELECT reserved_tokens,settled,generation FROM token_reservations WHERE task_id=? AND reservation_id=?",
+                (task_id, reservation_id),
+            ).fetchone()
+            task = conn.execute(
+                "SELECT worker_id,worker_generation FROM tasks WHERE task_id=?",
+                (task_id,),
+            ).fetchone()
+            if not row or row["settled"] or not task:
+                return 0
+            if worker_id and task["worker_id"] != worker_id:
+                return 0
+            if generation is not None and (
+                int(task["worker_generation"] or 0) != int(generation)
+                or int(row["generation"] or 0) != int(generation)
+            ):
+                return 0
+            amount = int(row["reserved_tokens"])
+            conn.execute(
+                "UPDATE token_reservations SET settled=1 WHERE task_id=? AND reservation_id=? AND settled=0",
+                (task_id, reservation_id),
+            )
+            conn.execute(
+                "UPDATE tasks SET reserved_tokens=MAX(0,reserved_tokens-?) WHERE task_id=?",
+                (amount, task_id),
+            )
             return amount
 
     def get_budget_status(self, task_id: str) -> dict[str, Any]:

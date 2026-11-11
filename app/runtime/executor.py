@@ -257,7 +257,9 @@ class TaskEventCallback(BaseCallbackHandler):
     def on_llm_error(self, error, *, run_id, **kwargs):
         started = self._llm_started.pop(str(run_id), time.monotonic())
         reservation_id = str(run_id)
-        self.db.release_token_reservation(self.task_id, reservation_id)
+        self.db.release_token_reservation(
+            self.task_id, reservation_id, self.worker_id, self.worker_generation
+        )
         self._token_reservations.discard(reservation_id)
         self.db.add_event(
             self.task_id,

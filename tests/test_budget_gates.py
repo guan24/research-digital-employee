@@ -361,3 +361,30 @@ def test_delivery_validation_two_repairs_exhausts_terminally_without_retry(setti
     assert finalizer_calls == [(task["task_id"], "failed", True)]
     assert sum(event["event_type"] == "delivery_validation_completed" for event in events) == 3
     assert not any(event["event_type"] == "retry_scheduled" for event in events)
+
+
+def test_stale_generation_cannot_settle_or_release_a_token_reservation(db):
+    task = db.create_task("Stale generation reservation guard", max_total_tokens=5000)
+    first = db.claim_next_task("old-worker")
+    reserved = db.reserve_tokens(
+        task["task_id"], "old-generation-call", 2500,
+        "old-worker", first["worker_generation"],
+    )
+    assert reserved["allowed"] is True
+    with db.transaction() as conn:
+        conn.execute(
+            "UPDATE tasks SET worker_id=?,worker_generation=? WHERE task_id=?",
+            ("new-worker", first["worker_generation"] + 1, task["task_id"]),
+        )
+
+    assert db.settle_token_reservation(
+        task["task_id"], "old-generation-call", 1200,
+        "old-worker", first["worker_generation"],
+    ) == 0
+    assert db.release_token_reservation(
+        task["task_id"], "old-generation-call",
+        "old-worker", first["worker_generation"],
+    ) == 0
+    current = db.get_task(task["task_id"])
+    assert current["total_tokens_used"] == 0
+    assert current["reserved_tokens"] == 2500
