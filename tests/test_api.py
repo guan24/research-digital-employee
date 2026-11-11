@@ -191,3 +191,26 @@ def test_task_api_rejects_unregistered_agent_type(tmp_path, monkeypatch):
             "agent_type": "unknown-role",
         })
         assert response.status_code == 422
+
+
+def test_api_exposes_agents_budget_evidence_and_memory(tmp_path, monkeypatch):
+    monkeypatch.setenv("APP_HOME", str(tmp_path))
+    monkeypatch.setenv("DATA_DIR", str(tmp_path / "data"))
+    monkeypatch.setenv("WORKSPACE_DIR", str(tmp_path / "workspaces"))
+    with TestClient(app) as client:
+        agents = client.get("/agents")
+        assert agents.status_code == 200
+        assert "research" in [item["agent_type"] for item in agents.json()["agents"]]
+        created = client.post("/tasks", json={
+            "goal": "Research a sufficiently detailed autonomous system",
+            "budget_enabled": True, "max_total_tokens": 20000
+        })
+        assert created.status_code == 202
+        task_id = created.json()["task_id"]
+        budget = client.get(f"/tasks/{task_id}/budget")
+        evidence = client.get(f"/tasks/{task_id}/evidence")
+        memory = client.get(f"/tasks/{task_id}/memory")
+        assert budget.status_code == evidence.status_code == memory.status_code == 200
+        assert budget.json()["dimensions"]["tokens"]["limit"] == 20000
+        assert evidence.json()["source_count"] == 0
+        assert memory.json()["content"] == ""

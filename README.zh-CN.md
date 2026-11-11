@@ -111,3 +111,15 @@ Markdown 支持渲染和源码两种模式。JSON 仅展示原始文本，不做
 - 支持公开 PDF 文本提取，扫描版 PDF 需要 OCR 时会明确报告无法提取，不会伪造正文。
 - Worker 在已有租约时等待租约释放或过期，再尝试接管。
 - Agent 通过 `agent_type` 注册表构建；当前默认并内置 `research`，新岗位提供独立 builder、提示词与工具集后可注册。
+
+
+## 长任务能力增强
+
+- **岗位注册表**：通过 `app/agents/registry.py` 注册岗位 Agent，定义岗位提示词、产物路径和质量门禁；API `GET /agents` 返回可用岗位。
+- **上下文压缩与长期记忆**：Deep Agents 的 `SummarizationMiddleware` 在上下文约 78% 时自动摘要并保留近期消息；LangGraph SQLite Checkpoint 负责运行状态恢复，任务工作区的 `notes/research_memory.md` 保存跨重启研究摘要。
+- **证据溯源**：成功读取的网页/PDF 自动写入 `evidence/registry.json` 和不可变内容快照，来源分配 `[S0001]` ID；Agent 可用 `record_finding` 将发现关联来源。报告质量门禁检查 URL、章节、来源 ID、快照和段落级引用覆盖率。
+- **资源软预算**：工具调用、累计运行时间、Token 三个维度均持久化。达到 80% 发出预警，达到 100% 要求 Agent 收敛研究并完成报告，不会因软预算自动中止；可审计请求额外预算。API：`GET /tasks/{task_id}/budget`。
+- **可观测性**：`GET /tasks/{task_id}/evidence` 与 `GET /tasks/{task_id}/memory` 提供证据和记忆查看，控制台展示预算、证据数量和最新记忆。
+- **兼容性**：SQLite 使用增量迁移；既有任务、事件、Checkpoint 和工作区无需重建。
+
+预算是资源治理信号，不是模型 Token 精确计费。Token 使用量以模型返回的 usage metadata 为准；服务未提供 usage 时不会虚构估算值。

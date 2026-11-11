@@ -20,7 +20,7 @@ const names = {
 };
 
 const eventNames = {
-  task_created: '任务创建', task_started: 'Worker 领取任务',
+  task_created: '任务创建', budget_warning: '预算预警', budget_soft_limit_reached: '软预算达到', research_memory_saved: '研究记忆保存', research_finding_recorded: '研究发现登记', task_started: 'Worker 领取任务',
   agent_execution_started: 'Agent 开始执行', agent_initial_run: '首次运行',
   agent_plan_started: '自主规划启动', research_plan_updated: 'Agent 规划调整', research_plan_finalized: '最终计划归档', checkpoint_resume: 'Checkpoint 恢复',
   checkpoint_already_complete: '检查点已完成', model_call_started: '模型调用开始',
@@ -206,6 +206,7 @@ function connectEvents(taskId) {
     events.push(item);
     upsertTraceEvent(item);
     if (item.event_type.startsWith('research_plan_')) renderPlan();
+    if (['budget_warning','budget_soft_limit_reached','research_memory_saved','research_finding_recorded'].includes(item.event_type)) renderBudgetAndEvidence();
     renderInstanceDiagnostics();
     if (['artifact_saved', 'report_saved_by_agent', 'report_materialized_from_final_answer'].includes(item.event_type)) refreshArtifacts(taskId);
     if (['task_started', 'task_completed', 'task_failed', 'task_cancelled', 'retry_scheduled'].includes(item.event_type)) {
@@ -232,6 +233,7 @@ async function pollNewEvents(taskId) {
       events.push(item);
       upsertTraceEvent(item);
       if (item.event_type.startsWith('research_plan_')) renderPlan();
+      if (['budget_warning','budget_soft_limit_reached','research_memory_saved','research_finding_recorded'].includes(item.event_type)) renderBudgetAndEvidence();
       if (['artifact_saved', 'report_saved_by_agent', 'report_materialized_from_final_answer'].includes(item.event_type)) refreshArtifacts(taskId);
     }
   } catch (error) { console.warn('Execution event polling failed', error); }
@@ -252,6 +254,7 @@ async function refreshArtifacts(taskId) {
 function renderTaskSummary() {
   if (!detail) return;
   $('taskStatus').textContent = names[detail.status] || detail.status;
+  renderBudgetAndEvidence();
   $('detail').innerHTML =
     '<div class="detail"><div class="muted">' + esc(detail.task_id) + '</div>' +
     '<h3>' + esc(detail.goal) + '</h3><div class="kv"><span>尝试 ' +
@@ -268,6 +271,33 @@ function renderTaskSummary() {
   $('retry').disabled = detail.status !== 'failed';
   $('cancel').disabled = !['queued', 'retry_wait', 'running', 'paused'].includes(detail.status);
   $('delete').disabled = detail.status === 'deleting';
+}
+
+async function renderBudgetAndEvidence() {
+  if (!detail) return;
+  const taskId = detail.task_id;
+  try {
+    const [budget, evidence, memory] = await Promise.all([
+      req('/tasks/' + taskId + '/budget'),
+      req('/tasks/' + taskId + '/evidence'),
+      req('/tasks/' + taskId + '/memory')
+    ]);
+    if (selected !== taskId) return;
+    const labels = {tool_calls:'工具调用', runtime_seconds:'累计运行时间', tokens:'Token'};
+    const pct = item => item.limit ? Math.round(item.used / item.limit * 100) : 0;
+    $('budgetPanel').innerHTML = '<div class="panelhead">任务资源预算 · ' + esc(budget.state) + '</div>' +
+      Object.entries(budget.dimensions || {}).map(([key,item]) =>
+        '<div class="budget-row"><span>' + esc(labels[key] || key) + '</span><b>' +
+        esc(item.used) + ' / ' + esc(item.limit) + '</b><div><i style="width:' +
+        Math.min(100,pct(item)) + '%"></i></div></div>').join('') +
+      '<small>' + esc(budget.instruction || '') + '</small>';
+    $('evidencePanel').innerHTML = '<div class="panelhead">证据登记簿</div><p>来源 ' +
+      esc(evidence.source_count || 0) + ' · 已核验 ' + esc(evidence.verified_source_count || 0) +
+      ' · 研究发现 ' + esc(evidence.finding_count || 0) + '</p>' +
+      '<small>索引：' + esc(evidence.registry_path || 'evidence/registry.json') + '</small>';
+    $('memoryPanel').innerHTML = '<div class="panelhead">长期研究记忆</div>' +
+      (memory.content ? '<pre>' + esc(memory.content) + '</pre>' : '<small>Agent 尚未保存研究记忆</small>');
+  } catch (error) { console.warn('Task budget/evidence refresh failed', error); }
 }
 
 function renderInstanceDiagnostics() {
@@ -735,7 +765,9 @@ $('createForm').onsubmit = async event => {
         goal: form.get('goal'),
         max_steps: Number(form.get('max_steps')),
         max_runtime_seconds: Number(form.get('max_runtime_seconds')),
-        max_attempts: Number(form.get('max_attempts'))
+        max_attempts: Number(form.get('max_attempts')),
+        max_total_tokens: Number(form.get('max_total_tokens')),
+        budget_enabled: form.get('budget_enabled') === 'on'
       })
     });
     $('createDialog').close();

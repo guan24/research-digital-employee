@@ -47,6 +47,10 @@ class Database:
                     max_attempts INTEGER NOT NULL DEFAULT 3,
                     max_steps INTEGER NOT NULL DEFAULT 12,
                     max_runtime_seconds INTEGER NOT NULL DEFAULT 3600,
+                    budget_enabled INTEGER NOT NULL DEFAULT 1,
+                    max_total_tokens INTEGER NOT NULL DEFAULT 100000,
+                    total_tokens_used INTEGER NOT NULL DEFAULT 0,
+                    worker_generation INTEGER NOT NULL DEFAULT 0,
                     runtime_seconds_used REAL NOT NULL DEFAULT 0,
                     runtime_last_accounted_at REAL,
                     execution_steps INTEGER NOT NULL DEFAULT 0,
@@ -86,6 +90,10 @@ class Database:
                 "runtime_seconds_used": "ALTER TABLE tasks ADD COLUMN runtime_seconds_used REAL NOT NULL DEFAULT 0",
                 "runtime_last_accounted_at": "ALTER TABLE tasks ADD COLUMN runtime_last_accounted_at REAL",
                 "execution_steps": "ALTER TABLE tasks ADD COLUMN execution_steps INTEGER NOT NULL DEFAULT 0",
+                "budget_enabled": "ALTER TABLE tasks ADD COLUMN budget_enabled INTEGER NOT NULL DEFAULT 1",
+                "max_total_tokens": "ALTER TABLE tasks ADD COLUMN max_total_tokens INTEGER NOT NULL DEFAULT 100000",
+                "total_tokens_used": "ALTER TABLE tasks ADD COLUMN total_tokens_used INTEGER NOT NULL DEFAULT 0",
+                "worker_generation": "ALTER TABLE tasks ADD COLUMN worker_generation INTEGER NOT NULL DEFAULT 0",
             }
             for column, statement in migrations.items():
                 if column not in columns:
@@ -112,6 +120,8 @@ class Database:
         max_runtime_seconds: int = 3600,
         metadata: dict[str, Any] | None = None,
         agent_type: str = "research",
+        budget_enabled: bool = True,
+        max_total_tokens: int = 100_000,
     ) -> dict[str, Any]:
         task_id = str(uuid.uuid4())
         now = utc_now()
@@ -119,12 +129,12 @@ class Database:
             conn.execute(
                 """INSERT INTO tasks(
                     task_id, goal, agent_type, status, created_at, updated_at, max_attempts,
-                    max_steps, max_runtime_seconds, metadata_json
-                ) VALUES (?, ?, ?, 'queued', ?, ?, ?, ?, ?, ?)""",
+                    max_steps, max_runtime_seconds, budget_enabled, max_total_tokens, metadata_json
+                ) VALUES (?, ?, ?, 'queued', ?, ?, ?, ?, ?, ?, ?, ?)""",
                 (task_id, goal, agent_type, now, now, max_attempts, max_steps, max_runtime_seconds,
-                 json.dumps(metadata or {}, ensure_ascii=False)),
+                 int(budget_enabled), max_total_tokens, json.dumps(metadata or {}, ensure_ascii=False)),
             )
-        self.add_event(task_id, "task_created", {"goal": goal, "max_steps": max_steps})
+        self.add_event(task_id, "task_created", {"goal": goal, "max_steps": max_steps, "budget_enabled": budget_enabled, "max_total_tokens": max_total_tokens})
         return self.get_task(task_id)  # type: ignore[return-value]
 
     def get_task(self, task_id: str) -> dict[str, Any] | None:
@@ -253,14 +263,15 @@ class Database:
             if row is None:
                 return None
             task_id = row["task_id"]
+            generation = int(row["worker_generation"] or 0) + 1
             conn.execute(
                 """UPDATE tasks SET status='running', attempts=attempts+1,
-                   worker_id=?, heartbeat_at=?, runtime_last_accounted_at=?, updated_at=?, started_at=COALESCE(started_at, ?)
+                   worker_id=?, worker_generation=?, heartbeat_at=?, runtime_last_accounted_at=?, updated_at=?, started_at=COALESCE(started_at, ?)
                    WHERE task_id=?""",
-                (worker_id, now, now, utc_now(), utc_now(), task_id),
+                (worker_id, generation, now, now, utc_now(), utc_now(), task_id),
             )
             claimed = conn.execute("SELECT * FROM tasks WHERE task_id=?", (task_id,)).fetchone()
-        self.add_event(task_id, "task_started", {"worker_id": worker_id, "attempt": claimed["attempts"]})
+        self.add_event(task_id, "task_started", {"worker_id": worker_id, "attempt": claimed["attempts"], "generation": claimed["worker_generation"]})
         return dict(claimed)
 
     def heartbeat(self, task_id: str, worker_id: str) -> bool:
@@ -409,22 +420,88 @@ class Database:
         return status
 
     def consume_execution_step(self, task_id: str, worker_id: str | None = None) -> int | None:
-        """Atomically consume one task-wide tool-call step; None means exhausted or ownership changed."""
+        """Atomically consume a tool call; soft limits are observed, never hard-stopped."""
         with self.transaction() as conn:
-            if worker_id is None:
-                cur = conn.execute(
-                    "UPDATE tasks SET execution_steps=execution_steps+1 WHERE task_id=? AND status='running' AND execution_steps < max_steps",
-                    (task_id,),
-                )
-            else:
-                cur = conn.execute(
-                    "UPDATE tasks SET execution_steps=execution_steps+1 WHERE task_id=? AND worker_id=? AND status='running' AND execution_steps < max_steps",
-                    (task_id, worker_id),
-                )
+            sql = "UPDATE tasks SET execution_steps=execution_steps+1 WHERE task_id=? AND status='running'"
+            args = [task_id]
+            if worker_id:
+                sql += " AND worker_id=?"
+                args.append(worker_id)
+            cur = conn.execute(sql, tuple(args))
             if cur.rowcount != 1:
                 return None
             row = conn.execute("SELECT execution_steps FROM tasks WHERE task_id=?", (task_id,)).fetchone()
             return int(row["execution_steps"]) if row else None
+
+    def record_token_usage(self, task_id: str, usage: dict[str, Any], worker_id: str | None = None, generation: int | None = None) -> int:
+        total = usage.get("total_tokens") or usage.get("totalTokens")
+        if total is None:
+            total = (usage.get("prompt_tokens") or usage.get("input_tokens") or 0) + (usage.get("completion_tokens") or usage.get("output_tokens") or 0)
+        try:
+            total = max(0, int(total))
+        except (TypeError, ValueError):
+            return 0
+        if not total:
+            return 0
+        with self.transaction() as conn:
+            sql = "UPDATE tasks SET total_tokens_used=total_tokens_used+? WHERE task_id=? AND status='running'"
+            args = [total, task_id]
+            if worker_id:
+                sql += " AND worker_id=?"
+                args.append(worker_id)
+            if generation is not None:
+                sql += " AND worker_generation=?"
+                args.append(generation)
+            cur = conn.execute(sql, tuple(args))
+        return total if cur.rowcount == 1 else 0
+
+    def get_budget_status(self, task_id: str) -> dict[str, Any]:
+        task = self.get_task(task_id)
+        if not task:
+            return {"enabled": False, "state": "missing", "dimensions": {}}
+        now = time.time()
+        accounted = task.get("runtime_last_accounted_at") or task.get("heartbeat_at") or now
+        runtime = float(task.get("runtime_seconds_used") or 0)
+        if task.get("status") == "running":
+            runtime += max(0.0, now - float(accounted))
+        dimensions = {
+            "tool_calls": {"used": int(task.get("execution_steps") or 0), "limit": int(task.get("max_steps") or 0)},
+            "runtime_seconds": {"used": round(runtime, 2), "limit": int(task.get("max_runtime_seconds") or 0)},
+            "tokens": {"used": int(task.get("total_tokens_used") or 0), "limit": int(task.get("max_total_tokens") or 0)},
+        }
+        for item in dimensions.values():
+            item["ratio"] = item["used"] / item["limit"] if item["limit"] else 0
+        enabled = bool(task.get("budget_enabled", 1))
+        peak = max((item["ratio"] for item in dimensions.values()), default=0)
+        state = "disabled" if not enabled else ("exhausted" if peak >= 1 else ("warning" if peak >= .8 else "normal"))
+        instruction = ("预算关闭；安全限制、服务超时和用户控制仍然生效。" if not enabled else
+            "软预算已达到：停止低价值检索，优先使用已有证据并完成报告，披露证据缺口。" if peak >= 1 else
+            "预算达到 80%；只执行高价值核验并开始收敛。" if peak >= .8 else "预算正常。")
+        return {"enabled": enabled, "state": state, "policy": "soft_limit_agent_autonomy", "dimensions": dimensions, "instruction": instruction}
+
+    def emit_budget_alerts(self, task_id: str) -> None:
+        budget = self.get_budget_status(task_id)
+        if not budget.get("enabled"):
+            return
+        for name, item in budget["dimensions"].items():
+            if not item["limit"]:
+                continue
+            for threshold in (80, 100):
+                if item["ratio"] < threshold / 100:
+                    continue
+                event_type = "budget_warning" if threshold == 80 else "budget_soft_limit_reached"
+                key = "budget:" + name + ":" + str(threshold)
+                with self.transaction() as conn:
+                    exists = conn.execute(
+                        "SELECT 1 FROM events WHERE task_id=? AND event_type=? AND payload_json LIKE ?",
+                        (task_id, event_type, "%" + key + "%"),
+                    ).fetchone()
+                    if exists:
+                        continue
+                    payload = json.dumps({"key": key, "dimension": name, "threshold_percent": threshold,
+                        "used": item["used"], "limit": item["limit"], "policy": "soft_limit_agent_autonomy"})
+                    conn.execute("INSERT INTO events(task_id,timestamp,event_type,payload_json) VALUES(?,?,?,?)",
+                        (task_id, utc_now(), event_type, payload))
 
     def mark_failed(self, task_id: str, error: str, worker_id: str | None = None) -> bool:
         now_ts = time.time()

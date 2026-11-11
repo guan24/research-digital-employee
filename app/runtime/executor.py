@@ -11,6 +11,8 @@ from typing import Any, Callable, Iterator
 from app.config import Settings
 from app.infrastructure.artifact_store import ArtifactStore
 from app.infrastructure.database import Database
+from app.infrastructure.evidence_registry import EvidenceRegistry
+from app.runtime.control import TaskPaused, TaskCancelled, TaskDeadlineExceeded, TaskStepLimitExceeded, WorkerLeaseLost
 from app.tools.research_tools import ResearchToolService, TaskCancelled, TaskDeadlineExceeded, TaskPaused, TaskStepLimitExceeded, WorkerLeaseLost
 
 logger = logging.getLogger(__name__)
@@ -132,24 +134,28 @@ class TaskEventCallback(BaseCallbackHandler):
 
     raise_error = True
 
-    def __init__(self, db: Database, task_id: str, started_monotonic: float, max_runtime_seconds: int, worker_id: str | None = None):
+    def __init__(self, db: Database, task_id: str, started_monotonic: float, max_runtime_seconds: int, worker_id: str | None = None, worker_generation: int | None = None):
         self.db = db
         self.task_id = task_id
         self.started_monotonic = started_monotonic
         self.max_runtime_seconds = max_runtime_seconds
         self.worker_id = worker_id
+        self.worker_generation = worker_generation
         self._llm_started: dict[str, float] = {}
         self._tool_started: dict[str, float] = {}
         self._tool_names: dict[str, str] = {}
 
     def _check_control(self) -> None:
-        if self.worker_id and not self.db.owns_worker_lease(self.worker_id):
-            raise WorkerLeaseLost("worker singleton lease was lost")
         task = self.db.get_task(self.task_id)
-        used = float((task or {}).get("runtime_seconds_used", 0) or 0)
-        accounted_at = (task or {}).get("runtime_last_accounted_at") or (task or {}).get("heartbeat_at") or time.time()
-        if used + max(0.0, time.time() - float(accounted_at)) >= self.max_runtime_seconds:
-            raise TaskDeadlineExceeded("task exceeded cumulative max_runtime_seconds")
+        if self.worker_id:
+            if not self.db.owns_worker_lease(self.worker_id):
+                raise WorkerLeaseLost("worker singleton lease was lost")
+            if not task or task.get("worker_id") != self.worker_id:
+                raise WorkerLeaseLost("task ownership changed")
+            if self.worker_generation is not None and int(task.get("worker_generation") or 0) != int(self.worker_generation):
+                raise WorkerLeaseLost("task execution generation changed")
+        if task:
+            self.db.emit_budget_alerts(self.task_id)
         flags = self.db.get_control_flags(self.task_id)
         if not flags:
             raise TaskCancelled("task record no longer exists")
@@ -191,6 +197,7 @@ class TaskEventCallback(BaseCallbackHandler):
         started = self._llm_started.pop(str(run_id), time.monotonic())
         raw_response = _serialize_model_response(response)
         usage = _model_usage(response)
+        self.db.record_token_usage(self.task_id, usage, self.worker_id, self.worker_generation)
         self.db.add_event(
             self.task_id,
             "model_call_completed",
@@ -350,7 +357,7 @@ class ResearchExecutor:
         task_id = task["task_id"]
         started = time.monotonic()
         artifacts = ArtifactStore(self.settings.workspace_dir, task_id)
-        callback = TaskEventCallback(self.db, task_id, started, int(task["max_runtime_seconds"]), worker_id)
+        callback = TaskEventCallback(self.db, task_id, started, int(task["max_runtime_seconds"]), worker_id, task.get("worker_generation"))
         callback._check_control()
         config = {
             "configurable": {"thread_id": task_id},
@@ -392,12 +399,15 @@ class ResearchExecutor:
         max_revisions = 2
         for revision in range(max_revisions + 1):
             report = artifacts.read_text(report_path)
-            validation = validator.validate(report, task.get("goal", ""))
+            validation = validator.validate(report, task.get("goal", ""), EvidenceRegistry(artifacts).summary())
             self.db.add_event(task_id, "report_validation_completed", {
                 "valid": validation.valid,
                 "errors": list(validation.errors),
                 "source_count": validation.source_count,
                 "word_count": validation.word_count,
+                "evidence_coverage": validation.evidence_coverage,
+                "cited_source_ids": list(validation.cited_source_ids),
+                "finding_count": validation.finding_count,
                 "revision": revision,
             })
             if validation.valid:
