@@ -11,6 +11,8 @@ class AgentProfile:
     role: str
     output_format: str
     max_steps: int
+    max_runtime_seconds: int
+    max_total_tokens: int
     system_prompt: str
     description: str = ""
     output_artifact: str = "result.md"
@@ -55,7 +57,9 @@ def load_research_profile() -> AgentProfile:
         raw = tomllib.load(handle)
     return AgentProfile(
         name=raw["name"], role=raw["role"], output_format=raw["output_format"],
-        max_steps=int(raw.get("max_steps", 12)),
+        max_steps=int(raw["max_steps"]),
+        max_runtime_seconds=int(raw["max_runtime_seconds"]),
+        max_total_tokens=int(raw["max_total_tokens"]),
         system_prompt=(profile_dir / "system_prompt.md").read_text(encoding="utf-8"),
         description=raw.get("description", raw["role"]),
         output_artifact=raw.get("output_artifact", "report.md"),
@@ -82,7 +86,15 @@ def register_agent(agent_type: str, builder: Callable[..., Any], *,
     path = Path(output_artifact)
     if path.is_absolute() or ".." in path.parts or not output_artifact:
         raise ValueError("output_artifact must be a safe task-relative path")
-    defaults = budget_defaults or BudgetDefaults()
+    if budget_defaults is None and profile_loader is not None:
+        role_profile = profile_loader()
+        defaults = BudgetDefaults(
+            max_steps=role_profile.max_steps,
+            max_runtime_seconds=role_profile.max_runtime_seconds,
+            max_total_tokens=role_profile.max_total_tokens,
+        )
+    else:
+        defaults = budget_defaults or DEFAULT_BUDGETS
     if isinstance(defaults, dict):
         defaults = BudgetDefaults(**defaults)
     _REGISTRY[key] = AgentRegistration(
@@ -117,6 +129,9 @@ def list_agent_profiles() -> list[dict[str, Any]]:
             "description": profile.description if profile else key,
             "output_format": profile.output_format if profile else "task artifact",
             "output_artifact": registration.output_artifact,
+            "max_steps": registration.budget_defaults.max_steps,
+            "max_runtime_seconds": registration.budget_defaults.max_runtime_seconds,
+            "max_total_tokens": registration.budget_defaults.max_total_tokens,
         })
     return result
 
@@ -149,5 +164,4 @@ register_agent(
     output_artifact="report.md", validator=_validate_research,
     postprocessor=_postprocess_research, max_revisions=2,
     finalizer=_finalize_research,
-    budget_defaults=BudgetDefaults(max_steps=30, max_runtime_seconds=3600, max_total_tokens=100_000),
 )
