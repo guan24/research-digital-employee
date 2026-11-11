@@ -5,12 +5,14 @@ from typing import Any
 
 REDACTED = "[REDACTED]"
 KEY_PATTERN = re.compile(
-    r"(?:api[_-]?key|access[_-]?token|refresh[_-]?token|token|password|passwd|secret|authorization|credential|connection[_-]?string|database[_-]?url|dsn)",
+    r"(?:api[_-]?key|access[_-]?token|refresh[_-]?token|^token$|password|passwd|secret|authorization|credential|connection[_-]?string|database[_-]?url|dsn)",
     re.IGNORECASE,
 )
 BEARER_PATTERN = re.compile(r"(?i)\b(Bearer\s+)[A-Za-z0-9._~+/-]+=*")
 OPENAI_PATTERN = re.compile(r"\bsk-[A-Za-z0-9_-]{12,}\b")
 TAVILY_PATTERN = re.compile(r"\btvly-[A-Za-z0-9_-]{8,}\b")
+URL_CREDENTIALS = re.compile(r"(?i)\b([a-z][a-z0-9+.-]*://)([^:/\s@]+):([^@/\s]+)@")
+
 KEY_VALUE_PATTERN = re.compile(
     r"""(["']?(?:api[_-]?key|access[_-]?token|refresh[_-]?token|token|password|passwd|secret|authorization|client_secret)["']?\s*[:=]\s*["']?)([^"'\s,;&}\]]+)""",
     re.IGNORECASE,

@@ -58,9 +58,13 @@ def test_credentials_are_redacted_but_research_text_is_preserved():
         "api_key": "sk-test-credential-value",
         "authorization": "Bearer very-secret-token",
         "output": "The report compares agents and their planning approaches.",
+        "token_usage": {"prompt_tokens": 12, "completion_tokens": 8},
+        "db": "postgresql://research:db-secret@localhost:5432/research",
     }
     cleaned = redact_value(value)
     assert cleaned["goal"] == value["goal"]
     assert cleaned["output"] == value["output"]
+    assert cleaned["token_usage"] == value["token_usage"]
+    assert "db-secret" not in cleaned["db"]
     assert cleaned["api_key"] == "[REDACTED]"
     assert cleaned["authorization"] == "[REDACTED]"
