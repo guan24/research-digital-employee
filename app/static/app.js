@@ -8,6 +8,9 @@ let artifacts = [];
 let activeFile = '';
 let fileText = '';
 let eventSource = null;
+let eventPollTimer = null;
+let previewMode = 'rendered';
+let planVersions = [];
 
 const names = {
   deleting: '正在删除', queued: '排队中', running: '运行中',
@@ -18,7 +21,7 @@ const names = {
 const eventNames = {
   task_created: '任务创建', task_started: 'Worker 领取任务',
   agent_execution_started: 'Agent 开始执行', agent_initial_run: '首次运行',
-  agent_plan_started: '自主规划启动', checkpoint_resume: 'Checkpoint 恢复',
+  agent_plan_started: '自主规划启动', research_plan_updated: '研究计划更新', research_plan_step_status: '计划步骤状态', research_plan_activity: '计划执行活动', checkpoint_resume: 'Checkpoint 恢复',
   checkpoint_already_complete: '检查点已完成', model_call_started: '模型调用开始',
   model_call_completed: '模型调用完成', model_call_failed: '模型调用失败',
   tool_call_started: '工具调用开始', tool_call_completed: '工具调用完成',
@@ -165,6 +168,7 @@ async function load(taskId) {
     renderTaskSummary();
     renderTrace();
     renderArtifacts();
+    renderPlan();
     connectEvents(taskId);
   } catch (error) {
     $('error').textContent = error.message;
@@ -173,6 +177,7 @@ async function load(taskId) {
 
 function connectEvents(taskId) {
   if (eventSource) eventSource.close();
+  if (eventPollTimer) clearInterval(eventPollTimer);
   const lastId = events.length ? events[events.length - 1].event_id : 0;
   eventSource = new EventSource('/tasks/' + taskId + '/events/stream?after_id=' + lastId);
   eventSource.addEventListener('task_event', message => {
@@ -180,6 +185,8 @@ function connectEvents(taskId) {
     if (events.some(event => event.event_id === item.event_id)) return;
     events.push(item);
     upsertTraceEvent(item);
+    if (item.event_type.startsWith('research_plan_')) renderPlan();
+    if (['artifact_saved', 'report_saved_by_agent', 'report_materialized_from_final_answer'].includes(item.event_type)) refreshArtifacts(taskId);
     if (['task_started', 'task_completed', 'task_failed', 'task_cancelled', 'retry_scheduled'].includes(item.event_type)) {
       req('/tasks/' + taskId).then(task => {
         if (selected === taskId) {
@@ -190,6 +197,35 @@ function connectEvents(taskId) {
     }
   });
   eventSource.addEventListener('task_deleted', () => eventSource.close());
+  eventSource.onerror = () => { /* EventSource reconnects with Last-Event-ID; polling is the fallback. */ };
+  eventPollTimer = setInterval(() => pollNewEvents(taskId), 2500);
+}
+
+async function pollNewEvents(taskId) {
+  if (selected !== taskId) return;
+  const lastId = events.length ? events[events.length - 1].event_id : 0;
+  try {
+    const incoming = await req('/tasks/' + taskId + '/events?after_id=' + lastId + '&limit=200');
+    for (const item of incoming) {
+      if (events.some(event => event.event_id === item.event_id)) continue;
+      events.push(item);
+      upsertTraceEvent(item);
+      if (item.event_type.startsWith('research_plan_')) renderPlan();
+      if (['artifact_saved', 'report_saved_by_agent', 'report_materialized_from_final_answer'].includes(item.event_type)) refreshArtifacts(taskId);
+    }
+  } catch (error) { console.warn('Execution event polling failed', error); }
+}
+
+async function refreshArtifacts(taskId) {
+  if (selected !== taskId) return;
+  try {
+    const result = await req('/tasks/' + taskId + '/artifacts');
+    if (selected !== taskId) return;
+    const oldPath = activeFile;
+    artifacts = result.artifacts || [];
+    renderArtifacts();
+    if (oldPath && artifacts.some(item => item.path === oldPath)) await openFile(oldPath, false);
+  } catch (error) { console.warn('Artifact refresh failed', error); }
 }
 
 function renderTaskSummary() {
@@ -221,6 +257,50 @@ function renderArtifacts() {
   document.querySelectorAll('[data-file]').forEach(element => {
     element.onclick = () => openFile(element.dataset.file);
   });
+}
+
+function planSnapshot() {
+  const versions = events.filter(event => event.event_type === 'research_plan_updated')
+    .map(event => ({version: event.payload.version || 1, plan: event.payload.plan || {}, event, changes: event.payload.change_reason || ''}));
+  const statuses = new Map();
+  for (const event of events) {
+    if (event.event_type !== 'research_plan_step_status') continue;
+    statuses.set(String(event.payload.step_id), event.payload.status);
+  }
+  const latest = versions.length ? versions[versions.length - 1] : null;
+  if (latest) latest.plan.steps = (latest.plan.steps || []).map(step => ({...step, status: statuses.get(String(step.id)) || step.status || 'pending'}));
+  return {versions, latest};
+}
+
+function renderPlan() {
+  const {versions, latest} = planSnapshot();
+  planVersions = versions;
+  const root = $('planPanel');
+  if (!latest) {
+    root.innerHTML = '<div class="empty plan-empty">Agent 尚未提交结构化执行计划。计划生成后将在此处实时显示。</div>';
+    return;
+  }
+  const labels = {pending: '未开始', in_progress: '进行中', completed: '已完成', skipped: '已跳过'};
+  const classes = {pending: 'pending', in_progress: 'in-progress', completed: 'completed', skipped: 'skipped'};
+  const steps = latest.plan.steps || [];
+  const completed = steps.filter(step => step.status === 'completed').length;
+  root.innerHTML = '<div class="plan-top"><div><strong>' + esc(latest.plan.title || '研究执行计划') + '</strong><p>' +
+    esc(latest.plan.objective || '') + '</p></div><span class="plan-version">v' + latest.version + '</span></div>' +
+    '<div class="plan-progress"><span>' + completed + ' / ' + steps.length + ' 步已完成</span><div><i style="width:' +
+    (steps.length ? Math.round(completed / steps.length * 100) : 0) + '%"></i></div></div>' +
+    '<ol class="plan-steps">' + steps.map((step,index) => '<li class="plan-step ' + (classes[step.status] || 'pending') +
+    '"><span class="plan-index">' + (index + 1) + '</span><div><strong>' + esc(step.title) + '</strong><p>' +
+    esc(step.objective || step.expected_output || '') + '</p>' +
+    (step.expected_output ? '<small>预期成果：' + esc(step.expected_output) + '</small>' : '') +
+    '</div><span class="plan-state">' + (labels[step.status] || labels.pending) + '</span></li>').join('') +
+    '</ol>' + (latest.changes ? '<p class="plan-change">本次调整：' + esc(latest.changes) + '</p>' : '') +
+    (versions.length > 1 ? '<details class="plan-history"><summary>查看计划变更历史（' + versions.length + ' 个版本）</summary>' +
+    versions.slice(0,-1).reverse().map(version => '<section><b>v' + version.version + ' · ' + time(version.event.timestamp) +
+    '</b><p>' + esc(version.plan.title || '研究执行计划') + '</p>' +
+    (version.changes ? '<small>' + esc(version.changes) + '</small>' : '') + '</section>').join('') +
+    '</details>' : '') +
+    (latest.event.payload.original_plan_text ? '<details class="plan-history"><summary>查看 Agent 原始计划 JSON</summary><pre>' +
+    esc(latest.event.payload.original_plan_text) + '</pre></details>' : '');
 }
 
 function traceKey(event) {
@@ -417,15 +497,74 @@ function upsertTraceEvent(event) {
   $('eventCount').textContent = events.length + ' EVENTS';
 }
 
-async function openFile(path) {
+async function openFile(path, rerender = true) {
   try {
     const response = await fetch('/tasks/' + selected + '/artifacts/' + path);
     if (!response.ok) throw Error('读取文件失败');
     fileText = await response.text();
     activeFile = path;
-    $('preview').textContent = fileText;
-    renderArtifacts();
+    renderArtifactPreview();
+    if (rerender) renderArtifacts();
   } catch (error) { alert(error.message); }
+}
+
+function renderMarkdown(source) {
+  const lines = String(source || '').replace(/\r\n/g, '\n').split('\n');
+  const output = [];
+  let inCode = false, code = [], listType = null;
+  const closeList = () => { if (listType) { output.push(listType === 'ol' ? '</ol>' : '</ul>'); listType = null; } };
+  const inline = value => esc(value)
+    .replace(/\x60([^\x60]+)\x60/g, '<code>$1</code>')
+    .replace(/\*\*([^*]+)\*\*/g, '<strong>$1</strong>')
+    .replace(/\*([^*]+)\*/g, '<em>$1</em>')
+    .replace(/\[([^\]]+)\]\((https?:\/\/[^ )]+)\)/g, '<a href="$2" target="_blank" rel="noopener noreferrer">$1</a>');
+  for (const line of lines) {
+    if (line.trim().startsWith(String.fromCharCode(96).repeat(3))) {
+      closeList();
+      if (inCode) { output.push('<pre><code>' + esc(code.join('\n')) + '</code></pre>'); code = []; }
+      inCode = !inCode; continue;
+    }
+    if (inCode) { code.push(line); continue; }
+    if (!line.trim()) { closeList(); continue; }
+    const heading = line.match(/^(#{1,6})\s+(.+)$/);
+    const unordered = line.match(/^\s*[-*+]\s+(.+)$/);
+    const ordered = line.match(/^\s*\d+[.)]\s+(.+)$/);
+    if (heading) { closeList(); const level = heading[1].length; output.push('<h' + level + '>' + inline(heading[2]) + '</h' + level + '>'); }
+    else if (unordered || ordered) {
+      const nextType = unordered ? 'ul' : 'ol';
+      if (listType !== nextType) { closeList(); listType = nextType; output.push('<' + listType + '>'); }
+      output.push('<li>' + inline((unordered || ordered)[1]) + '</li>');
+    } else if (/^>\s?/.test(line)) { closeList(); output.push('<blockquote>' + inline(line.replace(/^>\s?/, '')) + '</blockquote>'); }
+    else if (/^---+$/.test(line.trim())) { closeList(); output.push('<hr>'); }
+    else { closeList(); output.push('<p>' + inline(line) + '</p>'); }
+  }
+  closeList();
+  if (inCode) output.push('<pre><code>' + esc(code.join('\n')) + '</code></pre>');
+  return output.join('\n');
+}
+
+function highlightJson(source) {
+  let formatted;
+  try { formatted = JSON.stringify(JSON.parse(source), null, 2); }
+  catch { return '<pre class="source-code">' + esc(source) + '</pre>'; }
+  return '<pre class="source-code">' + esc(formatted) + '</pre>';
+}
+
+function renderArtifactPreview() {
+  const preview = $('preview');
+  const isJson = activeFile.toLowerCase().endsWith('.json');
+  const isMarkdown = activeFile.toLowerCase().endsWith('.md');
+  const rendered = isJson ? highlightJson(fileText)
+    : isMarkdown ? renderMarkdown(fileText)
+    : '<pre class="source-code">' + esc(fileText) + '</pre>';
+  preview.innerHTML = previewMode === 'rendered' ? rendered : '<pre class="source-code">' + esc(fileText) + '</pre>';
+  $('previewRendered').classList.toggle('active', previewMode === 'rendered');
+  $('previewSource').classList.toggle('active', previewMode === 'source');
+  $('previewRendered').disabled = previewMode === 'rendered';
+  $('previewSource').disabled = previewMode === 'source';
+  $('previewModeHint').textContent = isJson ? 'JSON · ' + (previewMode === 'rendered' ? '格式化视图' : '原始源码')
+    : isMarkdown ? 'Markdown · ' + (previewMode === 'rendered' ? '文档渲染' : '原始源码')
+    : '文本 · 原始内容';
 }
 
 async function action(name) {
@@ -468,6 +607,8 @@ async function deleteSelected() {
   }
 }
 
+$('previewRendered').onclick = () => { previewMode = 'rendered'; renderArtifactPreview(); };
+$('previewSource').onclick = () => { previewMode = 'source'; renderArtifactPreview(); };
 $('delete').onclick = deleteSelected;
 $('refresh').onclick = refresh;
 $('search').oninput = renderTasks;

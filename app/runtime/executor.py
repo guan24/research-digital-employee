@@ -22,6 +22,110 @@ except ImportError:  # Allows persistence/recovery unit tests without installing
         pass
 
 
+
+def _content_as_text(content: Any) -> str:
+    if content is None:
+        return ""
+    if isinstance(content, str):
+        return content
+    if isinstance(content, list):
+        parts = []
+        for item in content:
+            if isinstance(item, dict) and item.get("type") == "text":
+                parts.append(str(item.get("text", "")))
+            elif isinstance(item, str):
+                parts.append(item)
+        return "\n".join(part for part in parts if part)
+    return json.dumps(content, ensure_ascii=False, default=str)
+
+
+def _serialize_model_response(response: Any) -> dict[str, Any]:
+    """Preserve assistant content and tool calls, including tool-only ChatOpenAI turns."""
+    generations = getattr(response, "generations", None) or []
+    serialized: list[dict[str, Any]] = []
+    for group in generations:
+        group_items = group if isinstance(group, (list, tuple)) else [group]
+        for generation in group_items:
+            message = getattr(generation, "message", None)
+            if message is not None:
+                item: dict[str, Any] = {
+                    "content": getattr(message, "content", None) or ""
+                }
+                for attribute, key in (
+                    ("tool_calls", "tool_calls"),
+                    ("invalid_tool_calls", "invalid_tool_calls"),
+                    ("additional_kwargs", "additional_kwargs"),
+                ):
+                    value = getattr(message, attribute, None)
+                    if value:
+                        item[key] = value
+                if not item["content"] and not item.get("tool_calls") and not item.get("additional_kwargs"):
+                    text_value = getattr(generation, "text", None)
+                    if text_value:
+                        item["text"] = text_value
+                serialized.append(item)
+            else:
+                text_value = getattr(generation, "text", None)
+                if text_value is not None:
+                    serialized.append({"text": text_value})
+    if serialized:
+        return serialized[0] if len(serialized) == 1 else {"generations": serialized}
+
+    for attribute in ("content", "text", "output"):
+        value = getattr(response, attribute, None)
+        if value not in (None, ""):
+            return {attribute: value}
+    model_dump = getattr(response, "model_dump", None)
+    if callable(model_dump):
+        try:
+            return {"response": model_dump()}
+        except Exception:
+            pass
+    return {"unparsed_response": repr(response)[:20_000]}
+
+
+def _model_response_summary(raw_response: dict[str, Any]) -> str:
+    content = _content_as_text(raw_response.get("content") or raw_response.get("text"))
+    if content.strip():
+        return content.strip()[:1200]
+    calls = raw_response.get("tool_calls") or []
+    if not calls and isinstance(raw_response.get("additional_kwargs"), dict):
+        calls = raw_response["additional_kwargs"].get("tool_calls") or []
+    names = []
+    for call in calls:
+        if isinstance(call, dict):
+            function = call.get("function") or {}
+            names.append(function.get("name") or call.get("name") or "tool")
+    if names:
+        return "模型决定调用工具：" + "、".join(names[:8])
+    if raw_response.get("unparsed_response"):
+        return "模型返回了结构化响应，已保留原始响应供查看。"
+    return "模型已返回响应（无纯文本内容）。"
+
+
+def _model_usage(response: Any) -> dict[str, Any]:
+    llm_output = getattr(response, "llm_output", None) or {}
+    if isinstance(llm_output, dict):
+        usage = llm_output.get("token_usage") or llm_output.get("usage")
+        if isinstance(usage, dict) and usage:
+            return usage
+    for group in getattr(response, "generations", None) or []:
+        items = group if isinstance(group, (list, tuple)) else [group]
+        for generation in items:
+            message = getattr(generation, "message", None)
+            if message is None:
+                continue
+            usage = getattr(message, "usage_metadata", None)
+            if isinstance(usage, dict) and usage:
+                return usage
+            metadata = getattr(message, "response_metadata", None) or {}
+            if isinstance(metadata, dict):
+                usage = metadata.get("token_usage") or metadata.get("usage")
+                if isinstance(usage, dict) and usage:
+                    return usage
+    return {}
+
+
 class TaskEventCallback(BaseCallbackHandler):
     """Record model/tool lifecycle events and cooperatively honor task controls."""
 
@@ -35,6 +139,7 @@ class TaskEventCallback(BaseCallbackHandler):
         self.worker_id = worker_id
         self._llm_started: dict[str, float] = {}
         self._tool_started: dict[str, float] = {}
+        self._tool_names: dict[str, str] = {}
 
     def _check_control(self) -> None:
         if self.worker_id and not self.db.owns_worker_lease(self.worker_id):
@@ -80,22 +185,19 @@ class TaskEventCallback(BaseCallbackHandler):
 
     def on_llm_end(self, response, *, run_id, **kwargs):
         started = self._llm_started.pop(str(run_id), time.monotonic())
-        usage = {}
-        try:
-            generation = response.generations[0][0]
-            message = generation.message
-            usage = getattr(message, "usage_metadata", None) or getattr(message, "response_metadata", {}).get("token_usage", {}) or {}
-        except Exception:
-            pass
-        output = ""
-        try:
-            output = str(response.generations[0][0].message.content)
-        except Exception:
-            pass
+        raw_response = _serialize_model_response(response)
+        usage = _model_usage(response)
         self.db.add_event(
-            self.task_id, "model_call_completed",
-            {"duration_ms": int((time.monotonic() - started) * 1000),
-             "usage": usage, "decision_summary": output[:1200], "raw_response": output[:20000], "run_id": str(run_id)},
+            self.task_id,
+            "model_call_completed",
+            {
+                "duration_ms": int((time.monotonic() - started) * 1000),
+                "usage": usage,
+                "decision_summary": _model_response_summary(raw_response),
+                "raw_response": raw_response,
+                "response_type": type(response).__name__,
+                "run_id": str(run_id),
+            },
         )
 
     def on_llm_error(self, error, *, run_id, **kwargs):
@@ -106,31 +208,78 @@ class TaskEventCallback(BaseCallbackHandler):
             {"duration_ms": int((time.monotonic() - started) * 1000), "error": str(error)[:2000], "run_id": str(run_id)},
         )
 
+    def _record_plan_activity(self, tool_name: str, phase: str, run_id: str) -> None:
+        if tool_name == "update_research_plan":
+            return
+        self.db.add_event(
+            self.task_id,
+            "research_plan_activity",
+            {"tool": tool_name, "phase": phase, "run_id": run_id},
+        )
+        if phase != "started":
+            return
+        history = self.db.get_events(self.task_id, limit=2000)
+        plan_events = [event for event in history if event["event_type"] == "research_plan_updated"]
+        if not plan_events:
+            return
+        latest = plan_events[-1]
+        plan = latest.get("payload", {}).get("plan") or {}
+        steps = plan.get("steps") or []
+        statuses = {str(step.get("id")): step.get("status", "pending") for step in steps}
+        for event in history:
+            if event["event_id"] <= latest["event_id"] or event["event_type"] != "research_plan_step_status":
+                continue
+            payload = event.get("payload", {})
+            step_id = str(payload.get("step_id", ""))
+            if step_id in statuses:
+                statuses[step_id] = payload.get("status", statuses[step_id])
+        if any(status == "in_progress" for status in statuses.values()):
+            return
+        next_step = next((step for step in steps if statuses.get(str(step.get("id"))) == "pending"), None)
+        if next_step:
+            self.db.add_event(
+                self.task_id,
+                "research_plan_step_status",
+                {
+                    "step_id": str(next_step["id"]),
+                    "status": "in_progress",
+                    "source": "system",
+                    "reason": f"Observed tool execution: {tool_name}",
+                    "tool": tool_name,
+                },
+            )
+
     def on_tool_start(self, serialized, input_str, *, run_id, **kwargs):
         self._check_control()
         tool_name = (serialized or {}).get("name", "unknown")
         self._tool_started[str(run_id)] = time.monotonic()
+        self._tool_names[str(run_id)] = tool_name
         self.db.add_event(
             self.task_id,
             "tool_call_started",
             {"tool": tool_name, "input": str(input_str)[:2500], "run_id": str(run_id)},
         )
+        self._record_plan_activity(tool_name, "started", str(run_id))
 
     def on_tool_end(self, output, *, run_id, **kwargs):
         started = self._tool_started.pop(str(run_id), time.monotonic())
+        tool_name = self._tool_names.pop(str(run_id), "unknown")
         self.db.add_event(
             self.task_id,
             "tool_call_completed",
             {"output": str(output)[:20000], "duration_ms": int((time.monotonic() - started) * 1000), "run_id": str(run_id)},
         )
+        self._record_plan_activity(tool_name, "completed", str(run_id))
 
     def on_tool_error(self, error, *, run_id, **kwargs):
         started = self._tool_started.pop(str(run_id), time.monotonic())
+        tool_name = self._tool_names.pop(str(run_id), "unknown")
         self.db.add_event(
             self.task_id,
             "tool_call_failed",
             {"error": str(error)[:4000], "duration_ms": int((time.monotonic() - started) * 1000), "run_id": str(run_id)},
         )
+        self._record_plan_activity(tool_name, "failed", str(run_id))
 
 
 def extract_final_text(state_or_result: Any) -> str:

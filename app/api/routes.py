@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from pathlib import Path
+from typing import Any
 import asyncio
 import json
 import shutil
@@ -63,10 +64,22 @@ def get_task(task_id: str, request: Request):
 
 
 @router.get("/tasks/{task_id}/events", response_model=list[EventOut])
-def get_events(task_id: str, request: Request, limit: int = 500):
+def get_events(task_id: str, request: Request, limit: int = 500, after_id: int = 0):
     if not _db(request).get_task(task_id):
         raise HTTPException(status_code=404, detail="task not found")
-    return _db(request).get_events(task_id, max(1, min(limit, 2000)))
+    db = _db(request)
+    bounded_limit = max(1, min(limit, 2000))
+    if after_id > 0:
+        return db.get_events_after(task_id, after_id, bounded_limit)
+    return db.get_events(task_id, bounded_limit)
+
+
+def _format_sse_event(event: dict) -> str:
+    event_id = int(event["event_id"])
+    data = json.dumps(event, ensure_ascii=False)
+    return f"id: {event_id}\nevent: task_event\ndata: {data}\n\n"
+
+
 
 
 @router.post(
@@ -112,14 +125,14 @@ async def stream_events(task_id: str, request: Request, after_id: int = 0):
             cursor = max(after_id, 0)
         while not await request.is_disconnected():
             if not db.get_task(task_id):
-                yield "event: task_deleted\\ndata: {}\\n\\n"
+                yield "event: task_deleted\ndata: {}\n\n"
                 return
             batch = db.get_events_after(task_id, cursor, 100)
             for event in batch:
                 cursor = event["event_id"]
-                yield f"id: {cursor}\\nevent: task_event\\ndata: {json.dumps(event, ensure_ascii=False)}\\n\\n"
+                yield _format_sse_event(event)
             if not batch:
-                yield ": keep-alive\\n\\n"
+                yield ": keep-alive\n\n"
                 await asyncio.sleep(1)
 
     return StreamingResponse(generate(), media_type="text/event-stream",

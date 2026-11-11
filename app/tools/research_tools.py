@@ -482,7 +482,102 @@ class ResearchToolService:
         self.check_control()
         return json.dumps(self.artifacts.list_files(), ensure_ascii=False)
 
+    def update_research_plan(self, plan_json: str, change_reason: str = "") -> str:
+        """Persist a structured, versioned Agent plan and its step states."""
+        self.check_control()
+        try:
+            raw_plan = json.loads(plan_json)
+        except (TypeError, json.JSONDecodeError) as exc:
+            extracted = [re.sub(r"^\s*(?:[-*+]\s+|\d+[.)、]\s*)", "", line.strip()).lstrip("#").strip() for line in plan_json.splitlines() if line.strip()]
+            if not extracted:
+                raise ValueError("plan_json must be valid JSON or contain extractable plan steps") from exc
+            raw_plan = {
+                "title": "执行计划（文本提取）",
+                "objective": "从 Agent 原始规划文本中提取",
+                "steps": [{"id": f"step-{index}", "title": title} for index, title in enumerate(extracted[:20], start=1)],
+            }
+        if not isinstance(raw_plan, dict) or not isinstance(raw_plan.get("steps"), list):
+            raise ValueError("plan_json must be an object containing a steps array")
+        if not 1 <= len(raw_plan["steps"]) <= 20:
+            raise ValueError("a research plan must contain between 1 and 20 steps")
+
+        history = self.db.get_events(self.task_id, limit=2000)
+        plan_events = [event for event in history if event["event_type"] == "research_plan_updated"]
+        previous_event = plan_events[-1] if plan_events else None
+        previous_plan = (previous_event or {}).get("payload", {}).get("plan") or {}
+        previous_steps = {
+            str(step.get("id")): step
+            for step in previous_plan.get("steps", [])
+            if isinstance(step, dict) and step.get("id") is not None
+        }
+        if previous_event:
+            for event in history:
+                if event["event_id"] <= previous_event["event_id"] or event["event_type"] != "research_plan_step_status":
+                    continue
+                payload = event.get("payload", {})
+                step_id = str(payload.get("step_id", ""))
+                if step_id in previous_steps and payload.get("status"):
+                    previous_steps[step_id] = {**previous_steps[step_id], "status": payload["status"]}
+
+        allowed_statuses = {"pending", "in_progress", "completed", "skipped"}
+        aliases = {
+            "not_started": "pending", "未开始": "pending",
+            "进行中": "in_progress", "已完成": "completed", "已跳过": "skipped",
+        }
+        normalized_steps = []
+        seen_ids = set()
+        for index, raw_step in enumerate(raw_plan["steps"], start=1):
+            if not isinstance(raw_step, dict):
+                raise ValueError(f"plan step {index} must be an object")
+            step_id = str(raw_step.get("id") or f"step-{index}").strip()
+            title = str(raw_step.get("title") or "").strip()
+            if not step_id or not title or step_id in seen_ids:
+                raise ValueError(f"plan step {index} requires a unique id and non-empty title")
+            seen_ids.add(step_id)
+            status = raw_step.get("status")
+            if status is None:
+                status = previous_steps.get(step_id, {}).get("status", "pending")
+            status = aliases.get(str(status), str(status))
+            if status not in allowed_statuses:
+                raise ValueError(f"invalid status for {step_id}: {status}")
+            normalized_steps.append({
+                "id": step_id,
+                "title": title,
+                "objective": str(raw_step.get("objective") or "").strip(),
+                "expected_output": str(raw_step.get("expected_output") or "").strip(),
+                "status": status,
+            })
+
+        version = int((previous_event or {}).get("payload", {}).get("version", 0)) + 1
+        plan = {
+            "title": str(raw_plan.get("title") or "研究执行计划").strip(),
+            "objective": str(raw_plan.get("objective") or "").strip(),
+            "steps": normalized_steps,
+        }
+        saved_path = self.artifacts.write_text(
+            "notes/research_plan.json",
+            json.dumps({"version": version, **plan}, ensure_ascii=False, indent=2),
+        )
+        self.db.add_event(
+            self.task_id,
+            "research_plan_updated",
+            {
+                "version": version,
+                "source": "agent",
+                "change_reason": change_reason[:1000],
+                "artifact_path": saved_path,
+                "plan": plan,
+                "original_plan_text": plan_json[:12000],
+            },
+        )
+        return f"Research plan version {version} saved to {saved_path}."
+
     def as_langchain_tools(self):
+        @tool("update_research_plan")
+        def update_research_plan_tool(plan_json: str, change_reason: str = "") -> str:
+            """Create or revise the visible research plan. Pass JSON with title, objective and steps [{id,title,objective,expected_output,status}]. Status must be pending, in_progress, completed or skipped. Call this before research and whenever a step starts/completes or the plan changes."""
+            return self.update_research_plan(plan_json, change_reason)
+
         @tool("web_search")
         def web_search_tool(query: str, max_results: int = 5) -> str:
             """Search the public web using Tavily. Returns titles, URLs, snippets and a saved JSON source file."""
@@ -509,6 +604,7 @@ class ResearchToolService:
             return self.list_artifacts()
 
         return [
+            update_research_plan_tool,
             web_search_tool,
             fetch_url_tool,
             save_artifact_tool,
