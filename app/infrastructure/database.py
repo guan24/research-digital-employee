@@ -424,11 +424,14 @@ class Database:
         if not cur.rowcount:
             self.add_event(task["task_id"], "stale_worker_update_ignored", {"attempted_status": status})
             return "lease_lost"
+        current = self.get_task(task["task_id"]) or {}
         self.add_event(
             task["task_id"],
             "task_failed" if terminal else "retry_scheduled",
             {"error": error[:2000], "next_status": status, "delay_seconds": delay_seconds,
-             "attempt": task["attempts"], "max_attempts": task["max_attempts"]},
+             "attempt": task["attempts"], "max_attempts": task["max_attempts"],
+             "category": current.get("error_category") or "unknown",
+             "error_code": current.get("error_code") or "UNKNOWN_EXCEPTION"},
         )
         return status
 
