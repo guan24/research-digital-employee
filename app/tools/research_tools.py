@@ -488,7 +488,7 @@ class ResearchToolService:
         try:
             raw_plan = json.loads(plan_json)
         except (TypeError, json.JSONDecodeError) as exc:
-            extracted = [re.sub(r"^\s*(?:[-*+]\s+|\d+[.)、]\s*)", "", line.strip()).lstrip("#").strip() for line in plan_json.splitlines() if line.strip()]
+            extracted = [re.sub(r"^\s*(?:[-*+]\s+|\d+[.)、]\s*)", "", line.strip()).strip() for line in plan_json.splitlines() if line.strip() and not line.lstrip().startswith("#")]
             if not extracted:
                 raise ValueError("plan_json must be valid JSON or contain extractable plan steps") from exc
             raw_plan = {
