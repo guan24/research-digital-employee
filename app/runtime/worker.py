@@ -11,7 +11,7 @@ from pathlib import Path
 from app.config import Settings
 from app.infrastructure.database import Database
 from app.runtime.executor import ResearchExecutor
-from app.tools.research_tools import TaskCancelled, TaskDeadlineExceeded, TaskPaused, TaskStepLimitExceeded, WorkerLeaseLost
+from app.runtime.errors import TaskCancelled, TaskDeadlineExceeded, TaskPaused, TaskStepLimitExceeded, WorkerLeaseLost, BudgetExhausted, classify_exception
 
 logging.basicConfig(
     level=logging.INFO,
@@ -45,55 +45,65 @@ class Worker:
     def _execute_claimed(self, task: dict) -> None:
         self._current_task_id = task["task_id"]
         try:
-            report_path = self.executor.run(task, worker_id=self.worker_id)
+            result_path = self.executor.run(task, worker_id=self.worker_id)
             if not self.db.owns_worker_lease(self.worker_id):
                 self.db.add_event(task["task_id"], "worker_lease_lost", {"phase": "before_completion"})
                 return
             current = self.db.get_task(task["task_id"])
             if current and current["cancel_requested"]:
                 self.db.mark_cancelled(task["task_id"], self.worker_id)
-                self._finalize_plan_if_terminal(task["task_id"])
+                self._finalize_role_if_terminal(task["task_id"])
             elif current and current["pause_requested"]:
                 self.db.mark_paused(task["task_id"], self.worker_id)
             else:
-                relative = str(Path(report_path).resolve().relative_to(self.settings.app_home)) if Path(report_path).resolve().is_relative_to(self.settings.app_home) else report_path
+                relative = str(Path(result_path).resolve().relative_to(self.settings.app_home)) if Path(result_path).resolve().is_relative_to(self.settings.app_home) else result_path
                 if self.db.mark_completed(task["task_id"], relative, self.worker_id):
-                    self._finalize_plan_if_terminal(task["task_id"])
+                    self._finalize_role_if_terminal(task["task_id"])
         except TaskPaused:
             self.db.mark_paused(task["task_id"], self.worker_id)
         except TaskCancelled:
             self.db.mark_cancelled(task["task_id"], self.worker_id)
-            self._finalize_plan_if_terminal(task["task_id"])
+            self._finalize_role_if_terminal(task["task_id"])
         except WorkerLeaseLost as exc:
             self.db.add_event(task["task_id"], "worker_lease_lost", {"error": str(exc)})
-        except (TaskDeadlineExceeded, TaskStepLimitExceeded) as exc:
-            self.db.mark_failed(task["task_id"], f"{type(exc).__name__}: {exc}", self.worker_id)
-            self._finalize_plan_if_terminal(task["task_id"])
         except Exception as exc:
-            logger.exception("task %s failed", task["task_id"])
-            self.db.add_event(task["task_id"], "execution_exception", {"error_type": type(exc).__name__, "error": str(exc)[:3000]})
-            outcome = self.db.schedule_retry(task, f"{type(exc).__name__}: {exc}", self._retry_delay(task), self.worker_id)
-            if outcome == "failed":
-                self._finalize_plan_if_terminal(task["task_id"])
+            category, code, retryable = classify_exception(exc)
+            self.db.record_classified_error(task["task_id"], str(exc), category, code, retryable, int(task.get("attempts", 0)))
+            self.db.add_event(task["task_id"], "task_error_classified", {
+                "category": category, "error_code": code, "retryable": retryable,
+                "error": str(exc)[:2000], "attempt": task.get("attempts", 0),
+            })
+            logger.exception("task %s failed (%s/%s)", task["task_id"], category, code)
+            if not retryable:
+                self.db.mark_failed(task["task_id"], f"{code}: {exc}", self.worker_id)
+                self._finalize_role_if_terminal(task["task_id"])
+            else:
+                outcome = self.db.schedule_retry(task, f"{code}: {exc}", self._retry_delay(task), self.worker_id)
+                if outcome == "failed":
+                    self._finalize_role_if_terminal(task["task_id"])
         finally:
             self._current_task_id = None
 
-    def _finalize_plan_if_terminal(self, task_id: str) -> None:
+    def _finalize_role_if_terminal(self, task_id: str) -> None:
         task = self.db.get_task(task_id)
         if not task or task.get("status") not in {"completed", "failed", "cancelled"}:
             return
-        finalizer = getattr(self.executor, "finalize_plan", None)
+        finalizer = getattr(self.executor, "finalize_task", None)
+        if not callable(finalizer):
+            finalizer = getattr(self.executor, "finalize_plan", None)
         if not callable(finalizer):
             return
         try:
             finalizer(task_id, task["status"])
         except Exception as exc:
-            logger.exception("could not archive final Agent plan for task %s", task_id)
-            self.db.add_event(
-                task_id,
-                "research_plan_archive_failed",
-                {"error_type": type(exc).__name__, "error": str(exc)[:1000]},
-            )
+            logger.exception("role finalizer failed for task %s", task_id)
+            self.db.add_event(task_id, "role_finalizer_failed", {
+                "error_type": type(exc).__name__, "error": str(exc)[:1000],
+            })
+
+    def _finalize_plan_if_terminal(self, task_id: str) -> None:
+        # Compatibility for older callers/tests; dispatches through the role registration.
+        self._finalize_role_if_terminal(task_id)
 
     def _retry_delay(self, task: dict) -> int:
         attempt = max(1, int(task["attempts"]))
