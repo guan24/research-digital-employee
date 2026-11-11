@@ -11,6 +11,7 @@ let eventSource = null;
 let eventPollTimer = null;
 let previewMode = 'rendered';
 let planVersions = [];
+let loadGeneration = 0;
 
 const names = {
   deleting: '正在删除', queued: '排队中', running: '运行中',
