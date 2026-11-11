@@ -113,8 +113,9 @@ async function refresh() {
     // Polling refreshes task metadata only. It must never replace the live trace DOM.
     if (selected) {
       try {
-        detail = await req('/tasks/' + selected);
-        renderTaskSummary();
+        const taskId = selected;
+        const updatedDetail = await req('/tasks/' + taskId);
+        if (selected === taskId) { detail = updatedDetail; renderTaskSummary(); renderInstanceDiagnostics(); }
       } catch { /* The task may have been deleted in another tab. */ }
     }
   } catch (error) {
@@ -151,28 +152,45 @@ function renderTasks() {
 }
 
 async function load(taskId) {
-  try {
-    if (eventSource) eventSource.close();
-    const [task, history, files] = await Promise.all([
-      req('/tasks/' + taskId),
-      req('/tasks/' + taskId + '/events?limit=2000'),
-      req('/tasks/' + taskId + '/artifacts')
-    ]);
-    selected = taskId;
-    detail = task;
-    events = history;
-    artifacts = files.artifacts;
-    activeFile = '';
-    fileText = '';
-    $('preview').textContent = '选择工作区文件预览';
-    renderTaskSummary();
-    renderTrace();
-    renderArtifacts();
-    renderPlan();
-    connectEvents(taskId);
-  } catch (error) {
-    $('error').textContent = error.message;
+  const generation = ++loadGeneration;
+  selected = taskId;
+  if (eventSource) eventSource.close();
+  if (eventPollTimer) clearInterval(eventPollTimer);
+  eventSource = null; eventPollTimer = null;
+  detail = null; events = []; artifacts = []; activeFile = ''; fileText = '';
+  $('taskStatus').textContent = '加载中';
+  $('detail').innerHTML = '<div class="empty">正在读取任务执行实例…</div>';
+  $('instanceDiagnostics').innerHTML = '';
+  $('events').innerHTML = '<div class="empty">正在读取执行事件…</div>';
+  $('eventCount').textContent = '加载中';
+  $('planPanel').innerHTML = '<div class="empty">正在读取 Agent 执行计划…</div>';
+  $('artifacts').innerHTML = '<div class="empty">正在读取工作区文件…</div>';
+  const [taskResult, historyResult, artifactResult] = await Promise.allSettled([
+    req('/tasks/' + taskId), req('/tasks/' + taskId + '/events?limit=2000'),
+    req('/tasks/' + taskId + '/artifacts')
+  ]);
+  if (generation !== loadGeneration || selected !== taskId) return;
+  if (taskResult.status === 'fulfilled') { detail = taskResult.value; renderTaskSummary(); }
+  else {
+    $('taskStatus').textContent = '详情加载失败';
+    $('detail').innerHTML = '<div class="load-error"><strong>任务实例详情读取失败</strong><p>' +
+      esc(taskResult.reason?.message || '未知 API 错误') + '</p></div>';
   }
+  if (historyResult.status === 'fulfilled') {
+    events = Array.isArray(historyResult.value) ? historyResult.value : [];
+    renderTrace(); renderPlan(); renderInstanceDiagnostics();
+  } else {
+    events = [];
+    $('events').innerHTML = '<div class="load-error"><strong>执行事件读取失败</strong><p>' +
+      esc(historyResult.reason?.message || '未知 API 错误') + '</p></div>';
+    $('eventCount').textContent = '读取失败';
+    renderPlan(); renderInstanceDiagnostics();
+  }
+  if (artifactResult.status === 'fulfilled') { artifacts = artifactResult.value.artifacts || []; renderArtifacts(); }
+  else $('artifacts').innerHTML = '<div class="load-error">工作区文件读取失败：' +
+    esc(artifactResult.reason?.message || '未知 API 错误') + '</div>';
+  if (taskResult.status === 'fulfilled' || historyResult.status === 'fulfilled') connectEvents(taskId);
+  renderTasks();
 }
 
 function connectEvents(taskId) {
@@ -181,11 +199,13 @@ function connectEvents(taskId) {
   const lastId = events.length ? events[events.length - 1].event_id : 0;
   eventSource = new EventSource('/tasks/' + taskId + '/events/stream?after_id=' + lastId);
   eventSource.addEventListener('task_event', message => {
-    const item = JSON.parse(message.data);
+    let item;
+    try { item = JSON.parse(message.data); } catch (error) { console.error('Invalid task event payload', error); return; }
     if (events.some(event => event.event_id === item.event_id)) return;
     events.push(item);
     upsertTraceEvent(item);
     if (item.event_type.startsWith('research_plan_')) renderPlan();
+    renderInstanceDiagnostics();
     if (['artifact_saved', 'report_saved_by_agent', 'report_materialized_from_final_answer'].includes(item.event_type)) refreshArtifacts(taskId);
     if (['task_started', 'task_completed', 'task_failed', 'task_cancelled', 'retry_scheduled'].includes(item.event_type)) {
       req('/tasks/' + taskId).then(task => {
@@ -238,14 +258,38 @@ function renderTaskSummary() {
     Math.round(detail.max_runtime_seconds / 60) + ' min</span><span>规划步数 ' +
     detail.max_steps + '</span></div>' +
     (detail.last_error ? '<p class="task-error">最近错误：' + esc(detail.last_error) + '</p>' : '') +
-    '<div class="muted">创建：' + time(detail.created_at) + '　更新：' +
-    time(detail.updated_at) + '</div></div>';
+    '<div class="muted">创建：' + time(detail.created_at) + '　开始：' +
+    time(detail.started_at) + '　完成：' + time(detail.completed_at) + '</div></div>';
+  renderInstanceDiagnostics();
 
   $('pause').disabled = detail.status !== 'running';
   $('resume').disabled = detail.status !== 'paused';
   $('retry').disabled = detail.status !== 'failed';
   $('cancel').disabled = !['queued', 'retry_wait', 'running', 'paused'].includes(detail.status);
   $('delete').disabled = detail.status === 'deleting';
+}
+
+function renderInstanceDiagnostics() {
+  const root=$('instanceDiagnostics');
+  if(!root||!detail)return;
+  const count=type=>events.filter(e=>e.event_type===type).length;
+  const recovery=events.filter(e=>['checkpoint_resume','worker_recovery_scheduled','checkpoint_already_complete'].includes(e.event_type)).length;
+  const errors=events.filter(e=>['execution_exception','model_call_failed','tool_call_failed','research_page_fetch_failed','worker_recovery_scheduled','retry_scheduled','task_failed','research_plan_archive_failed'].includes(e.event_type)).slice(-8).reverse();
+  const attempts=events.filter(e=>e.event_type==='task_started').slice(-8).reverse();
+  const heartbeat=detail.heartbeat_at?new Date(Number(detail.heartbeat_at)*1000).toLocaleString():'当前无 Worker 心跳';
+  const next=detail.next_run_at>0?new Date(Number(detail.next_run_at)*1000).toLocaleString():'—';
+  root.innerHTML='<details class="instance-diagnostics" open><summary>运行实例与故障诊断</summary><div class="instance-grid">'+
+    '<div><small>状态</small><b>'+esc(detail.status)+'</b></div><div><small>Worker</small><b>'+esc(detail.worker_id||'尚未分配')+'</b></div>'+
+    '<div><small>最近心跳</small><b>'+esc(heartbeat)+'</b></div><div><small>Checkpoint</small><b>'+(detail.resume_mode?'等待恢复 / 请求复用':'常规执行')+'</b></div>'+
+    '<div><small>下次运行</small><b>'+esc(next)+'</b></div><div><small>恢复事件</small><b>'+recovery+' 次</b></div></div>'+
+    '<div class="instance-metrics"><span>模型 '+count('model_call_started')+' 次 / 失败 '+count('model_call_failed')+
+    '</span><span>工具 '+count('tool_call_started')+' 次 / 失败 '+count('tool_call_failed')+'</span></div>'+
+    (attempts.length?'<div class="instance-subtitle">Worker 执行尝试</div><ol class="instance-attempts">'+attempts.map(e=>
+      '<li><b>第 '+esc(e.payload?.attempt??'—')+' 次</b><span>'+esc(e.payload?.worker_id||'未记录')+'</span><time>'+time(e.timestamp)+'</time></li>').join('')+'</ol>':'')+
+    (errors.length?'<div class="instance-subtitle">异常与恢复记录</div><div class="instance-errors">'+errors.map(e=>{
+      const p=e.payload||{},m=p.error||p.reason||p.message||p.error_type||p.pending_nodes||e.event_type;
+      return '<div class="instance-error"><b>'+esc(eventNames[e.event_type]||e.event_type)+'</b><time>'+time(e.timestamp)+'</time><p>'+
+        esc(compact(Array.isArray(m)?m.join(', '):m,320))+'</p></div>';}).join('')+'</div>':'<p class="instance-no-errors">当前没有异常或恢复事件。</p>')+'</details>';
 }
 
 function renderArtifacts() {
@@ -273,37 +317,22 @@ function normalizedPlan(plan = {}) {
 }
 
 function planSnapshot() {
-  const versions = [];
-  for (const event of events) {
-    if (event.event_type !== 'research_plan_updated') continue;
-    const payload = event.payload || {};
-    const plan = normalizedPlan(payload.plan || {});
-    if (!plan.steps.length) continue;
-    const signature = JSON.stringify(plan);
-    // Collapse legacy versions created solely by step-status changes.
-    if (versions.length && versions[versions.length - 1].signature === signature) continue;
-    versions.push({
-      version: versions.length + 1,
-      plan,
-      signature,
-      event,
-      changeType: payload.change_type || (versions.length ? 'replan' : 'initial'),
-      trigger: payload.trigger || payload.change_reason || '',
-      newInformation: payload.new_information || '',
-      problemAnalysis: payload.problem_analysis || '',
-      decision: payload.decision || '',
-      changes: payload.changes || payload.change_reason || '',
-      planDiff: payload.plan_diff || {}
-    });
+  const versions=[];
+  for(const event of events){
+    if(event.event_type!=='research_plan_updated')continue;
+    const p=event.payload||{},plan=normalizedPlan(p.plan||{});
+    if(!plan.steps.length)continue;
+    const signature=JSON.stringify(plan);
+    if(versions.length&&versions[versions.length-1].signature===signature)continue;
+    versions.push({version:versions.length+1,plan,signature,event,changeType:p.change_type||(versions.length?'replan':'initial'),
+      trigger:p.trigger||p.change_reason||'',newInformation:p.new_information||'',problemAnalysis:p.problem_analysis||'',
+      decision:p.decision||'',changes:p.changes||p.change_reason||'',planDiff:p.plan_diff||{}});
   }
-  const latest = versions.length ? versions[versions.length - 1] : null;
-  const finalizedEvent = latest
-    ? [...events].reverse().find(event =>
-        event.event_type === 'research_plan_finalized' &&
-        event.event_id > latest.event.event_id
-      ) || null
-    : null;
-  return {versions, latest, finalizedEvent};
+  const latest=versions.length?versions[versions.length-1]:null;
+  const finalizedEvent=latest?[...events].reverse().find(e=>e.event_type==='research_plan_finalized'&&e.event_id>latest.event.event_id)||null:null;
+  const progress={};
+  for(const e of events){if(e.event_type!=='research_plan_step_status')continue;const p=e.payload||{};if(p.step_id)progress[p.step_id]={status:p.status||'pending',note:p.note||''};}
+  return {versions,latest,finalizedEvent,progress};
 }
 
 function planHistoryEntry(version) {
@@ -330,35 +359,26 @@ function planHistoryEntry(version) {
 }
 
 function renderPlan() {
-  const {versions, latest, finalizedEvent} = planSnapshot();
-  planVersions = versions;
-  const root = $('planPanel');
-  if (!latest) {
-    root.innerHTML = '<div class="empty plan-empty">Agent 尚未提交整体研究计划。计划生成后将在此处展示，实质性调整将形成新版本。</div>';
-    return;
-  }
-  const archiveLabel = finalizedEvent ? '最终计划已归档' : '规划执行中';
-  const archiveNote = finalizedEvent
-    ? '<p class="plan-archive-note">任务结束：' + esc(finalizedEvent.payload?.outcome || '已结束') +
-      ' · 完整历史已保存至 <code>notes/agent_execution_plan.json</code></p>'
-    : '<p class="plan-archive-note">步骤进度、工具调用和异常请查看下方执行轨迹；本区域只记录整体策略及实质性调整。</p>';
-  root.innerHTML = '<div class="plan-top"><div><strong>' + esc(latest.plan.title) +
-    '</strong><p>' + esc(latest.plan.objective) + '</p></div><span class="plan-version">' +
-    archiveLabel + ' · v' + latest.version + '</span></div>' +
-    '<div class="plan-section-label">当前整体执行计划</div><ol class="plan-steps">' +
-    latest.plan.steps.map((step, index) =>
-      '<li class="plan-step"><span class="plan-index">' + (index + 1) +
-      '</span><div><strong>' + esc(step.title) + '</strong>' +
-      (step.objective ? '<p>' + esc(step.objective) + '</p>' : '') +
-      (step.expected_output ? '<small>预期成果：' + esc(step.expected_output) + '</small>' : '') +
-      '</div></li>'
-    ).join('') + '</ol>' + archiveNote +
-    '<details class="plan-history" ' + (versions.length > 1 ? '' : 'hidden') +
-    '><summary>查看规划演进历史（' + versions.length + ' 个有效版本）</summary>' +
-    versions.map(planHistoryEntry).join('') + '</details>' +
-    (latest.event.payload.original_plan_text
-      ? '<details class="plan-version-detail"><summary>查看 Agent 提交的原始计划</summary><pre>' +
-        esc(latest.event.payload.original_plan_text) + '</pre></details>' : '');
+  const {versions,latest,finalizedEvent,progress}=planSnapshot();planVersions=versions;
+  const root=$('planPanel');if(!latest){root.innerHTML='<div class="empty plan-empty">Agent 尚未提交整体研究计划。</div>';return;}
+  const counts={pending:0,in_progress:0,completed:0,skipped:0,failed:0};
+  const steps=latest.plan.steps.map(step=>{const status=progress[step.id]?.status||'pending';counts[status]=(counts[status]||0)+1;return {...step,status,note:progress[step.id]?.note||''};});
+  const total=steps.length,done=counts.completed+counts.skipped,pct=total?Math.round(done/total*100):0;
+  const labels={pending:'待执行',in_progress:'进行中',completed:'已完成',skipped:'已跳过',failed:'失败'};
+  root.innerHTML='<div class="plan-top"><div><strong>'+esc(latest.plan.title)+'</strong><p>'+esc(latest.plan.objective)+'</p></div><span class="plan-version">'+
+    (finalizedEvent?'最终计划已归档':'规划执行中')+' · v'+latest.version+'</span></div>'+
+    '<div class="plan-progress"><span>执行进度 '+done+'/'+total+'（'+pct+'%）</span><div><i style="width:'+pct+'%"></i></div></div>'+
+    '<div class="plan-progress-counts"><span>已完成 '+counts.completed+'</span><span>进行中 '+counts.in_progress+'</span><span>待执行 '+counts.pending+
+    '</span><span>已跳过 '+counts.skipped+'</span><span>失败 '+counts.failed+'</span></div>'+
+    '<div class="plan-section-label">当前整体执行计划</div><ol class="plan-steps">'+steps.map((s,i)=>
+      '<li class="plan-step '+esc(s.status)+'"><span class="plan-index">'+(i+1)+'</span><div><strong>'+esc(s.title)+'</strong>'+
+      (s.objective?'<p>'+esc(s.objective)+'</p>':'')+(s.expected_output?'<small>预期成果：'+esc(s.expected_output)+'</small>':'')+
+      (s.note?'<small class="plan-step-note">'+esc(s.note)+'</small>':'')+'</div><span class="plan-state">'+labels[s.status]+'</span></li>').join('')+
+    '</ol><p class="plan-archive-note">步骤进度独立记录，不产生新的策略版本。</p>'+
+    (finalizedEvent?'<p class="plan-archive-note">完整计划及进度归档至 <code>notes/agent_execution_plan.json</code></p>':'')+
+    '<details class="plan-history" '+(versions.length>1?'':'hidden')+'><summary>查看规划演进历史（'+versions.length+' 个有效版本）</summary>'+
+    versions.map(planHistoryEntry).join('')+'</details>'+
+    (latest.event.payload.original_plan_text?'<details class="plan-version-detail"><summary>查看 Agent 提交的原始计划</summary><pre>'+esc(latest.event.payload.original_plan_text)+'</pre></details>':'');
 }
 
 function traceKey(event) {
@@ -460,7 +480,7 @@ function traceCard(item) {
   const payload = event.payload || {};
   const startPayload = item.start?.payload || {};
   const endPayload = item.end?.payload || {};
-  const status = traceStatus(item);
+  let status = traceStatus(item);
   const isModel = item.kind === 'model';
   const isTool = item.kind === 'tool';
   let category = isModel ? '模型' : isTool ? '工具' : '系统';

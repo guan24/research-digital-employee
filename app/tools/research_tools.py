@@ -501,6 +501,62 @@ class ResearchToolService:
         }
 
     @staticmethod
+    def _latest_step_progress(events: list[dict]) -> dict[str, dict]:
+        """Return the latest independently persisted progress event for each step."""
+        progress: dict[str, dict] = {}
+        for event in events:
+            if event.get("event_type") != "research_plan_step_status":
+                continue
+            payload = event.get("payload") or {}
+            step_id = str(payload.get("step_id") or "")
+            if not step_id:
+                continue
+            progress[step_id] = {
+                "status": payload.get("status") or "pending",
+                "updated_at": event.get("timestamp"),
+                "note": payload.get("note") or "",
+                "plan_version": payload.get("plan_version"),
+                "source": payload.get("source") or "agent",
+            }
+        return progress
+
+    @staticmethod
+    def mark_open_plan_steps_failed(db: Database, task_id: str, reason: str) -> int:
+        """Close in-progress plan steps as failed when the task exhausts its retries."""
+        events = db.get_events(task_id, limit=5000)
+        plan_events = [
+            event for event in events
+            if event.get("event_type") == "research_plan_updated"
+        ]
+        if not plan_events:
+            return 0
+        latest_plan_event = plan_events[-1]
+        plan = ResearchToolService._normalize_plan_structure(
+            latest_plan_event.get("payload", {}).get("plan") or {}
+        )
+        progress = ResearchToolService._latest_step_progress(events)
+        count = 0
+        for step in plan["steps"]:
+            state = progress.get(step["id"], {})
+            if state.get("status") != "in_progress":
+                continue
+            db.add_event(
+                task_id,
+                "research_plan_step_status",
+                {
+                    "step_id": step["id"],
+                    "step_title": step["title"],
+                    "status": "failed",
+                    "previous_status": "in_progress",
+                    "note": (reason or "任务执行失败，步骤未能完成")[:1200],
+                    "plan_version": latest_plan_event.get("payload", {}).get("version", 1),
+                    "source": "system",
+                },
+            )
+            count += 1
+        return count
+
+    @staticmethod
     def _plan_diff(previous: dict, current: dict) -> dict:
         previous_steps = {step["id"]: step for step in previous.get("steps", [])}
         current_steps = {step["id"]: step for step in current.get("steps", [])}
@@ -592,17 +648,46 @@ class ResearchToolService:
             return None
 
         task = db.get_task(task_id) or {}
+        latest_plan = history[-1]["plan"]
+        latest_progress = ResearchToolService._latest_step_progress(events)
+        progress = {
+            step["id"]: {
+                "status": latest_progress.get(step["id"], {}).get("status", "pending"),
+                "updated_at": latest_progress.get(step["id"], {}).get("updated_at"),
+                "note": latest_progress.get(step["id"], {}).get("note", ""),
+            }
+            for step in latest_plan["steps"]
+        }
+        final_plan_with_progress = {
+            **latest_plan,
+            "steps": [
+                {
+                    **step,
+                    "status": progress[step["id"]]["status"],
+                    "status_updated_at": progress[step["id"]]["updated_at"],
+                    "status_note": progress[step["id"]]["note"],
+                }
+                for step in latest_plan["steps"]
+            ],
+        }
+        progress_counts = {
+            status: sum(1 for item in progress.values() if item["status"] == status)
+            for status in ("pending", "in_progress", "completed", "skipped", "failed")
+        }
         archive = {
-            "schema_version": 1,
+            "schema_version": 2,
             "task_id": task_id,
             "goal": task.get("goal", ""),
             "status": status,
             "outcome": outcome,
             "finalized_at": finalized_at,
             "current_version": history[-1]["version"],
-            "final_plan": history[-1]["plan"],
+            "final_plan": latest_plan,
+            "final_plan_with_progress": final_plan_with_progress,
+            "progress": progress,
+            "progress_counts": progress_counts,
             "history": history,
-            "note": "Only initial planning and material strategic replans are versioned; step progress belongs to the execution trace.",
+            "note": "Strategic plan revisions and execution progress are stored separately. Step progress does not create a strategic plan version.",
         }
         artifacts.write_text(
             "notes/agent_execution_plan.json",
@@ -669,6 +754,7 @@ class ResearchToolService:
         previous_plan = self._normalize_plan_structure(
             (previous_event or {}).get("payload", {}).get("plan") or {}
         )
+        progress_before = self._latest_step_progress(history)
 
         unique_signatures = []
         for event in plan_events:
@@ -763,6 +849,32 @@ class ResearchToolService:
                 "original_plan_text": plan_text[:12000],
             },
         )
+        reset_step_ids = set()
+        if not previous_event:
+            reset_step_ids = {step["id"] for step in plan["steps"]}
+        else:
+            reset_step_ids = {
+                item["id"]
+                for item in (plan_diff.get("added_steps", []) + plan_diff.get("modified_steps", []))
+            }
+        for step in plan["steps"]:
+            if step["id"] not in reset_step_ids:
+                continue
+            previous_status = progress_before.get(step["id"], {}).get("status", "pending")
+            self.db.add_event(
+                self.task_id,
+                "research_plan_step_status",
+                {
+                    "step_id": step["id"],
+                    "step_title": step["title"],
+                    "status": "pending",
+                    "previous_status": previous_status,
+                    "note": "初始计划建立，等待执行" if not previous_event else "计划结构发生调整，该步骤等待重新执行",
+                    "plan_version": version,
+                    "source": "system",
+                },
+            )
+
         archive_path = self.persist_plan_archive(
             self.db, self.task_id, self.artifacts, status="in_progress"
         )
@@ -770,6 +882,95 @@ class ResearchToolService:
             f"Saved {'initial' if change_type == 'initial' else 'revised'} "
             f"research plan version {version} to {saved_path}; "
             f"full plan history: {archive_path}."
+        )
+
+    def update_plan_step_status(
+        self,
+        step_id: str,
+        status: str,
+        note: str = "",
+    ) -> str:
+        """Persist one step's execution progress without creating a strategic plan version."""
+        self.check_control()
+        allowed_statuses = {"pending", "in_progress", "completed", "skipped", "failed"}
+        normalized_status = str(status or "").strip().lower()
+        normalized_step_id = str(step_id or "").strip()
+        if normalized_status not in allowed_statuses:
+            raise ValueError(
+                "status must be one of: pending, in_progress, completed, skipped, failed"
+            )
+        if not normalized_step_id:
+            raise ValueError("step_id cannot be empty")
+
+        events = self.db.get_events(self.task_id, limit=5000)
+        plan_events = [
+            event for event in events
+            if event.get("event_type") == "research_plan_updated"
+        ]
+        if not plan_events:
+            raise ValueError("create the overall research plan before updating step progress")
+        latest_plan_event = plan_events[-1]
+        payload = latest_plan_event.get("payload") or {}
+        plan = self._normalize_plan_structure(payload.get("plan") or {})
+        step = next(
+            (item for item in plan["steps"] if item["id"] == normalized_step_id),
+            None,
+        )
+        if step is None:
+            raise ValueError(
+                f"step_id '{normalized_step_id}' is not present in the current plan"
+            )
+
+        progress = self._latest_step_progress(events)
+        previous = progress.get(normalized_step_id, {})
+        previous_status = previous.get("status", "pending")
+        normalized_note = str(note or "").strip()
+        if previous_status == normalized_status and previous.get("note", "") == normalized_note:
+            return (
+                f"Step '{normalized_step_id}' remains {normalized_status}; "
+                "no duplicate progress event was written."
+            )
+
+        version = int(payload.get("version") or 1)
+        self.db.add_event(
+            self.task_id,
+            "research_plan_step_status",
+            {
+                "step_id": normalized_step_id,
+                "step_title": step["title"],
+                "status": normalized_status,
+                "previous_status": previous_status,
+                "note": normalized_note[:1500],
+                "plan_version": version,
+                "source": "agent",
+            },
+        )
+        current_events = self.db.get_events(self.task_id, limit=5000)
+        current_progress = self._latest_step_progress(current_events)
+        plan_with_progress = {
+            "schema_version": 1,
+            "version": version,
+            **plan,
+            "steps": [
+                {
+                    **item,
+                    "status": current_progress.get(item["id"], {}).get("status", "pending"),
+                    "status_note": current_progress.get(item["id"], {}).get("note", ""),
+                }
+                for item in plan["steps"]
+            ],
+        }
+        saved_path = self.artifacts.write_text(
+            "notes/research_plan.json",
+            json.dumps(plan_with_progress, ensure_ascii=False, indent=2),
+        )
+        archive_path = self.persist_plan_archive(
+            self.db, self.task_id, self.artifacts, status="in_progress"
+        )
+        return (
+            f"Updated plan step '{normalized_step_id}': "
+            f"{previous_status} -> {normalized_status}. "
+            f"Progress saved to {saved_path}; plan archive refreshed at {archive_path}."
         )
 
     def as_langchain_tools(self):
@@ -798,6 +999,18 @@ class ResearchToolService:
                 changes,
             )
 
+        @tool("update_plan_step_status")
+        def update_plan_step_status_tool(
+            step_id: str,
+            status: str,
+            note: str = "",
+        ) -> str:
+            """Update execution progress for one step in the current overall research plan.
+            Use status pending, in_progress, completed, skipped or failed.
+            Call when a step starts, finishes, is intentionally skipped, or cannot be completed.
+            This records progress separately and does not create a new strategic plan version."""
+            return self.update_plan_step_status(step_id, status, note)
+
         @tool("web_search")
         def web_search_tool(query: str, max_results: int = 5) -> str:
             """Search the public web using Tavily. Returns titles, URLs, snippets and a saved JSON source file."""
@@ -825,6 +1038,7 @@ class ResearchToolService:
 
         return [
             update_research_plan_tool,
+            update_plan_step_status_tool,
             web_search_tool,
             fetch_url_tool,
             save_artifact_tool,

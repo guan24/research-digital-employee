@@ -62,3 +62,10 @@ The plan is the Agent's overall research strategy, not a step-progress tracker.
 ## Artifact preview layout
 
 Markdown has rendered and raw-source modes. JSON is intentionally shown as original source text only: no JSON parsing, pretty-printing, tree rendering, or syntax highlighting. The preview panel and grid item use min-width: 0, fixed width: 100% constraints, and internal horizontal scrolling for long source lines/tables so switching between Markdown and JSON does not resize the outer preview frame.
+
+
+## Step progress and task-instance diagnostics
+
+Strategic plan versions and step execution progress are separate event streams. \`research_plan_updated\` stores strategy; \`research_plan_step_status\` stores per-step transitions (\`pending\`, \`in_progress\`, \`completed\`, \`skipped\`, \`failed\`). Unchanged step IDs retain progress after a replan; added or materially modified steps reset to pending. On terminal task failure, still-in-progress steps are marked failed with the task error. The final archive stores both the strategy-only plan and a final plan snapshot with progress.
+
+Task details expose Worker ID, heartbeat, next retry time, checkpoint-resume mode and pause/cancel flags. The console derives model/tool counts, attempt history, recovery events and recent diagnostics from the event journal. The task-detail loader independently loads task metadata, events and artifacts so one failed endpoint does not blank the other panels; a load-generation token prevents stale requests from overwriting the current selection.

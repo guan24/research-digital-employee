@@ -4,7 +4,7 @@ A local, long-running autonomous research employee built with **Deep Agents, Lan
 
 ## Features
 
-- Agent-generated overall research plan with evidence-driven strategic revisions. History records the trigger, new information, analysis of the previous approach, decision and concrete changes—not per-step progress.
+- Agent-generated overall research plan with evidence-driven strategic revisions. Per-step progress (pending, in progress, completed, skipped, failed) is displayed independently from strategic version history. History records the trigger, new information, analysis of the previous approach, decision and concrete changes—not routine progress.
 - The final plan and all material revisions are archived to `notes/agent_execution_plan.json` when a task reaches a terminal state.
 - Tavily search, public webpage fetching and task-scoped Markdown/JSON artifacts.
 - Durable task lifecycle and event journal in SQLite; LangGraph SQLite checkpoints keyed by task ID.
@@ -57,7 +57,7 @@ Open the Research Console at <http://127.0.0.1:8000/>. Create research tasks in 
 2. Select the task to inspect its status and chronological execution trace.
 3. The timeline streams persisted events over SSE. Reconnect uses the last event ID; historical events remain available through `GET /tasks/{task_id}/events`.
 4. The trace groups model/tool start and completion/failure events into one card. The default view shows concise decisions, status, duration and token usage. Raw model prompts/responses stay collapsed until “View full request / response” is opened; tool inputs/outputs are separately expandable. SSE updates only the affected card, preserving expanded panels and their scroll positions. Only observable generated model output is shown, never hidden chain-of-thought. Credentials are redacted before persistence.
-5. Inspect the Agent's overall plan and its strategic revision history. Routine step/tool progress remains in the execution trace; final plan history is archived to `notes/agent_execution_plan.json`.
+5. Inspect the Agent's overall plan, per-step progress, and strategic revision history. The execution-instance panel shows Worker ownership, heartbeat, checkpoint/retry state, model/tool counts, attempts and recent diagnostics. Final plan and progress are archived to `notes/agent_execution_plan.json`.
 6. Browse task-scoped intermediate files. Markdown supports rendered/source modes; JSON is displayed as plain source text without parsing, reformatting or JSON rendering, inside a fixed-width preview frame.
 7. Retry failed tasks, pause/resume or cancel using the task controls.
 8. Delete a task permanently. For a running task, the UI shows the stopping/cleanup state while the API waits up to 60 seconds. If the Worker does not confirm stopping, deletion is aborted and task data remains.

@@ -21,6 +21,12 @@ class TaskOut(BaseModel):
     updated_at: str
     started_at: str | None = None
     completed_at: str | None = None
+    worker_id: str | None = None
+    heartbeat_at: float | None = None
+    next_run_at: float | None = None
+    resume_mode: bool = False
+    pause_requested: bool = False
+    cancel_requested: bool = False
     attempts: int
     max_attempts: int
     max_steps: int

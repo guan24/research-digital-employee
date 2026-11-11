@@ -28,6 +28,29 @@ def test_task_api_create_status_and_events(tmp_path, monkeypatch):
         assert events.json()[0]["event_type"] == "task_created"
 
 
+def test_task_detail_exposes_execution_instance_runtime_fields(tmp_path, monkeypatch):
+    monkeypatch.setenv("APP_HOME", str(tmp_path))
+    monkeypatch.setenv("DATA_DIR", str(tmp_path / "data"))
+    monkeypatch.setenv("WORKSPACE_DIR", str(tmp_path / "workspaces"))
+    with TestClient(app) as client:
+        created = client.post("/tasks", json={"goal": "Research a sufficiently detailed task instance"})
+        task_id = created.json()["task_id"]
+        db = client.app.state.db
+        with db.transaction() as conn:
+            conn.execute(
+                """UPDATE tasks SET worker_id=?, heartbeat_at=?, next_run_at=?,
+                   resume_mode=1, pause_requested=1, cancel_requested=0 WHERE task_id=?""",
+                ("worker-instance-test", 1790000000.0, 1790000100.0, task_id),
+            )
+        payload = client.get(f"/tasks/{task_id}").json()
+        assert payload["worker_id"] == "worker-instance-test"
+        assert payload["heartbeat_at"] == 1790000000.0
+        assert payload["next_run_at"] == 1790000100.0
+        assert payload["resume_mode"] is True
+        assert payload["pause_requested"] is True
+        assert payload["cancel_requested"] is False
+
+
 def test_task_api_rejects_short_goal(tmp_path, monkeypatch):
     monkeypatch.setenv("APP_HOME", str(tmp_path))
     monkeypatch.setenv("DATA_DIR", str(tmp_path / "data"))

@@ -122,6 +122,76 @@ def test_tool_callbacks_do_not_mutate_plan_step_status(settings, db):
     assert "research_plan_activity" not in event_types
 
 
+def test_plan_step_progress_is_separate_from_strategic_versions(settings, db):
+    task, service = make_service(settings, db)
+    plan = {"title": "研究计划", "objective": "完成研究", "steps": [
+        {"id": "scope", "title": "明确范围"}, {"id": "research", "title": "收集证据"}
+    ]}
+    service.update_research_plan(json.dumps(plan, ensure_ascii=False))
+    service.update_plan_step_status("scope", "in_progress", "正在梳理研究边界")
+    service.update_plan_step_status("scope", "completed", "范围和评价标准已确定")
+    service.update_plan_step_status("research", "in_progress", "正在检索官方资料")
+    assert len([e for e in db.get_events(task["task_id"]) if e["event_type"] == "research_plan_updated"]) == 1
+    live = json.loads(service.artifacts.read_text("notes/research_plan.json"))
+    assert live["steps"][0]["status"] == "completed"
+    assert live["steps"][1]["status"] == "in_progress"
+
+
+def test_plan_progress_replan_preserves_unchanged_and_resets_modified_steps(settings, db):
+    task, service = make_service(settings, db)
+    initial = {"title": "初始计划", "objective": "研究", "steps": [
+        {"id": "scope", "title": "明确范围"}, {"id": "research", "title": "收集证据"}
+    ]}
+    service.update_research_plan(json.dumps(initial, ensure_ascii=False))
+    service.update_plan_step_status("scope", "completed", "范围确认完成")
+    service.update_plan_step_status("research", "in_progress", "正在收集资料")
+    revised = {"title": "调整计划", "objective": "增加交叉核验", "steps": [
+        {"id": "scope", "title": "明确范围"},
+        {"id": "research", "title": "重新收集并整理证据"},
+        {"id": "verify", "title": "交叉核验关键结论"},
+    ]}
+    service.update_research_plan(
+        json.dumps(revised, ensure_ascii=False),
+        trigger="发现部分资料版本不一致",
+        new_information="同一功能在不同版本文档中的描述存在差异",
+        problem_analysis="原证据收集步骤没有明确版本核验要求",
+        decision="扩展证据收集范围并新增交叉核验",
+        changes="修改 research 步骤并增加 verify 步骤",
+    )
+    progress = service._latest_step_progress(db.get_events(task["task_id"]))
+    assert progress["scope"]["status"] == "completed"
+    assert progress["research"]["status"] == "pending"
+    assert progress["verify"]["status"] == "pending"
+
+
+def test_final_plan_archive_contains_step_progress(settings, db):
+    task, service = make_service(settings, db)
+    service.update_research_plan(json.dumps({"title":"计划","objective":"研究","steps":[
+        {"id":"one","title":"收集资料"},{"id":"two","title":"撰写报告"}]}, ensure_ascii=False))
+    service.update_plan_step_status("one", "completed", "资料已收集")
+    service.update_plan_step_status("two", "in_progress", "正在撰写")
+    archive_path = ResearchExecutor(settings, db).finalize_plan(task["task_id"], "completed")
+    archive = json.loads(service.artifacts.read_text(archive_path))
+    assert archive["schema_version"] == 2
+    assert archive["progress"]["one"]["status"] == "completed"
+    assert archive["progress"]["two"]["status"] == "in_progress"
+    assert archive["final_plan_with_progress"]["steps"][0]["status"] == "completed"
+
+
+def test_failed_finalization_closes_in_progress_steps(settings, db):
+    task, service = make_service(settings, db)
+    service.update_research_plan(json.dumps({"title":"计划","objective":"研究","steps":[
+        {"id":"one","title":"收集资料"}]}, ensure_ascii=False))
+    service.update_plan_step_status("one", "in_progress", "正在检索")
+    with db.transaction() as conn:
+        conn.execute("UPDATE tasks SET status='failed', last_error=? WHERE task_id=?",
+                     ("API quota exhausted", task["task_id"]))
+    archive_path = ResearchExecutor(settings, db).finalize_plan(task["task_id"], "failed")
+    archive = json.loads(service.artifacts.read_text(archive_path))
+    assert archive["progress"]["one"]["status"] == "failed"
+    assert "API quota exhausted" in archive["progress"]["one"]["note"]
+
+
 def test_model_callback_persists_tool_only_chat_response(settings, db):
     task, _ = make_service(settings, db)
     callback = TaskEventCallback(db, task["task_id"], __import__("time").monotonic(), 3600)
@@ -168,6 +238,11 @@ def test_artifact_preview_has_markdown_json_render_and_source_modes():
     assert "JSON · 原始文本" in source
     assert "$('previewRendered').hidden = true" in source
     assert "function planHistoryEntry(version)" in source
+    assert "let status = traceStatus(item)" in source
+    assert "const status = traceStatus(item)" not in source
+    assert "Promise.allSettled" in source
+    assert "function renderInstanceDiagnostics()" in source
+    assert "plan-progress-counts" in source
     assert "problemAnalysis" in source
     assert "newInformation" in source
     assert "research_plan_finalized" in source

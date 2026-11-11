@@ -293,6 +293,13 @@ class ResearchExecutor:
         """Freeze the final strategic plan and all material revisions at task termination."""
         artifacts = ArtifactStore(self.settings.workspace_dir, task_id)
         finalized_at = datetime.now(timezone.utc).isoformat(timespec="seconds")
+        task = self.db.get_task(task_id) or {}
+        if outcome == "failed":
+            ResearchToolService.mark_open_plan_steps_failed(
+                self.db,
+                task_id,
+                task.get("last_error") or "任务达到最大重试次数，当前步骤未能完成",
+            )
         archive_path = ResearchToolService.persist_plan_archive(
             self.db,
             task_id,
