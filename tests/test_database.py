@@ -126,14 +126,14 @@ def test_runtime_budget_is_accounted_across_heartbeats_and_retries(db):
     assert after_retry["runtime_last_accounted_at"] is None
 
 
-def test_tool_call_budget_is_a_soft_convergence_signal(db):
+def test_tool_call_budget_is_a_hard_pre_call_gate(db):
     task = db.create_task("Research a topic with enough detail", max_steps=2)
     db.claim_next_task("worker-a")
     assert db.consume_execution_step(task["task_id"], "worker-a") == 1
     assert db.consume_execution_step(task["task_id"], "worker-a") == 2
-    assert db.consume_execution_step(task["task_id"], "worker-a") == 3
-    assert db.get_task(task["task_id"])["execution_steps"] == 3
-    assert db.get_budget_status(task["task_id"])["state"] == "exhausted"
+    assert db.consume_execution_step(task["task_id"], "worker-a") is None
+    assert db.get_task(task["task_id"])["execution_steps"] == 2
+    assert any(event["event_type"] == "budget_call_rejected" for event in db.get_events(task["task_id"]))
 
 
 def test_agent_type_and_step_counter_are_persisted(db):
@@ -141,8 +141,8 @@ def test_agent_type_and_step_counter_are_persisted(db):
     assert task["agent_type"] == "research"
     claimed = db.claim_next_task("worker-a")
     assert db.consume_execution_step(task["task_id"], "worker-a") == 1
-    assert db.consume_execution_step(task["task_id"], "worker-a") == 2
-    assert db.get_task(task["task_id"])["execution_steps"] == 2
+    assert db.consume_execution_step(task["task_id"], "worker-a") is None
+    assert db.get_task(task["task_id"])["execution_steps"] == 1
 
 
 def test_token_budget_and_warning_alerts_are_persisted(db):
