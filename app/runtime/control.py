@@ -1,7 +1,8 @@
-"""Cooperative task-control signals shared by the runtime and tool services."""
+"""Cooperative task-control signals and hard resource gates."""
+
 
 class TaskControlSignal(RuntimeError):
-    """Base class for cooperative task lifecycle signals."""
+    """Base class for task lifecycle and resource-control signals."""
 
 
 class TaskPaused(TaskControlSignal):
@@ -13,12 +14,22 @@ class TaskCancelled(TaskControlSignal):
 
 
 class TaskDeadlineExceeded(TaskControlSignal):
-    """A non-negotiable safety ceiling was reached."""
+    """A non-negotiable safety deadline was reached."""
 
 
 class TaskStepLimitExceeded(TaskControlSignal):
-    """A non-negotiable tool-call ceiling was reached."""
+    """The task-wide tool-call hard limit was reached."""
 
 
 class WorkerLeaseLost(TaskControlSignal):
     """The current execution no longer owns its worker/task generation."""
+
+
+class BudgetExceeded(TaskControlSignal):
+    """A preflight resource gate rejected work before it was started."""
+
+    def __init__(self, code: str, dimension: str, message: str, details=None):
+        super().__init__(message)
+        self.code = code
+        self.dimension = dimension
+        self.details = details or {}

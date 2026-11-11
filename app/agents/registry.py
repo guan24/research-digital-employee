@@ -17,13 +17,26 @@ class AgentProfile:
 
 
 @dataclass(frozen=True)
+class BudgetDefaults:
+    max_steps: int = 12
+    max_runtime_seconds: int = 3600
+    max_total_tokens: int = 100_000
+    max_cost_usd: float | None = None
+
+
+@dataclass(frozen=True)
 class AgentRegistration:
     agent_type: str
     builder: Callable[..., Any]
     profile_loader: Callable[[], AgentProfile] | None = None
     output_artifact: str = "result.md"
     validator: Callable[..., Any] | None = None
+    postprocessor: Callable[..., Any] | None = None
     finalizer: Callable[..., Any] | None = None
+    default_budget: BudgetDefaults = BudgetDefaults()
+
+
+_REGISTRY: dict[str, AgentRegistration] = {}
 
 
 def load_research_profile() -> AgentProfile:
@@ -36,19 +49,22 @@ def load_research_profile() -> AgentProfile:
         max_steps=int(raw.get("max_steps", 12)),
         system_prompt=(profile_dir / "system_prompt.md").read_text(encoding="utf-8"),
         description=raw.get("description", raw["role"]),
-        output_artifact=raw.get("output_artifact", "report.md"),
+        output_artifact=raw.get("output_artifact", "result.md"),
     )
 
 
-_REGISTRY: dict[str, AgentRegistration] = {}
-
-
-def register_agent(agent_type: str, builder: Callable[..., Any], *,
-                   profile_loader: Callable[[], AgentProfile] | None = None,
-                   output_artifact: str = "result.md",
-                   validator: Callable[..., Any] | None = None,
-                   finalizer: Callable[..., Any] | None = None,
-                   replace: bool = False) -> None:
+def register_agent(
+    agent_type: str,
+    builder: Callable[..., Any],
+    *,
+    profile_loader: Callable[[], AgentProfile] | None = None,
+    output_artifact: str = "result.md",
+    validator: Callable[..., Any] | None = None,
+    postprocessor: Callable[..., Any] | None = None,
+    finalizer: Callable[..., Any] | None = None,
+    default_budget: BudgetDefaults | None = None,
+    replace: bool = False,
+) -> None:
     key = str(agent_type or "").strip().lower()
     if not key:
         raise ValueError("agent_type cannot be empty")
@@ -58,8 +74,19 @@ def register_agent(agent_type: str, builder: Callable[..., Any], *,
     if path.is_absolute() or ".." in path.parts or not output_artifact:
         raise ValueError("output_artifact must be a safe task-relative path")
     _REGISTRY[key] = AgentRegistration(
-        key, builder, profile_loader, output_artifact, validator, finalizer
+        agent_type=key,
+        builder=builder,
+        profile_loader=profile_loader,
+        output_artifact=output_artifact,
+        validator=validator,
+        postprocessor=postprocessor,
+        finalizer=finalizer,
+        default_budget=default_budget or BudgetDefaults(),
     )
+
+
+def unregister_agent(agent_type: str) -> None:
+    _REGISTRY.pop((agent_type or "").strip().lower(), None)
 
 
 def get_agent_registration(agent_type: str) -> AgentRegistration:
@@ -80,7 +107,7 @@ def registered_agent_types() -> tuple[str, ...]:
     return tuple(sorted(_REGISTRY))
 
 
-def list_agent_profiles() -> list[dict[str, str]]:
+def list_agent_profiles() -> list[dict[str, Any]]:
     result = []
     for key, registration in sorted(_REGISTRY.items()):
         profile = registration.profile_loader() if registration.profile_loader else None
@@ -91,6 +118,12 @@ def list_agent_profiles() -> list[dict[str, str]]:
             "description": profile.description if profile else key,
             "output_format": profile.output_format if profile else "task artifact",
             "output_artifact": registration.output_artifact,
+            "default_budget": {
+                "max_steps": registration.default_budget.max_steps,
+                "max_runtime_seconds": registration.default_budget.max_runtime_seconds,
+                "max_total_tokens": registration.default_budget.max_total_tokens,
+                "max_cost_usd": registration.default_budget.max_cost_usd,
+            },
         })
     return result
 
@@ -108,13 +141,23 @@ def _validate_research(report: str, task: dict, artifacts):
     )
 
 
+def _postprocess_research(context):
+    from app.agents.research.delivery import postprocess_research_delivery
+    return postprocess_research_delivery(context)
+
+
 def _finalize_research(db, task_id: str, artifacts, status: str, task: dict):
     from app.agents.research.lifecycle import finalize_research_task
     return finalize_research_task(db, task_id, artifacts, status, task)
 
 
 register_agent(
-    "research", _build_research, profile_loader=load_research_profile,
-    output_artifact="report.md", validator=_validate_research,
+    "research",
+    _build_research,
+    profile_loader=load_research_profile,
+    output_artifact="report.md",
+    validator=_validate_research,
+    postprocessor=_postprocess_research,
     finalizer=_finalize_research,
+    default_budget=BudgetDefaults(max_steps=30, max_runtime_seconds=3600, max_total_tokens=100_000),
 )

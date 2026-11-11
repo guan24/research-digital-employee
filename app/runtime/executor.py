@@ -11,9 +11,9 @@ from typing import Any, Callable, Iterator
 from app.config import Settings
 from app.infrastructure.artifact_store import ArtifactStore
 from app.infrastructure.database import Database
-from app.infrastructure.evidence_registry import EvidenceRegistry
 from app.runtime.control import TaskPaused, TaskCancelled, TaskDeadlineExceeded, TaskStepLimitExceeded, WorkerLeaseLost
-from app.tools.research_tools import ResearchToolService, TaskCancelled, TaskDeadlineExceeded, TaskPaused, TaskStepLimitExceeded, WorkerLeaseLost
+from app.runtime.delivery import DeliveryContext, run_delivery_pipeline
+from app.runtime.errors import MissingArtifactError
 
 logger = logging.getLogger(__name__)
 
@@ -302,122 +302,126 @@ class ResearchExecutor:
         self.agent_builder = agent_builder
         self.checkpointer_factory = checkpointer_factory
 
-    def finalize_plan(self, task_id: str, outcome: str) -> str | None:
-        """Freeze the final strategic plan and all material revisions at task termination."""
-        artifacts = ArtifactStore(self.settings.workspace_dir, task_id)
-        finalized_at = datetime.now(timezone.utc).isoformat(timespec="seconds")
-        task = self.db.get_task(task_id) or {}
-        if outcome == "failed":
-            ResearchToolService.mark_open_plan_steps_failed(
-                self.db,
-                task_id,
-                task.get("last_error") or "任务达到最大重试次数，当前步骤未能完成",
-            )
-        archive_path = ResearchToolService.persist_plan_archive(
-            self.db,
-            task_id,
-            artifacts,
-            status="finalized",
-            outcome=outcome,
-            finalized_at=finalized_at,
-        )
-        if not archive_path:
-            return None
-        events = self.db.get_events(task_id, limit=5000)
-        plan_events = [
-            event for event in events
-            if event["event_type"] == "research_plan_updated"
-        ]
-        latest = plan_events[-1] if plan_events else None
-        payload = latest.get("payload", {}) if latest else {}
-        archive = json.loads(artifacts.read_text(archive_path))
-        self.db.add_event(
-            task_id,
-            "research_plan_finalized",
-            {
-                "version": archive.get("current_version", payload.get("version", 1)),
-                "outcome": outcome,
-                "history_count": len(archive.get("history", [])),
-                "artifact_path": archive_path,
-                "finalized_at": finalized_at,
-            },
-        )
-        return archive_path
+    def finalize_task(self, task_id: str, outcome: str) -> Any:
+        """Dispatch terminal cleanup to the registered role; shared runtime owns no role policy."""
+        from app.agents.registry import get_agent_registration
 
-    def _build_agent(self, task: dict[str, Any], checkpointer: Any, started: float):
+        task = self.db.get_task(task_id) or {}
+        registration = get_agent_registration(task.get("agent_type", "research"))
+        if registration.finalizer is None:
+            return None
+        artifacts = ArtifactStore(self.settings.workspace_dir, task_id)
+        return registration.finalizer(self.db, task_id, artifacts, outcome, task)
+
+    def finalize_plan(self, task_id: str, outcome: str) -> Any:
+        """Backward-compatible alias; role-specific finalization is registry-dispatched."""
+        return self.finalize_task(task_id, outcome)
+
+    def _build_agent(self, registration, task: dict[str, Any], checkpointer: Any, started: float):
         if self.agent_builder:
             return self.agent_builder(self.settings, self.db, task, checkpointer, started)
-        from app.agents.registry import get_agent_builder
-
-        return get_agent_builder(task.get("agent_type", "research"))(
-            self.settings, self.db, task, checkpointer, started
-        )
+        return registration.builder(self.settings, self.db, task, checkpointer, started)
 
     def run(self, task: dict[str, Any], worker_id: str | None = None) -> str:
+        from app.agents.registry import get_agent_registration
+
         task_id = task["task_id"]
+        registration = get_agent_registration(task.get("agent_type", "research"))
         started = time.monotonic()
         artifacts = ArtifactStore(self.settings.workspace_dir, task_id)
-        callback = TaskEventCallback(self.db, task_id, started, int(task["max_runtime_seconds"]), worker_id, task.get("worker_generation"))
+        callback = TaskEventCallback(
+            self.db, task_id, started, int(task["max_runtime_seconds"]),
+            worker_id, task.get("worker_generation"),
+        )
         callback._check_control()
         config = {
             "configurable": {"thread_id": task_id},
             "recursion_limit": max(30, int(task["max_steps"]) * 5),
             "callbacks": [callback],
         }
-        self.db.add_event(task_id, "agent_execution_started", {"thread_id": task_id})
-        self.db.add_event(task_id, "agent_plan_started", {"goal": task["goal"], "note": "Agent-generated plan and plan revisions are observable in subsequent model outputs and artifact saves."})
+        self.db.add_event(task_id, "agent_execution_started", {
+            "thread_id": task_id, "agent_type": registration.agent_type,
+            "output_artifact": registration.output_artifact,
+        })
+        self.db.add_event(task_id, "agent_plan_started", {
+            "goal": task["goal"],
+            "note": "Agent-generated plan and plan revisions are observable in execution events and saved artifacts.",
+        })
 
         with self.checkpointer_factory(self.settings.checkpoint_path) as checkpointer:
-            agent = self._build_agent(task, checkpointer, started)
+            agent = self._build_agent(registration, task, checkpointer, started)
             snapshot = agent.get_state(config)
+            repair_requested = bool(task.get("repair_requested"))
+            repair_feedback = str(task.get("repair_feedback") or "")
+            budget_resume = bool(task.get("budget_resume_requested"))
+
             if snapshot is not None and getattr(snapshot, "next", ()):
-                self.db.add_event(task_id, "checkpoint_resume", {"pending_nodes": list(snapshot.next)})
+                self.db.add_event(task_id, "checkpoint_resume", {
+                    "pending_nodes": list(snapshot.next),
+                    "repair_requested": repair_requested,
+                    "budget_resume_requested": budget_resume,
+                })
                 result = agent.invoke(None, config=config)
             elif snapshot is not None and getattr(snapshot, "values", None):
-                # The graph finished but the worker may have died before updating the task row.
-                self.db.add_event(task_id, "checkpoint_already_complete", {})
-                result = snapshot.values
+                if repair_requested and repair_feedback:
+                    self.db.add_event(task_id, "targeted_repair_started", {
+                        "reason": "delivery_validation_failed",
+                        "feedback": repair_feedback[:3000],
+                    })
+                    result = agent.invoke(
+                        {"messages": [{"role": "user", "content": repair_feedback}]},
+                        config=config,
+                    )
+                elif budget_resume:
+                    self.db.add_event(task_id, "budget_checkpoint_resume", {
+                        "note": "Continue from the existing checkpoint and saved work; do not repeat completed research."
+                    })
+                    result = agent.invoke(
+                        {"messages": [{"role": "user", "content": (
+                            "资源预算已获人工扩额。请从现有 checkpoint、工作区产物和研究记忆继续，"
+                            "不要重复已完成的检索或规划；仅补齐尚未完成的工作并完成交付。"
+                        )}]},
+                        config=config,
+                    )
+                else:
+                    self.db.add_event(task_id, "checkpoint_already_complete", {})
+                    result = snapshot.values
             else:
                 self.db.add_event(task_id, "agent_initial_run", {})
+                initial_message = task["goal"]
+                if repair_requested and repair_feedback:
+                    initial_message += "\n\n针对上次交付校验失败的定向修复要求：\n" + repair_feedback
                 result = agent.invoke(
-                    {"messages": [{"role": "user", "content": task["goal"]}]},
+                    {"messages": [{"role": "user", "content": initial_message}]},
                     config=config,
                 )
 
-        report_path = "report.md"
-        if not artifacts.exists(report_path):
+            if repair_requested:
+                self.db.clear_repair_request(task_id, worker_id, task.get("worker_generation"))
+            if budget_resume:
+                self.db.clear_budget_resume_request(task_id, worker_id, task.get("worker_generation"))
+
+        output_artifact = registration.output_artifact
+        if not artifacts.exists(output_artifact):
             final_text = extract_final_text(result)
             if not final_text.strip():
-                raise RuntimeError("agent finished without a final answer or report.md")
-            artifacts.write_text(report_path, final_text.strip() + "\n")
-            self.db.add_event(task_id, "report_materialized_from_final_answer", {"path": report_path})
+                raise MissingArtifactError(
+                    f"agent '{registration.agent_type}' finished without '{output_artifact}' or a final answer"
+                )
+            artifacts.write_text(output_artifact, final_text.strip() + "\n")
+            self.db.add_event(task_id, "artifact_materialized_from_final_answer", {
+                "agent_type": registration.agent_type, "path": output_artifact,
+            })
         else:
-            self.db.add_event(task_id, "report_saved_by_agent", {"path": report_path})
-        from app.runtime.report_validator import ReportValidator, validation_feedback
-
-        validator = ReportValidator()
-        max_revisions = 2
-        for revision in range(max_revisions + 1):
-            report = artifacts.read_text(report_path)
-            validation = validator.validate(report, task.get("goal", ""), EvidenceRegistry(artifacts).summary())
-            self.db.add_event(task_id, "report_validation_completed", {
-                "valid": validation.valid,
-                "errors": list(validation.errors),
-                "source_count": validation.source_count,
-                "word_count": validation.word_count,
-                "evidence_coverage": validation.evidence_coverage,
-                "cited_source_ids": list(validation.cited_source_ids),
-                "finding_count": validation.finding_count,
-                "revision": revision,
+            self.db.add_event(task_id, "role_artifact_found", {
+                "agent_type": registration.agent_type, "path": output_artifact,
             })
-            if validation.valid:
-                break
-            if revision >= max_revisions:
-                raise RuntimeError("report validation failed after bounded revisions: " + "; ".join(validation.errors))
-            feedback = validation_feedback(validation)
-            self.db.add_event(task_id, "report_revision_requested", {
-                "revision": revision + 1, "feedback": feedback[:3000]
-            })
-            agent.invoke({"messages": [{"role": "user", "content": feedback}]}, config=config)
 
-        return str((artifacts.workspace / report_path).resolve())
+        context = DeliveryContext(
+            task=task, artifacts=artifacts, db=self.db, agent=agent,
+            config=config, result=result, output_artifact=output_artifact,
+            registration=registration,
+        )
+        resolved_artifact = run_delivery_pipeline(registration, context)
+        return str((artifacts.workspace / resolved_artifact).resolve())
+
