@@ -146,81 +146,87 @@ def main():
             current["status"], current["error_code"], bool(validator_called),
             bool(finalizer_called), ArtifactStore(settings.workspace_dir, role_task["task_id"]).exists("deliverables/probe.txt")))
 
-    # 6. Regression smoke: hard step gate, restricted exploration and writable artifacts.
-    step_task = db.create_task("Tool step hard gate probe", max_steps=2)
-    db.claim_next_task("probe-step-worker")
-    step_callback = TaskEventCallback(db, step_task["task_id"], time.monotonic(), 3600)
-    step_callback.on_tool_start({"name": "probe_tool"}, "{}", run_id="step-1")
-    step_callback.on_tool_start({"name": "probe_tool"}, "{}", run_id="step-2")
-    step_blocked = False
-    try:
-        step_callback.on_tool_start({"name": "probe_tool"}, "{}", run_id="step-3")
-    except Exception as exc:
-        step_blocked = type(exc).__name__ == "TaskStepLimitExceeded"
-    step_current = db.get_task(step_task["task_id"])
-    print("STEP_REGRESSION_PROBE: used=%s third_call_blocked=%s" % (
-        step_current["execution_steps"], step_blocked))
-
-    from app.tools.research_tools import ResearchToolService
-    restricted_task = db.create_task("Restricted exploration probe", max_total_tokens=1000)
-    db.claim_next_task("probe-restricted-worker")
-    db.record_token_usage(restricted_task["task_id"], {"total_tokens": 960}, "probe-restricted-worker", 1)
-    restricted_store = ArtifactStore(settings.workspace_dir, restricted_task["task_id"])
-    restricted_service = ResearchToolService(settings, db, restricted_task["task_id"], restricted_store, time.monotonic())
-    search_result = json.loads(restricted_service.web_search("must be blocked"))
-    restricted_service.save_artifact("notes/allowed.md", "artifact writes remain allowed")
-    print("RESTRICTED_REGRESSION_PROBE: search_blocked=%s artifact_write=%s" % (
-        search_result.get("error_type") == "budget_intercept",
-        restricted_store.exists("notes/allowed.md")))
-
-    # 7. Two bounded delivery repairs still terminate without Worker retry.
-    repair_role = "probe_two_repairs_" + uuid.uuid4().hex[:8]
-    repair_calls = []
-    validator_calls = []
-    repair_finalizers = []
-
-    class RepairAgent:
-        def get_state(self, config):
-            return None
-        def invoke(self, payload, config):
-            return {"messages": [{"role": "assistant", "content": "invalid deliverable"}]}
-
-    def always_invalid(content, task, artifacts):
-        validator_calls.append(content)
-        return False
-
-    def repair_once(agent, result, config, task, artifacts, validation):
-        repair_calls.append(len(repair_calls) + 1)
-        agent.invoke({"messages": [{"role": "user", "content": "repair"}]}, config=config)
-
-    def repair_finalizer(_db, task_id, artifacts, outcome, task):
-        repair_finalizers.append((task_id, outcome))
-
-    register_agent(
-        repair_role, lambda *_args: RepairAgent(),
-        output_artifact="reports/repair-probe.md", validator=always_invalid,
-        postprocessor=repair_once, max_revisions=2, finalizer=repair_finalizer,
-    )
-    repair_task = db.create_task("Two revision terminal probe", agent_type=repair_role)
-    repair_executor = ResearchExecutor(settings, db, checkpointer_factory=fake_checkpointer)
-    Worker(settings, db, executor=repair_executor).run_once()
-    repair_current = db.get_task(repair_task["task_id"])
-    repair_events = db.get_events(repair_task["task_id"])
-    print("VALIDATION_REGRESSION_PROBE: status=%s validations=%s repairs=%s retry_events=%s finalizer=%s" % (
-        repair_current["status"], len(validator_calls), len(repair_calls),
-        sum(e["event_type"] == "retry_scheduled" for e in repair_events),
-        bool(repair_finalizers)))
-
-    # 8. First root cause remains the first entry after later errors.
-    history_task = db.create_task("Root cause history probe")
-    db.record_classified_error(history_task["task_id"], "initial auth failure", "terminal", "AUTH_FAILED", False, 1)
-    db.record_classified_error(history_task["task_id"], "later timeout", "retryable", "UPSTREAM_TIMEOUT", True, 2)
-    history_current = db.get_task(history_task["task_id"])
-    history = json.loads(history_current["error_history_json"])
-    first = json.loads(history_current["first_error_json"])
-    print("ROOT_CAUSE_REGRESSION_PROBE: first=%s history_entries=%s" % (
-        first["error_code"], len(history)))
-
+    with tempfile.TemporaryDirectory(prefix="research-regression-probes-") as regression_tmp:
+        root = Path(regression_tmp)
+        settings = build_settings(root)
+        settings.ensure_directories()
+        db = Database(settings.database_path)
+        db.init()
+        # 6. Regression smoke: hard step gate, restricted exploration and writable artifacts.
+        step_task = db.create_task("Tool step hard gate probe", max_steps=2)
+        db.claim_next_task("probe-step-worker")
+        step_callback = TaskEventCallback(db, step_task["task_id"], time.monotonic(), 3600)
+        step_callback.on_tool_start({"name": "probe_tool"}, "{}", run_id="step-1")
+        step_callback.on_tool_start({"name": "probe_tool"}, "{}", run_id="step-2")
+        step_blocked = False
+        try:
+            step_callback.on_tool_start({"name": "probe_tool"}, "{}", run_id="step-3")
+        except Exception as exc:
+            step_blocked = type(exc).__name__ == "TaskStepLimitExceeded"
+        step_current = db.get_task(step_task["task_id"])
+        print("STEP_REGRESSION_PROBE: used=%s third_call_blocked=%s" % (
+            step_current["execution_steps"], step_blocked))
+    
+        from app.tools.research_tools import ResearchToolService
+        restricted_task = db.create_task("Restricted exploration probe", max_total_tokens=1000)
+        db.claim_next_task("probe-restricted-worker")
+        db.record_token_usage(restricted_task["task_id"], {"total_tokens": 960}, "probe-restricted-worker", 1)
+        restricted_store = ArtifactStore(settings.workspace_dir, restricted_task["task_id"])
+        restricted_service = ResearchToolService(settings, db, restricted_task["task_id"], restricted_store, time.monotonic())
+        search_result = json.loads(restricted_service.web_search("must be blocked"))
+        restricted_service.save_artifact("notes/allowed.md", "artifact writes remain allowed")
+        print("RESTRICTED_REGRESSION_PROBE: search_blocked=%s artifact_write=%s" % (
+            search_result.get("error_type") == "budget_intercept",
+            restricted_store.exists("notes/allowed.md")))
+    
+        # 7. Two bounded delivery repairs still terminate without Worker retry.
+        repair_role = "probe_two_repairs_" + uuid.uuid4().hex[:8]
+        repair_calls = []
+        validator_calls = []
+        repair_finalizers = []
+    
+        class RepairAgent:
+            def get_state(self, config):
+                return None
+            def invoke(self, payload, config):
+                return {"messages": [{"role": "assistant", "content": "invalid deliverable"}]}
+    
+        def always_invalid(content, task, artifacts):
+            validator_calls.append(content)
+            return False
+    
+        def repair_once(agent, result, config, task, artifacts, validation):
+            repair_calls.append(len(repair_calls) + 1)
+            agent.invoke({"messages": [{"role": "user", "content": "repair"}]}, config=config)
+    
+        def repair_finalizer(_db, task_id, artifacts, outcome, task):
+            repair_finalizers.append((task_id, outcome))
+    
+        register_agent(
+            repair_role, lambda *_args: RepairAgent(),
+            output_artifact="reports/repair-probe.md", validator=always_invalid,
+            postprocessor=repair_once, max_revisions=2, finalizer=repair_finalizer,
+        )
+        repair_task = db.create_task("Two revision terminal probe", agent_type=repair_role)
+        repair_executor = ResearchExecutor(settings, db, checkpointer_factory=fake_checkpointer)
+        Worker(settings, db, executor=repair_executor).run_once()
+        repair_current = db.get_task(repair_task["task_id"])
+        repair_events = db.get_events(repair_task["task_id"])
+        print("VALIDATION_REGRESSION_PROBE: status=%s validations=%s repairs=%s retry_events=%s finalizer=%s" % (
+            repair_current["status"], len(validator_calls), len(repair_calls),
+            sum(e["event_type"] == "retry_scheduled" for e in repair_events),
+            bool(repair_finalizers)))
+    
+        # 8. First root cause remains the first entry after later errors.
+        history_task = db.create_task("Root cause history probe")
+        db.record_classified_error(history_task["task_id"], "initial auth failure", "terminal", "AUTH_FAILED", False, 1)
+        db.record_classified_error(history_task["task_id"], "later timeout", "retryable", "UPSTREAM_TIMEOUT", True, 2)
+        history_current = db.get_task(history_task["task_id"])
+        history = json.loads(history_current["error_history_json"])
+        first = json.loads(history_current["first_error_json"])
+        print("ROOT_CAUSE_REGRESSION_PROBE: first=%s history_entries=%s" % (
+            first["error_code"], len(history)))
+    
     # 9. Static import boundary and minimal-dependency import probe.
     runtime_dir = ROOT / "app" / "runtime"
     pattern = re.compile(r"^\s*(?:from|import)\s+(?:app\.tools\.research_tools|app\.agents\.research)(?:\.|\s|$)")
