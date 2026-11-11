@@ -18,10 +18,15 @@ class AgentProfile:
 
 @dataclass(frozen=True)
 class BudgetDefaults:
-    max_steps: int = 30
-    max_runtime_seconds: int = 3600
-    max_total_tokens: int = 100_000
+    max_steps: int
+    max_runtime_seconds: int
+    max_total_tokens: int
     max_cost_microusd: int | None = None
+
+
+DEFAULT_BUDGETS = BudgetDefaults(
+    max_steps=12, max_runtime_seconds=1800, max_total_tokens=50_000
+)
 
 
 @dataclass(frozen=True)
@@ -40,7 +45,7 @@ class AgentRegistration:
     postprocessor: Callable[..., Any] | None = None
     max_revisions: int = 0
     finalizer: Callable[..., Any] | None = None
-    budget_defaults: BudgetDefaults = field(default_factory=BudgetDefaults)
+    budget_defaults: BudgetDefaults = field(default_factory=lambda: DEFAULT_BUDGETS)
 
 
 def load_research_profile() -> AgentProfile:
@@ -102,7 +107,7 @@ def registered_agent_types() -> tuple[str, ...]:
     return tuple(sorted(_REGISTRY))
 
 
-def list_agent_profiles() -> list[dict[str, str]]:
+def list_agent_profiles() -> list[dict[str, Any]]:
     result = []
     for key, registration in sorted(_REGISTRY.items()):
         profile = registration.profile_loader() if registration.profile_loader else None

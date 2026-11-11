@@ -317,13 +317,23 @@ class Database:
                 (cutoff,),
             ).fetchall()
             for row in rows:
+                pending = conn.execute(
+                    "SELECT COALESCE(SUM(reserved_tokens),0) AS amount FROM token_reservations WHERE task_id=? AND settled=0",
+                    (row["task_id"],),
+                ).fetchone()["amount"]
+                if pending:
+                    conn.execute(
+                        "UPDATE token_reservations SET settled=1 WHERE task_id=? AND settled=0",
+                        (row["task_id"],),
+                    )
                 conn.execute(
                     """UPDATE tasks SET status='queued', worker_id=NULL, heartbeat_at=NULL,
                        runtime_seconds_used=runtime_seconds_used+MAX(0.0, ?-COALESCE(runtime_last_accounted_at, heartbeat_at, ?)),
-                       runtime_last_accounted_at=NULL, resume_mode=1, next_run_at=0, updated_at=?,
+                       runtime_last_accounted_at=NULL, reserved_tokens=MAX(0,reserved_tokens-?),
+                       resume_mode=1, next_run_at=0, updated_at=?,
                        last_error=COALESCE(last_error, 'worker heartbeat expired; queued for checkpoint recovery')
                        WHERE task_id=?""",
-                    (now_epoch, now_epoch, now, row["task_id"]),
+                    (now_epoch, now_epoch, int(pending or 0), now, row["task_id"]),
                 )
         for row in rows:
             self.add_event(row["task_id"], "worker_recovery_scheduled", {"reason": "stale heartbeat"})
@@ -356,6 +366,7 @@ class Database:
         return cur.rowcount == 1
 
     def mark_paused(self, task_id: str, worker_id: str | None = None) -> bool:
+        self.release_pending_token_reservations(task_id)
         now_ts = time.time()
         now_iso = utc_now()
         with closing(self.connect()) as conn:
@@ -378,6 +389,7 @@ class Database:
         return cur.rowcount == 1
 
     def mark_cancelled(self, task_id: str, worker_id: str | None = None) -> bool:
+        self.release_pending_token_reservations(task_id)
         now_ts = time.time()
         now_iso = utc_now()
         with self.transaction() as conn:
@@ -403,6 +415,7 @@ class Database:
         return cur.rowcount == 1
 
     def schedule_retry(self, task: dict[str, Any], error: str, delay_seconds: int, worker_id: str | None = None) -> str:
+        self.release_pending_token_reservations(task["task_id"])
         terminal = int(task["attempts"]) >= int(task["max_attempts"])
         status = "failed" if terminal else "retry_wait"
         now_ts = time.time()
@@ -485,30 +498,146 @@ class Database:
         return {"first_error":json.loads(first),"error_history":history}
 
     def reserve_tokens(self, task_id: str, reservation_id: str, estimate: int, worker_id: str | None = None, generation: int | None = None) -> dict[str, Any]:
-        amount=max(1,int(estimate))
+        """Atomically reserve model-call tokens before the provider request."""
+        amount = max(1, int(estimate))
         with self.transaction() as conn:
-            row=conn.execute("SELECT * FROM tasks WHERE task_id=?",(task_id,)).fetchone()
-            if not row: return {"allowed":False,"reason":"task_missing"}
-            if worker_id and (row["worker_id"]!=worker_id or (generation is not None and row["worker_generation"]!=generation)): return {"allowed":False,"reason":"stale_generation"}
-            remaining=int(row["max_total_tokens"])-int(row["total_tokens_used"])-int(row["reserved_tokens"])
-            if row["budget_enabled"] and amount>remaining:
-                payload={"dimension":"tokens","gate":"before_model","requested":amount,"used":row["total_tokens_used"],"reserved":row["reserved_tokens"],"limit":row["max_total_tokens"],"remaining":max(0,remaining),"generation":row["worker_generation"]}
-                conn.execute("INSERT INTO events(task_id,timestamp,event_type,payload_json) VALUES(?,?,?,?)",(task_id,utc_now(),"budget_call_rejected",json.dumps(payload)))
-                return {"allowed":False,"reason":"token_budget_exhausted",**payload}
-            cur=conn.execute("INSERT OR IGNORE INTO token_reservations(task_id,reservation_id,reserved_tokens,generation) VALUES(?,?,?,?)",(task_id,reservation_id,amount,generation or 0))
-            if cur.rowcount: conn.execute("UPDATE tasks SET reserved_tokens=reserved_tokens+? WHERE task_id=?",(amount,task_id))
-            return {"allowed":True,"reserved":amount,"remaining":remaining-amount}
+            row = conn.execute("SELECT * FROM tasks WHERE task_id=?", (task_id,)).fetchone()
+            if not row:
+                return {"allowed": False, "reason": "task_missing"}
+            if worker_id and (
+                row["worker_id"] != worker_id
+                or (generation is not None and row["worker_generation"] != generation)
+            ):
+                return {"allowed": False, "reason": "stale_generation"}
+            existing = conn.execute(
+                "SELECT reserved_tokens,settled FROM token_reservations WHERE task_id=? AND reservation_id=?",
+                (task_id, reservation_id),
+            ).fetchone()
+            remaining = int(row["max_total_tokens"]) - int(row["total_tokens_used"]) - int(row["reserved_tokens"])
+            if existing:
+                return {
+                    "allowed": True, "already_reserved": not bool(existing["settled"]),
+                    "already_settled": bool(existing["settled"]),
+                    "reserved": 0 if existing["settled"] else int(existing["reserved_tokens"]),
+                    "remaining": max(0, remaining),
+                }
+            if row["budget_enabled"] and amount > remaining:
+                payload = {
+                    "dimension": "tokens", "gate": "before_model_call",
+                    "requested": amount, "used": int(row["total_tokens_used"]),
+                    "reserved": int(row["reserved_tokens"]), "limit": int(row["max_total_tokens"]),
+                    "remaining": max(0, remaining), "generation": int(row["worker_generation"]),
+                }
+                conn.execute(
+                    "INSERT INTO events(task_id,timestamp,event_type,payload_json) VALUES(?,?,?,?)",
+                    (task_id, utc_now(), "budget_call_rejected", json.dumps(payload, ensure_ascii=False)),
+                )
+                return {"allowed": False, "reason": "token_budget_exhausted", **payload}
+            conn.execute(
+                "INSERT INTO token_reservations(task_id,reservation_id,reserved_tokens,generation) VALUES(?,?,?,?)",
+                (task_id, reservation_id, amount, int(generation or 0)),
+            )
+            conn.execute(
+                "UPDATE tasks SET reserved_tokens=reserved_tokens+? WHERE task_id=?",
+                (amount, task_id),
+            )
+            return {
+                "allowed": True, "reserved": amount,
+                "remaining": max(0, remaining - amount),
+            }
+
+    def release_pending_token_reservations(self, task_id: str) -> int:
+        """Release reservations left by an interrupted attempt; settled calls are untouched."""
+        with self.transaction() as conn:
+            rows = conn.execute(
+                "SELECT reservation_id,reserved_tokens FROM token_reservations WHERE task_id=? AND settled=0",
+                (task_id,),
+            ).fetchall()
+            amount = sum(int(item["reserved_tokens"]) for item in rows)
+            if not rows:
+                return 0
+            conn.execute(
+                "UPDATE token_reservations SET settled=1 WHERE task_id=? AND settled=0",
+                (task_id,),
+            )
+            conn.execute(
+                "UPDATE tasks SET reserved_tokens=MAX(0,reserved_tokens-?) WHERE task_id=?",
+                (amount, task_id),
+            )
+            conn.execute(
+                "INSERT INTO events(task_id,timestamp,event_type,payload_json) VALUES(?,?,?,?)",
+                (task_id, utc_now(), "token_reservations_released", json.dumps({
+                    "released_tokens": amount, "reservation_count": len(rows),
+                    "reason": "attempt_ended_or_worker_recovered",
+                }, ensure_ascii=False)),
+            )
+            return amount
+
+    def check_runtime_budget(self, task_id: str, worker_id: str | None = None,
+                             generation: int | None = None) -> dict[str, Any]:
+        """Enforce cumulative runtime at every controlled execution boundary."""
+        now = time.time()
+        with self.transaction() as conn:
+            row = conn.execute("SELECT * FROM tasks WHERE task_id=?", (task_id,)).fetchone()
+            if not row or row["status"] != "running" or not bool(row["budget_enabled"]):
+                return {"exhausted": False}
+            if worker_id and row["worker_id"] != worker_id:
+                return {"exhausted": False, "stale_worker": True}
+            if generation is not None and int(row["worker_generation"] or 0) != int(generation):
+                return {"exhausted": False, "stale_generation": True}
+            accounted_at = row["runtime_last_accounted_at"] or row["heartbeat_at"] or now
+            used = float(row["runtime_seconds_used"] or 0) + max(0.0, now - float(accounted_at))
+            limit = int(row["max_runtime_seconds"] or 0)
+            if not limit or used < limit:
+                return {"exhausted": False, "used": used, "limit": limit}
+            payload = {
+                "key": "runtime_seconds:hard", "dimension": "runtime_seconds",
+                "gate": "controlled_execution_boundary", "used": round(used, 3),
+                "limit": limit, "remaining": max(0.0, limit - used),
+                "generation": int(row["worker_generation"] or 0),
+            }
+            exists = conn.execute(
+                "SELECT 1 FROM events WHERE task_id=? AND event_type='budget_call_rejected' AND payload_json LIKE ?",
+                (task_id, "%runtime_seconds:hard%"),
+            ).fetchone()
+            if not exists:
+                conn.execute(
+                    "INSERT INTO events(task_id,timestamp,event_type,payload_json) VALUES(?,?,?,?)",
+                    (task_id, utc_now(), "budget_call_rejected", json.dumps(payload, ensure_ascii=False)),
+                )
+            conn.execute(
+                "UPDATE tasks SET runtime_seconds_used=?,runtime_last_accounted_at=? WHERE task_id=? AND status='running'",
+                (used, now, task_id),
+            )
+            return {"exhausted": True, "used": used, "limit": limit, "remaining": 0.0, "generation": payload["generation"]}
 
     def settle_token_reservation(self, task_id: str, reservation_id: str, actual: int, worker_id: str | None = None, generation: int | None = None) -> int:
+        """Settle one reservation exactly once using provider-reported usage."""
         with self.transaction() as conn:
-            row=conn.execute("SELECT * FROM token_reservations WHERE task_id=? AND reservation_id=?",(task_id,reservation_id)).fetchone()
-            task=conn.execute("SELECT worker_id,worker_generation FROM tasks WHERE task_id=?",(task_id,)).fetchone()
-            if not row or row["settled"] or not task: return 0
-            if worker_id and task["worker_id"]!=worker_id: return 0
-            if generation is not None and task["worker_generation"]!=generation: return 0
-            actual=max(0,int(actual)); reserved=int(row["reserved_tokens"])
-            conn.execute("UPDATE token_reservations SET settled=1,actual_tokens=? WHERE task_id=? AND reservation_id=?",(actual,task_id,reservation_id))
-            conn.execute("UPDATE tasks SET reserved_tokens=MAX(0,reserved_tokens-?),total_tokens_used=total_tokens_used+? WHERE task_id=?",(reserved,actual,task_id))
+            row = conn.execute(
+                "SELECT * FROM token_reservations WHERE task_id=? AND reservation_id=?",
+                (task_id, reservation_id),
+            ).fetchone()
+            task = conn.execute(
+                "SELECT worker_id,worker_generation FROM tasks WHERE task_id=?",
+                (task_id,),
+            ).fetchone()
+            if not row or row["settled"] or not task:
+                return 0
+            if worker_id and task["worker_id"] != worker_id:
+                return 0
+            if generation is not None and task["worker_generation"] != generation:
+                return 0
+            actual = max(0, int(actual))
+            reserved = int(row["reserved_tokens"])
+            conn.execute(
+                "UPDATE token_reservations SET settled=1,actual_tokens=? WHERE task_id=? AND reservation_id=? AND settled=0",
+                (actual, task_id, reservation_id),
+            )
+            conn.execute(
+                "UPDATE tasks SET reserved_tokens=MAX(0,reserved_tokens-?),total_tokens_used=total_tokens_used+? WHERE task_id=?",
+                (reserved, actual, task_id),
+            )
             return actual
 
     def release_token_reservation(self, task_id: str, reservation_id: str) -> int:
@@ -593,6 +722,7 @@ class Database:
                         (task_id, utc_now(), event_type, payload))
 
     def mark_failed(self, task_id: str, error: str, worker_id: str | None = None) -> bool:
+        self.release_pending_token_reservations(task_id)
         now_ts = time.time()
         now_iso = utc_now()
         with self.transaction() as conn:
