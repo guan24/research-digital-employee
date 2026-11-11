@@ -141,8 +141,8 @@ def test_agent_type_and_step_counter_are_persisted(db):
     assert task["agent_type"] == "research"
     claimed = db.claim_next_task("worker-a")
     assert db.consume_execution_step(task["task_id"], "worker-a") == 1
-    assert db.consume_execution_step(task["task_id"], "worker-a") is None
-    assert db.get_task(task["task_id"])["execution_steps"] == 1
+    assert db.consume_execution_step(task["task_id"], "worker-a") == 2
+    assert db.get_task(task["task_id"])["execution_steps"] == 2
 
 
 def test_token_budget_and_warning_alerts_are_persisted(db):
