@@ -121,6 +121,42 @@ class Database:
             rows = conn.execute("SELECT * FROM tasks ORDER BY created_at DESC LIMIT ?", (limit,)).fetchall()
         return [dict(row) for row in rows]
 
+    def get_runtime_overview(self) -> dict[str, Any]:
+        """Return task counts and the current single-worker lease for the console."""
+        with closing(self.connect()) as conn:
+            rows = conn.execute(
+                "SELECT status, COUNT(*) AS total FROM tasks GROUP BY status"
+            ).fetchall()
+            lease = conn.execute(
+                "SELECT owner, lease_until FROM worker_lease WHERE lock_id=1"
+            ).fetchone()
+
+        counts = {status: 0 for status in TASK_STATUSES}
+        for row in rows:
+            counts[str(row["status"])] = int(row["total"])
+
+        now = time.time()
+        owner = lease["owner"] if lease else None
+        lease_until = float(lease["lease_until"]) if lease else 0.0
+        if owner and lease_until > now:
+            worker_status = "active"
+        elif owner:
+            worker_status = "lease_expired"
+        else:
+            worker_status = "offline"
+
+        return {
+            "task_counts": counts,
+            "worker": {
+                "status": worker_status,
+                "worker_id": owner if worker_status == "active" else None,
+                "lease_until": lease_until if worker_status == "active" else None,
+                "lease_remaining_seconds": (
+                    max(0, int(lease_until - now)) if worker_status == "active" else 0
+                ),
+            },
+        }
+
     def add_event(self, task_id: str, event_type: str, payload: dict[str, Any] | None = None) -> None:
         safe_payload = json.dumps(payload or {}, ensure_ascii=False, default=str)
         with closing(self.connect()) as conn:

@@ -113,3 +113,18 @@ def test_task_api_retry_rejects_non_failed_task(tmp_path, monkeypatch):
         )
         assert response.status_code == 409
         assert "current status is 'queued'" in response.json()["detail"]
+
+
+def test_console_root_serves_frontend_and_static_assets(tmp_path, monkeypatch):
+    monkeypatch.setenv("APP_HOME", str(tmp_path))
+    monkeypatch.setenv("DATA_DIR", str(tmp_path / "data"))
+    monkeypatch.setenv("WORKSPACE_DIR", str(tmp_path / "workspaces"))
+    with TestClient(app) as client:
+        page = client.get("/")
+        assert page.status_code == 200
+        assert "研究任务总览" in page.text
+        script = client.get("/static/app.js")
+        stylesheet = client.get("/static/style.css")
+        assert script.status_code == 200
+        assert "checkpoint_resume" in script.text
+        assert stylesheet.status_code == 200

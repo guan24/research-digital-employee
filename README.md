@@ -47,7 +47,10 @@ uvicorn app.api.main:app --reload --host 127.0.0.1 --port 8000
 python -m app.runtime.worker
 ```
 
+Research Console: <http://127.0.0.1:8000/>  
 Swagger UI: <http://127.0.0.1:8000/docs>
+
+The built-in local console polls the API every three seconds and provides task creation, queue/status filters, task controls (pause/resume/cancel/retry), event inspection, worker lease overview, artifact browsing, and Markdown/text preview. The frontend is plain HTML/CSS/JavaScript served by FastAPI from `app/static/`; no separate Node build is required.
 
 The API and Worker are intentionally separate processes. An HTTP request only creates a task and returns a `task_id`; the Worker executes it independently.
 

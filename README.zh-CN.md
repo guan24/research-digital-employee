@@ -47,7 +47,10 @@ uvicorn app.api.main:app --reload --host 127.0.0.1 --port 8000
 python -m app.runtime.worker
 ```
 
+研究控制台：<http://127.0.0.1:8000/>  
 Swagger UI：<http://127.0.0.1:8000/docs>
+
+内置控制台每 3 秒轮询一次 API，支持创建任务、任务队列与状态筛选、暂停/恢复/取消/重试、执行事件追踪、Worker 租约概览、工作区文件浏览及 Markdown/文本预览。前端使用原生 HTML/CSS/JavaScript，由 FastAPI 从 `app/static/` 直接托管，无需单独安装 Node 或执行前端构建。
 
 API 与 Worker 是刻意分离的两个进程。HTTP 请求只会创建一个任务并返回 `task_id`；Worker 独立执行该任务。
 

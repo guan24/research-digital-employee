@@ -25,6 +25,12 @@ def health(request: Request):
     return {"status": "ok", "database": str(db.path)}
 
 
+@router.get("/system/overview")
+def system_overview(request: Request):
+    """Small operational snapshot for the local research console."""
+    return _db(request).get_runtime_overview()
+
+
 @router.post("/tasks", response_model=TaskOut, status_code=202)
 def create_task(body: TaskCreate, request: Request):
     settings = _settings(request)
