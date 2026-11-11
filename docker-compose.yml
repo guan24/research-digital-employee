@@ -1,0 +1,31 @@
+services:
+  api:
+    build: .
+    command: uvicorn app.api.main:app --host 0.0.0.0 --port 8000
+    env_file: .env
+    environment:
+      APP_HOME: /app
+      DATA_DIR: /app/data
+      WORKSPACE_DIR: /app/workspaces
+    ports:
+      - "8000:8000"
+    volumes:
+      - ./data:/app/data
+      - ./workspaces:/app/workspaces
+    restart: unless-stopped
+
+  worker:
+    build: .
+    command: python -m app.runtime.worker
+    env_file: .env
+    environment:
+      APP_HOME: /app
+      DATA_DIR: /app/data
+      WORKSPACE_DIR: /app/workspaces
+      LANGGRAPH_STRICT_MSGPACK: "true"
+    volumes:
+      - ./data:/app/data
+      - ./workspaces:/app/workspaces
+    depends_on:
+      - api
+    restart: unless-stopped

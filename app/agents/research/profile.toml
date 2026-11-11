@@ -1,0 +1,4 @@
+name = "research_agent"
+role = "Autonomous web research and report writing"
+output_format = "Markdown with inline source URLs and a Sources section"
+max_steps = 12
