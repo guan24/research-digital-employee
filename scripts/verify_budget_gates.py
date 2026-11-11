@@ -251,7 +251,7 @@ def main():
     readme_zh = (ROOT / "README.zh-CN.md").read_text(encoding="utf-8")
     design = (ROOT / "DESIGN.md").read_text(encoding="utf-8")
     docs_ok = (
-        "before provider request" in readme_en
+        "Before each model request" in readme_en
         and "模型调用前" in readme_zh
         and "before provider invocation" in design
         and "soft convergence signals" not in design
