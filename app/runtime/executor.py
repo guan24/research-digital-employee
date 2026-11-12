@@ -196,13 +196,18 @@ class TaskEventCallback(BaseCallbackHandler):
 
     raise_error = True
 
-    def __init__(self, db: Database, task_id: str, started_monotonic: float, max_runtime_seconds: int, worker_id: str | None = None, worker_generation: int | None = None):
+    def __init__(
+        self, db: Database, task_id: str, started_monotonic: float,
+        max_runtime_seconds: int, worker_id: str | None = None,
+        worker_generation: int | None = None, plan_progress_service: Any | None = None,
+    ):
         self.db = db
         self.task_id = task_id
         self.started_monotonic = started_monotonic
         self.max_runtime_seconds = max_runtime_seconds
         self.worker_id = worker_id
         self.worker_generation = worker_generation
+        self.plan_progress_service = plan_progress_service
         self._llm_started: dict[str, float] = {}
         self._tool_started: dict[str, float] = {}
         self._tool_names: dict[str, str] = {}
@@ -353,6 +358,39 @@ class TaskEventCallback(BaseCallbackHandler):
             "tool_call_started",
             {"tool": tool_name, "input": str(input_str)[:2500], "run_id": str(run_id)},
         )
+        if self.plan_progress_service is not None:
+            try:
+                self.plan_progress_service.sync_plan_progress_for_tool(tool_name, str(input_str))
+            except (TaskPaused, TaskCancelled, TaskDeadlineExceeded, WorkerLeaseLost):
+                raise
+            except Exception as exc:
+                self.db.add_event(self.task_id, "research_plan_progress_sync_failed", {
+                    "tool": tool_name, "error_type": type(exc).__name__, "error": str(exc)[:1000],
+                })
+
+    def sync_plan_progress_for_phase(self, phase: str, note: str = "") -> None:
+        if self.plan_progress_service is None:
+            return
+        try:
+            self.plan_progress_service.sync_plan_progress_for_phase(phase, note)
+        except (TaskPaused, TaskCancelled, TaskDeadlineExceeded, WorkerLeaseLost):
+            raise
+        except Exception as exc:
+            self.db.add_event(self.task_id, "research_plan_progress_sync_failed", {
+                "phase": phase, "error_type": type(exc).__name__, "error": str(exc)[:1000],
+            })
+
+    def complete_active_plan_step(self, note: str) -> None:
+        if self.plan_progress_service is None:
+            return
+        try:
+            self.plan_progress_service.complete_active_plan_step(note)
+        except (TaskPaused, TaskCancelled, TaskDeadlineExceeded, WorkerLeaseLost):
+            raise
+        except Exception as exc:
+            self.db.add_event(self.task_id, "research_plan_progress_sync_failed", {
+                "phase": "completion", "error_type": type(exc).__name__, "error": str(exc)[:1000],
+            })
 
     def on_tool_end(self, output, *, run_id, **kwargs):
         started = self._tool_started.pop(str(run_id), time.monotonic())
@@ -492,8 +530,14 @@ class ResearchExecutor:
         artifact_path = registration.output_artifact or "result.md"
         started = time.monotonic()
         artifacts = ArtifactStore(self.settings.workspace_dir, task_id)
-        callback = TaskEventCallback(self.db, task_id, started,
-            int(task["max_runtime_seconds"]), worker_id, task.get("worker_generation"))
+        plan_progress_service = None
+        if registration.agent_type == "research":
+            from app.runtime.plan_progress import PlanProgressTracker
+            plan_progress_service = PlanProgressTracker(self.db, task_id, artifacts)
+        callback = TaskEventCallback(
+            self.db, task_id, started, int(task["max_runtime_seconds"]),
+            worker_id, task.get("worker_generation"), plan_progress_service,
+        )
         callback._check_control()
         config = {
             "configurable": {"thread_id": task_id},
@@ -585,6 +629,9 @@ class ResearchExecutor:
                         "cited_finding_ids": list(getattr(validation, "cited_finding_ids", ()) or ()),
                     }
                     self.db.add_event(task_id, "delivery_validation_completed", validation_payload)
+                    callback.sync_plan_progress_for_phase(
+                        "validation", "系统已开始校验最终报告及证据引用。"
+                    )
                     if valid:
                         persisted = self._verify_artifact(task_id, artifacts, artifact_path, "validated_report")
                         digest = hashlib.sha256(persisted.encode("utf-8")).hexdigest()
@@ -597,6 +644,7 @@ class ResearchExecutor:
                             "source_count": getattr(validation, "source_count", None),
                             "report_url_count": getattr(validation, "report_url_count", None),
                         })
+                        callback.complete_active_plan_step("最终报告已通过交付校验并正式交付。")
                         break
 
                     if revision >= registration.max_revisions:
@@ -647,4 +695,5 @@ class ResearchExecutor:
                     "sha256": hashlib.sha256(persisted.encode("utf-8")).hexdigest(),
                     "validation_required": False,
                 })
+                callback.complete_active_plan_step("最终成果已持久化并完成交付。")
         return str((artifacts.workspace / artifact_path).resolve())
