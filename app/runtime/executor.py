@@ -532,11 +532,8 @@ class ResearchExecutor:
         artifacts = ArtifactStore(self.settings.workspace_dir, task_id)
         plan_progress_service = None
         if registration.agent_type == "research":
-            from app.tools.research_tools import ResearchToolService
-            plan_progress_service = ResearchToolService(
-                self.settings, self.db, task_id, artifacts, started,
-                worker_id, task.get("worker_generation"),
-            )
+            from app.runtime.plan_progress import PlanProgressTracker
+            plan_progress_service = PlanProgressTracker(self.db, task_id, artifacts)
         callback = TaskEventCallback(
             self.db, task_id, started, int(task["max_runtime_seconds"]),
             worker_id, task.get("worker_generation"), plan_progress_service,
