@@ -1,4 +1,5 @@
 name = "research_agent"
+display_name = "研究员"
 role = "Autonomous web research and report writing"
 output_format = "Markdown with inline source URLs and a Sources section"
 max_steps = 30

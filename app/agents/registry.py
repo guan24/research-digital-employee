@@ -16,6 +16,7 @@ class AgentProfile:
     system_prompt: str
     description: str = ""
     output_artifact: str = "result.md"
+    display_name: str = ""
 
 
 @dataclass(frozen=True)
@@ -63,6 +64,7 @@ def load_research_profile() -> AgentProfile:
         system_prompt=(profile_dir / "system_prompt.md").read_text(encoding="utf-8"),
         description=raw.get("description", raw["role"]),
         output_artifact=raw.get("output_artifact", "report.md"),
+        display_name=raw.get("display_name", raw["name"]),
     )
 
 
@@ -125,6 +127,7 @@ def list_agent_profiles() -> list[dict[str, Any]]:
         profile = registration.profile_loader() if registration.profile_loader else None
         result.append({
             "agent_type": key, "name": profile.name if profile else key,
+            "display_name": profile.display_name if profile else key,
             "role": profile.role if profile else key,
             "description": profile.description if profile else key,
             "output_format": profile.output_format if profile else "task artifact",
@@ -132,6 +135,7 @@ def list_agent_profiles() -> list[dict[str, Any]]:
             "max_steps": registration.budget_defaults.max_steps,
             "max_runtime_seconds": registration.budget_defaults.max_runtime_seconds,
             "max_total_tokens": registration.budget_defaults.max_total_tokens,
+            "max_revisions": registration.max_revisions,
         })
     return result
 

@@ -1,1 +1,112 @@
-<!doctype html><html lang="zh-CN"><head><meta charset="UTF-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>Research OS · 研究数字员工</title><link rel="stylesheet" href="/static/style.css"></head><body><aside><div class="brand">◈ <b>Research OS</b><small>数字员工运行平台</small></div><p class="label">WORKSPACE</p><div class="nav active">▦　任务工作台</div><div class="nav">◉　Agent 运行实例</div><div class="nav">▤　数据与检查点</div><div class="nav">⌁　运行事件与诊断</div><section class="worker"><p>WORKER STATUS</p><div id="worker">检查中…</div><small id="lease">等待心跳</small></section><footer>FastAPI · LangGraph · SQLite<br>本地单 Worker 环境</footer></aside><main><header><span>Workspace　/　研究任务控制台</span><span><i id="apiDot"></i> LOCAL ENV <button id="refresh">刷新</button></span></header><section class="heading"><div><small>AUTONOMOUS RESEARCH WORKSPACE</small><h1>研究任务总览</h1><p>管理长时运行任务，追踪 Agent 决策、工具调用、检查点与研究成果。</p></div><button class="primary" id="newTask">＋ 创建研究任务</button></section><div id="error"></div><section class="stats"><article><small>任务总数</small><strong id="total">0</strong><p>持久化任务记录</p></article><article><small>运行中</small><strong id="running">0</strong><p>Worker 正在执行</p></article><article><small>已完成</small><strong id="completed">0</strong><p>成功生成研究成果</p></article><article><small>异常任务</small><strong id="failed">0</strong><p>等待诊断或重试</p></article></section><section class="columns"><article class="panel"><div class="panelhead">任务队列 <span id="taskCount">0</span></div><input id="search" placeholder="搜索任务目标 / ID"><select id="filter"><option value="all">全部任务</option><option>queued</option><option>running</option><option>retry_wait</option><option>paused</option><option>completed</option><option>failed</option><option>cancelled</option></select><div id="tasks" class="tasklist">加载中…</div></article><article class="panel"><div class="panelhead">执行实例详情 <span id="taskStatus"></span></div><div id="budgetPanel" class="budget-panel"></div><div id="evidencePanel" class="evidence-panel"></div><div id="memoryPanel" class="memory-panel"></div><div id="detail"><div class="empty">选择任务查看详情</div></div><div id="instanceDiagnostics"></div><div class="actions"><button id="pause">暂停</button><button id="resume">恢复</button><button id="cancel">取消</button><button id="retry" class="primary">重试失败任务</button><button id="delete" class="danger">删除任务</button></div><div class="panelhead">Agent 执行计划 <small>整体规划 · 决策调整 · 最终归档</small></div><div id="planPanel" class="plan-panel"><div class="empty">等待 Agent 制定研究计划…</div></div><div class="panelhead">执行轨迹 <small id="eventCount"></small></div><div id="events" class="events"></div></article></section><section class="columns bottom"><article class="panel"><div class="panelhead">研究工作区 / 中间成果</div><div id="artifacts" class="artifacts">选择一个任务</div></article><article class="panel"><div class="panelhead">成果预览 <span class="preview-controls"><small id="previewModeHint">Markdown 支持渲染；JSON 展示原始文本</small><button id="previewRendered" class="active" disabled>Markdown 渲染</button><button id="previewSource">原始源码</button><button id="download">下载文件</button></span></div><div id="preview" class="preview">选择工作区文件预览，完成后可查看 report.md</div></article></section><p class="foot">任务由独立 Worker 执行 · LangGraph SQLite Checkpoint 持久化 · 事件日志可追溯 · 关闭浏览器不影响任务运行</p></main><dialog id="createDialog"><form id="createForm"><h2>创建自主研究任务</h2><label>研究目标<textarea name="goal" required minlength="10" rows="5" placeholder="调研当前主流 Coding Agent 的技术架构，比较任务规划、工具使用、上下文管理和长任务恢复机制，形成有依据的 Markdown 研究报告。"></textarea></label><div class="formrow"><label>最大工具调用数<input name="max_steps" type="number" min="2" max="100" value="30"></label><label>Token 预算<input name="max_total_tokens" type="number" min="1000" max="2000000" step="1000" value="100000"></label><label>启用软预算<input name="budget_enabled" type="checkbox" checked></label><label>运行时限（秒）<input name="max_runtime_seconds" type="number" min="60" max="14400" value="3600"></label><label>最大重试次数<input name="max_attempts" type="number" min="1" max="5" value="3"></label></div><div class="actions"><button type="button" id="closeDialog">取消</button><button class="primary">提交任务</button></div></form></dialog><script src="/static/app.js"></script></body></html>
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1">
+  <title>Research OS · 研究数字员工</title>
+  <link rel="stylesheet" href="/static/style.css">
+</head>
+<body>
+  <aside class="appbar">
+    <div class="brand">◈ <b>Research OS</b><small>研究数字员工运行平台</small></div>
+    <nav aria-label="主导航"><a class="nav active" href="#taskWorkspace">▦　任务工作台</a></nav>
+    <section class="worker" aria-live="polite">
+      <p>WORKER STATUS</p><div id="worker">检查中…</div><small id="lease">等待心跳</small>
+    </section>
+    <footer>FastAPI · LangGraph · SQLite<br>本地单 Worker 环境</footer>
+  </aside>
+  <main>
+    <header><span>Workspace　/　研究任务控制台</span><span><i id="apiDot"></i> LOCAL ENV <button id="refresh" type="button">刷新</button></span></header>
+    <section class="heading">
+      <div><small>AUTONOMOUS RESEARCH WORKSPACE</small><h1>研究任务总览</h1><p>查看任务目标、执行健康、资源预算与研究证据。</p></div>
+      <button class="primary" id="newTask" type="button">＋ 创建任务</button>
+    </section>
+    <div id="error" role="alert"></div>
+    <section class="stats" aria-label="任务统计">
+      <article><small>任务总数</small><strong id="total">0</strong><p>持久化任务记录</p></article>
+      <article><small>运行中</small><strong id="running">0</strong><p>Worker 正在执行</p></article>
+      <article><small>已完成</small><strong id="completed">0</strong><p>成功生成研究成果</p></article>
+      <article><small>异常任务</small><strong id="failed">0</strong><p>等待诊断或重试</p></article>
+    </section>
+    <section class="columns" id="taskWorkspace">
+      <article class="panel task-queue">
+        <div class="panelhead">任务队列 <span id="taskCount">0</span></div>
+        <label class="sr-only" for="search">搜索任务</label><input id="search" placeholder="搜索任务目标 / ID / 岗位">
+        <div class="filter-row">
+          <label class="sr-only" for="filter">任务筛选</label>
+          <select id="filter">
+            <option value="all">全部任务</option><option value="abnormal">仅异常</option>
+            <option value="budget_alert">仅预算告警</option><option value="queued">排队中</option>
+            <option value="running">运行中</option><option value="retry_wait">等待重试</option>
+            <option value="paused">已暂停</option><option value="completed">已完成</option>
+            <option value="failed">执行失败</option><option value="cancelled">已取消</option>
+          </select>
+          <label class="sr-only" for="sort">任务排序</label>
+          <select id="sort"><option value="created">按创建时间</option><option value="activity">按最近活动</option></select>
+        </div>
+        <div id="tasks" class="tasklist" aria-live="polite">加载中…</div>
+      </article>
+      <article class="panel detail-panel">
+        <div class="panelhead">任务身份 <span id="taskStatus"></span></div>
+        <div id="detail"><div class="empty">选择任务查看详情</div></div>
+        <section id="healthPanel" class="health-panel" aria-label="执行健康与预算">
+          <div class="health-summary"><div><small>Worker</small><b id="taskWorker">—</b></div><div><small>心跳新鲜度</small><b id="heartbeatFreshness">—</b></div><div><small>恢复次数</small><b id="recoveryCount">0 次</b></div><div><small>预算状态</small><b id="budgetState">—</b></div></div>
+          <div id="budgetPanel" class="budget-panel"></div>
+        </section>
+        <div class="actions">
+          <button id="pause" type="button">暂停</button><button id="resume" type="button">恢复</button>
+          <button id="cancel" type="button">取消</button><button id="retry" class="primary" type="button">重试失败任务</button>
+          <button id="delete" class="danger" type="button">删除任务</button>
+        </div>
+        <div class="panelhead section-heading">执行计划 <small>整体规划 · 决策调整 · 最终归档</small></div>
+        <div id="planPanel" class="plan-panel"><div class="empty">等待 Agent 制定研究计划…</div></div>
+        <div class="panelhead section-heading">执行轨迹 <small id="eventCount"></small></div>
+        <div id="streamStatus" class="stream-status" role="status" hidden></div>
+        <div id="events" class="events"></div>
+        <section id="evidencePanel" class="evidence-panel">
+          <div class="panelhead">证据登记簿</div><div class="empty">选择任务查看来源与研究发现</div>
+        </section>
+        <section id="qualityPanel" class="quality-panel">
+          <div class="panelhead">交付质量</div><div class="empty">等待交付校验结果</div>
+        </section>
+      </article>
+    </section>
+    <section class="columns bottom">
+      <article class="panel"><div class="panelhead">工作区文件</div><div id="artifacts" class="artifacts">选择一个任务</div></article>
+      <article class="panel"><div class="panelhead">成果 / 快照预览 <span class="preview-controls"><small id="previewModeHint">Markdown 支持渲染；JSON 展示原始文本</small><button id="previewRendered" class="active" disabled type="button">Markdown 渲染</button><button id="previewSource" type="button">原始源码</button><button id="download" type="button">下载文件</button></span></div><div id="preview" class="preview">选择工作区文件或证据快照预览</div></article>
+    </section>
+    <section class="panel diagnostics-panel"><div id="instanceDiagnostics"></div><div id="memoryPanel" class="memory-panel"></div></section>
+    <p class="foot">任务由独立 Worker 执行 · LangGraph SQLite Checkpoint 持久化 · 事件日志可追溯 · 关闭浏览器不影响任务运行</p>
+  </main>
+  <dialog id="createDialog">
+    <form id="createForm">
+      <h2>创建数字员工任务</h2>
+      <label>任务目标<textarea name="goal" required minlength="10" maxlength="12000" rows="5" placeholder="描述希望数字员工自主完成的研究任务、比较维度和交付要求。"></textarea></label>
+      <label>执行岗位<select id="agentType" name="agent_type" required><option value="research">研究员</option></select></label>
+      <div id="agentDefaults" class="agent-defaults">岗位默认预算加载中…</div>
+      <p class="form-hint">预算字段留空即使用所选岗位默认配额；填写后覆盖岗位默认值。</p>
+      <div class="formrow">
+        <label>工具调用上限（2–100 次）<input name="max_steps" type="number" min="2" max="100" placeholder="岗位默认"></label>
+        <label>Token 上限（1,000–5,000,000 Token）<input name="max_total_tokens" type="number" min="1000" max="5000000" step="1000" placeholder="岗位默认"></label>
+        <label>运行时限（60–86,400 秒）<input name="max_runtime_seconds" type="number" min="60" max="86400" placeholder="岗位默认"></label>
+        <label>最大重试次数（1–5 次）<input name="max_attempts" type="number" min="1" max="5" value="3"></label>
+        <label class="checkbox-label"><input name="budget_enabled" type="checkbox" checked> 启用预算闸门（硬上限）</label>
+      </div>
+      <div class="actions"><button type="button" id="closeDialog">取消</button><button class="primary" type="submit">提交任务</button></div>
+    </form>
+  </dialog>
+  <dialog id="budgetDialog">
+    <form id="budgetForm">
+      <h2>申请扩额</h2><p class="form-hint">扩额将叠加到现有额度，不重置已用量；预算终止的任务可从 Checkpoint 续跑。</p>
+      <label>申请原因<textarea name="reason" required minlength="3" maxlength="1200" rows="3" placeholder="说明需要扩额的原因"></textarea></label>
+      <div class="formrow">
+        <label>增加工具调用次数（0–100）<input name="additional_steps" type="number" min="0" max="100" value="0"></label>
+        <label>增加 Token（0–5,000,000）<input name="additional_tokens" type="number" min="0" max="5000000" value="0"></label>
+        <label>增加运行时间（秒，0–86,400）<input name="additional_runtime_seconds" type="number" min="0" max="86400" value="0"></label>
+      </div>
+      <div class="actions"><button type="button" id="closeBudgetDialog">取消</button><button class="primary" type="submit">提交扩额</button></div>
+    </form>
+  </dialog>
+  <script src="/static/app.js"></script>
+</body>
+</html>

@@ -12,6 +12,10 @@ let eventPollTimer = null;
 let previewMode = 'rendered';
 let planVersions = [];
 let loadGeneration = 0;
+let agentProfiles = [];
+let workerOverview = { status: 'offline' };
+let eventStreamMode = 'connecting';
+let lastBudget = null;
 
 const names = {
   deleting: '正在删除', queued: '排队中', running: '运行中',
@@ -20,7 +24,7 @@ const names = {
 };
 
 const eventNames = {
-  task_created: '任务创建', budget_warning: '预算预警', budget_soft_limit_reached: '软预算达到', research_memory_saved: '研究记忆保存', research_finding_recorded: '研究发现登记', task_started: 'Worker 领取任务',
+  task_created: '任务创建', budget_warning: '预算预警', budget_restricted: '预算进入受限状态', budget_soft_limit_reached: '预算达到软上限', budget_extension_approved: '预算扩额已批准', budget_checkpoint_resume_requested: '扩额后请求断点续跑', delivery_validation_completed: '交付校验完成', delivery_repair_resumed: '定向修复恢复', research_memory_saved: '研究记忆保存', research_finding_recorded: '研究发现登记', task_started: 'Worker 领取任务',
   agent_execution_started: 'Agent 开始执行', agent_initial_run: '首次运行',
   agent_plan_started: '自主规划启动', research_plan_updated: 'Agent 规划调整', research_plan_finalized: '最终计划归档', checkpoint_resume: 'Checkpoint 恢复',
   checkpoint_already_complete: '检查点已完成', model_call_started: '模型调用开始',
@@ -94,62 +98,115 @@ async function req(url, options) {
   return response.json();
 }
 
-async function refresh() {
+async function loadAgents() {
   try {
-    const [taskList, overview] = await Promise.all([
-      req('/tasks?limit=100'), req('/system/overview')
-    ]);
-    tasks = taskList;
-    const counts = overview.task_counts || {};
-    $('total').textContent = tasks.length;
-    $('running').textContent = counts.running || 0;
-    $('completed').textContent = counts.completed || 0;
-    $('failed').textContent = counts.failed || 0;
-    $('worker').textContent = overview.worker.status === 'active' ? '● Worker 在线' : '○ Worker 离线';
-    $('lease').textContent = overview.worker.worker_id || '等待 Worker 心跳';
-    $('apiDot').style.background = '#65d39b';
-    $('error').textContent = '';
-    renderTasks();
-
-    // Polling refreshes task metadata only. It must never replace the live trace DOM.
-    if (selected) {
-      try {
-        const taskId = selected;
-        const updatedDetail = await req('/tasks/' + taskId);
-        if (selected === taskId) { detail = updatedDetail; renderTaskSummary(); renderInstanceDiagnostics(); }
-      } catch { /* The task may have been deleted in another tab. */ }
+    const result = await req('/agents');
+    agentProfiles = Array.isArray(result.agents) ? result.agents : [];
+    const select = $('agentType');
+    if (select) {
+      const selectedType = select.value;
+      select.innerHTML = agentProfiles.map(agent => '<option value="' + esc(agent.agent_type) + '">' +
+        esc(agent.display_name || agent.name || agent.agent_type) + '（' + esc(agent.agent_type) + '）</option>').join('') ||
+        '<option value="research">研究员（research）</option>';
+      if (agentProfiles.some(agent => agent.agent_type === selectedType)) select.value = selectedType;
+      renderAgentDefaults();
+      renderTasks();
+      if (detail) renderTaskSummary();
     }
-  } catch (error) {
+  } catch (error) { if ($('agentDefaults')) $('agentDefaults').textContent = '岗位列表加载失败：' + error.message; }
+}
+function getAgent(agentType) { return agentProfiles.find(agent => agent.agent_type === agentType) || null; }
+function roleLabel(agentType) {
+  const agent = getAgent(agentType);
+  return agent ? (agent.display_name || agent.name || agent.agent_type) : (agentType || '研究岗位');
+}
+function renderAgentDefaults() {
+  const agent = getAgent($('agentType')?.value || 'research'), root = $('agentDefaults');
+  if (!root) return;
+  if (!agent) { root.textContent = '未读取到岗位默认预算；留空由服务端岗位配置决定。'; return; }
+  root.innerHTML = '<b>岗位默认配额</b><span>工具调用 ' + esc(agent.max_steps) + ' 次</span><span>Token ' +
+    Number(agent.max_total_tokens || 0).toLocaleString() + '</span><span>运行时长 ' + esc(agent.max_runtime_seconds) + ' 秒</span>';
+}
+async function refresh(manual = false) {
+  if (document.visibilityState === 'hidden' && !manual) return;
+  const [taskResult, overviewResult] = await Promise.allSettled([req('/tasks?limit=100'), req('/system/overview')]);
+  if (taskResult.status === 'fulfilled') {
+    tasks = taskResult.value;
+    $('total').textContent = tasks.length;
+    $('running').textContent = tasks.filter(task => task.status === 'running').length;
+    $('completed').textContent = tasks.filter(task => task.status === 'completed').length;
+    $('failed').textContent = tasks.filter(task => ['failed','retry_wait'].includes(task.status)).length;
+    renderTasks();
+  } else $('error').textContent = '任务列表加载失败：' + taskResult.reason.message;
+  if (overviewResult.status === 'fulfilled') {
+    workerOverview = overviewResult.value.worker || {status:'offline'};
+    $('worker').textContent = workerOverview.status === 'active' ? '● Worker 在线' :
+      workerOverview.status === 'lease_expired' ? '! Worker 租约过期' : '○ Worker 离线';
+    $('lease').textContent = workerOverview.worker_id || '当前没有持有有效租约';
+    $('apiDot').style.background = '#65d39b';
+  } else {
     $('apiDot').style.background = '#ff7875';
-    $('error').textContent = 'API 连接失败：' + error.message + '。请启动 FastAPI。';
+    $('error').textContent = '运行状态读取失败：' + overviewResult.reason.message;
+  }
+  if (selected && (manual || taskResult.status === 'fulfilled')) {
+    const taskId = selected;
+    try {
+      detail = await req('/tasks/' + taskId);
+      if (selected === taskId) {
+        renderTaskSummary();
+        if (manual) await load(taskId);
+      }
+    } catch (error) { if (manual) $('detail').innerHTML = '<div class="load-error">任务详情刷新失败：' + esc(error.message) + '</div>'; }
   }
 }
 
-function renderTasks() {
-  const query = $('search').value.toLowerCase();
-  const filter = $('filter').value;
-  const visible = tasks.filter(task =>
-    (filter === 'all' || task.status === filter) &&
-    (!query || (task.goal + ' ' + task.task_id).toLowerCase().includes(query))
+function taskRuntimeSeconds(task) {
+  let used = Number(task.runtime_seconds_used || 0);
+  if (task.status === 'running' && task.heartbeat_at) used += Math.max(0, Date.now()/1000 - Number(task.heartbeat_at));
+  return used;
+}
+function formatDuration(seconds) {
+  const value = Math.max(0, Math.floor(Number(seconds)||0));
+  if (value < 60) return value + ' 秒';
+  if (value < 3600) return Math.floor(value/60) + ' 分钟';
+  return Math.floor(value/3600) + ' 小时 ' + Math.floor(value%3600/60) + ' 分钟';
+}
+function heartbeatAge(task) { return task?.heartbeat_at ? Math.max(0,Date.now()/1000-Number(task.heartbeat_at)) : Infinity; }
+function taskBudgetRatio(task) {
+  return Math.max(
+    Number(task.max_steps) ? Number(task.execution_steps||0)/Number(task.max_steps) : 0,
+    Number(task.max_total_tokens) ? Number(task.total_tokens_used||0)/Number(task.max_total_tokens) : 0,
+    Number(task.max_runtime_seconds) ? taskRuntimeSeconds(task)/Number(task.max_runtime_seconds) : 0
   );
-  $('taskCount').textContent = visible.length;
-  $('tasks').innerHTML = visible.map(task =>
-    '<div class="task ' + (task.task_id === selected ? 'selected' : '') +
-    '" data-id="' + esc(task.task_id) + '">' +
-    '<div class="meta"><span class="tag ' + esc(task.status) + '">' +
-    esc(names[task.status] || task.status) + '</span>' + time(task.updated_at) + '</div>' +
-    '<b>' + esc(task.goal) + '</b><div class="meta"><span>' +
-    esc(task.task_id.slice(0, 8)) + '</span><span>尝试 ' +
-    task.attempts + '/' + task.max_attempts + '</span></div></div>'
-  ).join('') || '<div class="empty">暂无任务</div>';
-
-  document.querySelectorAll('.task').forEach(element => {
-    element.onclick = () => {
-      selected = element.dataset.id;
-      load(selected);
-      renderTasks();
-    };
+}
+function taskIsStale(task) { return task.status === 'running' && heartbeatAge(task) > 30; }
+function renderTasks() {
+  const query = $('search').value.toLowerCase(), filter = $('filter').value, sort = $('sort').value;
+  const visible = tasks.filter(task => {
+    const ratio = taskBudgetRatio(task), abnormal = ['failed','retry_wait'].includes(task.status) || taskIsStale(task);
+    const budgetAlert = task.budget_enabled !== false && ratio >= .8, role = roleLabel(task.agent_type);
+    const matches = filter === 'all' || (filter === 'abnormal' && abnormal) ||
+      (filter === 'budget_alert' && budgetAlert) || task.status === filter;
+    return matches && (!query || (task.goal+' '+task.task_id+' '+role+' '+task.agent_type).toLowerCase().includes(query));
   });
+  visible.sort((a,b) => sort === 'activity' ? String(b.updated_at||'').localeCompare(String(a.updated_at||'')) :
+    String(b.created_at||'').localeCompare(String(a.created_at||'')));
+  $('taskCount').textContent = visible.length;
+  $('tasks').innerHTML = visible.map(task => {
+    const ratio=taskBudgetRatio(task), stale=taskIsStale(task);
+    return '<button type="button" class="task '+(task.task_id===selected?'selected':'')+'" data-id="'+esc(task.task_id)+'">'+
+      '<div class="meta"><span class="tag '+esc(task.status)+'">'+esc(names[task.status]||task.status)+'</span>'+
+      '<span>'+esc(roleLabel(task.agent_type))+' · '+esc(task.agent_type||'research')+'</span></div>'+
+      '<b>'+esc(compact(task.goal,130)||'未命名任务')+'</b><div class="meta"><span>'+
+      (task.status==='running'?'已运行 '+formatDuration(taskRuntimeSeconds(task)):'活动 '+time(task.updated_at))+
+      '</span><span>尝试 '+esc(task.attempts)+'/'+esc(task.max_attempts)+'</span></div><div class="task-flags">'+
+      (ratio>=.8&&task.budget_enabled!==false?'<span class="flag warning">预算 '+Math.round(ratio*100)+'%</span>':'')+
+      (stale?'<span class="flag danger">心跳过期</span>':'')+'</div></button>';
+  }).join('') || '<div class="empty"><b>还没有匹配的任务</b><p>创建任务 → 查看自主计划 → 跟踪执行轨迹与证据。</p><button type="button" class="primary" id="emptyCreate">创建第一个任务</button></div>';
+  $('emptyCreate')?.addEventListener('click',()=>$('createDialog').showModal());
+  document.querySelectorAll('.task[data-id]').forEach(element=>element.addEventListener('click',()=>{
+    selected=element.dataset.id;load(selected);renderTasks();
+  }));
 }
 
 async function load(taskId) {
@@ -160,6 +217,8 @@ async function load(taskId) {
   eventSource = null; eventPollTimer = null;
   detail = null; events = []; artifacts = []; activeFile = ''; fileText = '';
   $('taskStatus').textContent = '加载中';
+  setStreamStatus('');
+  $('qualityPanel').innerHTML = '<div class="empty">正在读取交付校验记录…</div>';
   $('detail').innerHTML = '<div class="empty">正在读取任务执行实例…</div>';
   $('instanceDiagnostics').innerHTML = '';
   $('events').innerHTML = '<div class="empty">正在读取执行事件…</div>';
@@ -179,13 +238,13 @@ async function load(taskId) {
   }
   if (historyResult.status === 'fulfilled') {
     events = Array.isArray(historyResult.value) ? historyResult.value : [];
-    renderTrace(); renderPlan(); renderInstanceDiagnostics();
+    renderTrace(); renderPlan(); renderQuality(); renderHealth(); renderInstanceDiagnostics();
   } else {
     events = [];
     $('events').innerHTML = '<div class="load-error"><strong>执行事件读取失败</strong><p>' +
       esc(historyResult.reason?.message || '未知 API 错误') + '</p></div>';
     $('eventCount').textContent = '读取失败';
-    renderPlan(); renderInstanceDiagnostics();
+    renderPlan(); renderQuality(); renderHealth(); renderInstanceDiagnostics();
   }
   if (artifactResult.status === 'fulfilled') { artifacts = artifactResult.value.artifacts || []; renderArtifacts(); }
   else $('artifacts').innerHTML = '<div class="load-error">工作区文件读取失败：' +
@@ -194,49 +253,55 @@ async function load(taskId) {
   renderTasks();
 }
 
+function setStreamStatus(message,degraded=false) {
+  const root=$('streamStatus');root.hidden=!message;root.textContent=message||'';root.classList.toggle('degraded',Boolean(degraded));
+}
+function startEventPolling(taskId) {
+  if(eventPollTimer)clearInterval(eventPollTimer);
+  eventPollTimer=setInterval(()=>{if(document.visibilityState==='visible')pollNewEvents(taskId);},2500);
+  setStreamStatus('已降级为轮询 · 每 2.5 秒检查新增事件',true);
+}
 function connectEvents(taskId) {
-  if (eventSource) eventSource.close();
-  if (eventPollTimer) clearInterval(eventPollTimer);
-  const lastId = events.length ? events[events.length - 1].event_id : 0;
-  eventSource = new EventSource('/tasks/' + taskId + '/events/stream?after_id=' + lastId);
-  eventSource.addEventListener('task_event', message => {
-    let item;
-    try { item = JSON.parse(message.data); } catch (error) { console.error('Invalid task event payload', error); return; }
-    if (events.some(event => event.event_id === item.event_id)) return;
-    events.push(item);
-    upsertTraceEvent(item);
-    if (item.event_type.startsWith('research_plan_')) renderPlan();
-    if (['budget_warning','budget_soft_limit_reached','research_memory_saved','research_finding_recorded'].includes(item.event_type)) renderBudgetAndEvidence();
-    renderInstanceDiagnostics();
-    if (['artifact_saved', 'report_saved_by_agent', 'report_materialized_from_final_answer'].includes(item.event_type)) refreshArtifacts(taskId);
-    if (['task_started', 'task_completed', 'task_failed', 'task_cancelled', 'retry_scheduled'].includes(item.event_type)) {
-      req('/tasks/' + taskId).then(task => {
-        if (selected === taskId) {
-          detail = task;
-          renderTaskSummary();
-        }
-      }).catch(() => {});
+  if(eventSource)eventSource.close();if(eventPollTimer)clearInterval(eventPollTimer);
+  const lastId=events.length?events[events.length-1].event_id:0;
+  eventStreamMode='connecting';setStreamStatus('正在建立实时事件连接…');
+  eventSource=new EventSource('/tasks/'+taskId+'/events/stream?after_id='+lastId);
+  eventSource.onopen=()=>{if(selected!==taskId)return;eventStreamMode='live';setStreamStatus('实时事件流已连接');};
+  eventSource.addEventListener('task_event',message=>{
+    let item;try{item=JSON.parse(message.data);}catch(error){console.error('Invalid task event payload',error);return;}
+    if(events.some(event=>event.event_id===item.event_id))return;
+    events.push(item);upsertTraceEvent(item);
+    if(item.event_type.startsWith('research_plan_'))renderPlan();
+    if(['budget_warning','budget_restricted','budget_soft_limit_reached','budget_extension_approved','research_memory_saved','research_finding_recorded'].includes(item.event_type))renderBudgetAndEvidence();
+    if(item.event_type==='delivery_validation_completed')renderQuality();
+    renderInstanceDiagnostics();renderHealth();
+    if(['artifact_saved','report_saved_by_agent','report_materialized_from_final_answer','artifact_materialized_from_final_answer'].includes(item.event_type))refreshArtifacts(taskId);
+    if(['task_started','task_completed','task_failed','task_cancelled','retry_scheduled','budget_checkpoint_resume_requested'].includes(item.event_type)){
+      req('/tasks/'+taskId).then(task=>{if(selected===taskId){detail=task;renderTaskSummary();renderTasks();}}).catch(()=>{});
     }
   });
-  eventSource.addEventListener('task_deleted', () => eventSource.close());
-  eventSource.onerror = () => { /* EventSource reconnects with Last-Event-ID; polling is the fallback. */ };
-  eventPollTimer = setInterval(() => pollNewEvents(taskId), 2500);
+  eventSource.addEventListener('task_deleted',()=>eventSource.close());
+  eventSource.onerror=()=>{
+    if(selected!==taskId||eventStreamMode==='polling')return;
+    eventStreamMode='polling';eventSource.close();eventSource=null;startEventPolling(taskId);
+  };
 }
-
 async function pollNewEvents(taskId) {
-  if (selected !== taskId) return;
-  const lastId = events.length ? events[events.length - 1].event_id : 0;
-  try {
-    const incoming = await req('/tasks/' + taskId + '/events?after_id=' + lastId + '&limit=200');
-    for (const item of incoming) {
-      if (events.some(event => event.event_id === item.event_id)) continue;
-      events.push(item);
-      upsertTraceEvent(item);
-      if (item.event_type.startsWith('research_plan_')) renderPlan();
-      if (['budget_warning','budget_soft_limit_reached','research_memory_saved','research_finding_recorded'].includes(item.event_type)) renderBudgetAndEvidence();
-      if (['artifact_saved', 'report_saved_by_agent', 'report_materialized_from_final_answer'].includes(item.event_type)) refreshArtifacts(taskId);
+  if(selected!==taskId||document.visibilityState==='hidden')return;
+  const lastId=events.length?events[events.length-1].event_id:0;
+  try{
+    const incoming=await req('/tasks/'+taskId+'/events?after_id='+lastId+'&limit=200');
+    for(const item of incoming){
+      if(events.some(event=>event.event_id===item.event_id))continue;
+      events.push(item);upsertTraceEvent(item);
+      if(item.event_type.startsWith('research_plan_'))renderPlan();
+      if(['budget_warning','budget_restricted','budget_soft_limit_reached','budget_extension_approved','research_memory_saved','research_finding_recorded'].includes(item.event_type))renderBudgetAndEvidence();
+      if(item.event_type==='delivery_validation_completed')renderQuality();
+      if(['artifact_saved','report_saved_by_agent','report_materialized_from_final_answer','artifact_materialized_from_final_answer'].includes(item.event_type))refreshArtifacts(taskId);
+      renderHealth();
     }
-  } catch (error) { console.warn('Execution event polling failed', error); }
+    if(incoming.length){const updated=await req('/tasks/'+taskId);if(selected===taskId){detail=updated;renderTaskSummary();renderTasks();}}
+  }catch(error){setStreamStatus('事件轮询失败：'+error.message,true);}
 }
 
 async function refreshArtifacts(taskId) {
@@ -251,53 +316,128 @@ async function refreshArtifacts(taskId) {
   } catch (error) { console.warn('Artifact refresh failed', error); }
 }
 
+function errorCategoryLabel(category) {
+  return ({retryable:'可重试',terminal:'终态',unknown:'未知',control:'控制信号'})[category]||'未知';
+}
+function errorCategoryClass(category) { return category==='terminal'?'terminal':category==='retryable'?'retryable':'unknown'; }
+function latestValidation() { return [...events].reverse().find(event=>event.event_type==='delivery_validation_completed')||null; }
 function renderTaskSummary() {
-  if (!detail) return;
-  $('taskStatus').textContent = names[detail.status] || detail.status;
-  renderBudgetAndEvidence();
-  $('detail').innerHTML =
-    '<div class="detail"><div class="muted">' + esc(detail.task_id) + '</div>' +
-    '<h3>' + esc(detail.goal) + '</h3><div class="kv"><span>尝试 ' +
-    detail.attempts + '/' + detail.max_attempts + '</span><span>运行预算 ' +
-    Math.round(detail.max_runtime_seconds / 60) + ' min</span><span>规划步数 ' +
-    detail.max_steps + '</span></div>' +
-    (detail.last_error ? '<p class="task-error">最近错误：' + esc(detail.last_error) + '</p>' : '') +
-    '<div class="muted">创建：' + time(detail.created_at) + '　开始：' +
-    time(detail.started_at) + '　完成：' + time(detail.completed_at) + '</div></div>';
-  renderInstanceDiagnostics();
-
-  $('pause').disabled = detail.status !== 'running';
-  $('resume').disabled = detail.status !== 'paused';
-  $('retry').disabled = detail.status !== 'failed';
-  $('cancel').disabled = !['queued', 'retry_wait', 'running', 'paused'].includes(detail.status);
-  $('delete').disabled = detail.status === 'deleting';
+  if(!detail)return;
+  $('taskStatus').textContent=names[detail.status]||detail.status;
+  const firstError=parseObject(detail.first_error_json),history=parseObject(detail.error_history_json)||[];
+  const latestError=history.length?history[history.length-1]:null,plan=planSnapshot(),version=plan.latest?'v'+plan.latest.version:'尚未生成';
+  const failed=['failed','retry_wait'].includes(detail.status),goal=String(detail.goal||'');
+  $('detail').innerHTML='<div class="identity-card"><div class="identity-top"><span class="role-pill">'+esc(roleLabel(detail.agent_type))+
+    '</span><code>'+esc(detail.agent_type||'research')+'</code><span class="tag '+esc(detail.status)+'">'+esc(names[detail.status]||detail.status)+'</span>'+
+    '<span class="plan-version">当前计划 '+esc(version)+'</span></div><div class="identity-goal"><b>任务目标</b><p>'+esc(compact(goal,230))+'</p>'+
+    (goal.length>230?'<details><summary>展开完整研究目标</summary><p>'+esc(goal)+'</p></details>':'')+'</div>'+
+    '<div class="identity-metrics"><span>已运行 <b id="elapsedRuntime">'+esc(formatDuration(taskRuntimeSeconds(detail)))+'</b></span>'+
+    '<span>尝试 <b>'+esc(detail.attempts)+'/'+esc(detail.max_attempts)+'</b></span>'+
+    '<span>'+(detail.resume_mode?'<b class="resume-mark">断点续跑中</b>':'常规执行')+'</span>'+
+    '<span>工具调用上限 <b>'+esc(detail.max_steps)+' 次</b></span></div>'+
+    (failed?'<section class="failure-summary"><div class="failure-heading"><span class="error-class '+errorCategoryClass(detail.error_category||firstError?.category)+'">'+
+      esc(errorCategoryLabel(detail.error_category||firstError?.category))+'</span><b>'+esc(detail.error_code||latestError?.error_code||'UNKNOWN_EXCEPTION')+
+      '</b></div><p><strong>首次失败原因：</strong>'+esc(firstError?.summary||firstError?.message||detail.last_error||'未记录首因')+'</p>'+
+      (latestError?'<small>最近一次错误：'+esc(latestError.summary||'')+'</small>':'')+
+      '<details class="error-history"><summary>错误历史（'+history.length+' 条）</summary><ol>'+history.map((item,index)=>
+        '<li><b>第 '+esc(item.attempt||index+1)+' 次 · '+esc(errorCategoryLabel(item.category))+'</b><code>'+
+        esc(item.error_code||'UNKNOWN')+'</code><time>'+esc(time(item.timestamp))+'</time><p>'+esc(item.summary||'')+'</p></li>').join('')+
+      '</ol></details>'+(detail.status==='retry_wait'?'<p class="retry-next">下次重试：'+esc(detail.next_run_at?time(Number(detail.next_run_at)*1000):'等待调度')+'</p>':'')+
+      '</section>':'')+'<div class="muted">创建：'+esc(time(detail.created_at))+'　开始：'+esc(time(detail.started_at))+
+      '　完成：'+esc(time(detail.completed_at))+'</div></div>';
+  renderHealth();renderBudgetAndEvidence();renderQuality();renderInstanceDiagnostics();
+  $('pause').disabled=detail.status!=='running';$('resume').disabled=detail.status!=='paused';
+  $('retry').disabled=detail.status!=='failed';$('cancel').disabled=!['queued','retry_wait','running','paused'].includes(detail.status);
+  $('delete').disabled=detail.status==='deleting';
+}
+function renderHealth() {
+  if(!detail)return;
+  const age=heartbeatAge(detail),stale=detail.status==='running'&&age>30,online=workerOverview.status==='active';
+  $('taskWorker').textContent=detail.worker_id?(online?'在线 · ':'已分配 · ')+detail.worker_id:(online?'在线（空闲/其他任务）':'离线');
+  $('heartbeatFreshness').textContent=Number.isFinite(age)?(age<60?Math.floor(age)+' 秒前':Math.floor(age/60)+' 分钟前'):'暂无心跳';
+  $('heartbeatFreshness').classList.toggle('stale',stale);
+  $('recoveryCount').textContent=events.filter(event=>['checkpoint_resume','worker_recovery_scheduled','checkpoint_already_complete','budget_checkpoint_resume_requested'].includes(event.event_type)).length+' 次';
+  $('budgetState').textContent=budgetStateLabel(lastBudget?.state,detail);
+  const elapsed=$('elapsedRuntime');if(elapsed)elapsed.textContent=formatDuration(taskRuntimeSeconds(detail));
+}
+function budgetStateLabel(state,task=detail) {
+  if(task?.status==='failed'&&/BUDGET_EXHAUSTED/.test(task.error_code||''))return '已终止';
+  if(state==='normal'&&events.some(event=>event.event_type==='budget_extension_approved'))return '已扩额';
+  return ({normal:'正常',warning:'预警',restricted:'受限收敛',soft_limit:'已达软上限',disabled:'预算闸门关闭',missing:'不可用'})[state]||'待读取';
 }
 
-async function renderBudgetAndEvidence() {
-  if (!detail) return;
-  const taskId = detail.task_id;
-  try {
-    const [budget, evidence, memory] = await Promise.all([
-      req('/tasks/' + taskId + '/budget'),
-      req('/tasks/' + taskId + '/evidence'),
-      req('/tasks/' + taskId + '/memory')
-    ]);
-    if (selected !== taskId) return;
-    const labels = {tool_calls:'工具调用', runtime_seconds:'累计运行时间', tokens:'Token'};
-    const pct = item => item.limit ? Math.round(item.used / item.limit * 100) : 0;
-    $('budgetPanel').innerHTML = '<div class="panelhead">任务资源预算 · ' + esc(budget.state) + '</div>' +
-      Object.entries(budget.dimensions || {}).map(([key,item]) =>
-        '<div class="budget-row"><span>' + esc(labels[key] || key) + '</span><b>' +
-        esc(item.used) + ' / ' + esc(item.limit) + '</b><div><i style="width:' +
-        Math.min(100,pct(item)) + '%"></i></div></div>').join('') +
-      '<small>' + esc(budget.instruction || '') + '</small>';
-    $('evidencePanel').innerHTML = '<div class="panelhead">证据登记簿</div><p>来源 ' +
-      esc(evidence.source_count || 0) + ' · 已核验 ' + esc(evidence.verified_source_count || 0) +
-      ' · 研究发现 ' + esc(evidence.finding_count || 0) + '</p>' +
-      '<small>索引：' + esc(evidence.registry_path || 'evidence/registry.json') + '</small>';
-    $('memoryPanel').innerHTML = '<div class="panelhead">长期研究记忆</div>' +
-      (memory.content ? '<pre>' + esc(memory.content) + '</pre>' : '<small>Agent 尚未保存研究记忆</small>');
-  } catch (error) { console.warn('Task budget/evidence refresh failed', error); }
+function renderBudgetAndEvidence() {
+  if(!detail)return;const taskId=detail.task_id;
+  Promise.allSettled([req('/tasks/'+taskId+'/budget'),req('/tasks/'+taskId+'/evidence'),req('/tasks/'+taskId+'/memory')]).then(results=>{
+    if(selected!==taskId)return;
+    const [budgetResult,evidenceResult,memoryResult]=results;
+    if(budgetResult.status==='fulfilled'){
+      const budget=budgetResult.value;lastBudget=budget;$('budgetState').textContent=budgetStateLabel(budget.state,detail);
+      const labels={tool_calls:'工具调用',runtime_seconds:'运行时长',tokens:'Token'};
+      const stopped=detail.status==='failed'&&/BUDGET_EXHAUSTED/.test(detail.error_code||'');
+      const dimName={TOOL_STEP_BUDGET_EXHAUSTED:'工具调用',TOKEN_BUDGET_EXHAUSTED:'Token',RUNTIME_BUDGET_EXHAUSTED:'运行时长'};
+      const title=stopped?'已终止 · '+(dimName[detail.error_code]||'预算')+'预算耗尽':budgetStateLabel(budget.state,detail);
+      $('budgetPanel').innerHTML='<div class="budget-heading"><b>任务预算闸门</b><span class="budget-state state-'+esc(stopped?'terminated':budget.state)+'">'+esc(title)+'</span></div>'+
+        Object.entries(budget.dimensions||{}).map(([key,item])=>{
+          const ratio=Number(item.ratio||0),pct=Math.round(ratio*100),tone=ratio>=1?'over':ratio>=.95?'restricted':ratio>=.8?'warning':'normal';
+          const used=key==='runtime_seconds'?formatDuration(item.used):Number(item.used||0).toLocaleString();
+          const limit=key==='runtime_seconds'?formatDuration(item.limit):Number(item.limit||0).toLocaleString();
+          const remaining=key==='runtime_seconds'?formatDuration(item.remaining):Number(item.remaining||0).toLocaleString();
+          const reserved=key==='tokens'?'<small>已预留 '+Number(item.reserved||0).toLocaleString()+' Token</small>':'';
+          return '<div class="budget-dimension"><div class="budget-dimension-top"><b>'+labels[key]+'</b><strong>'+pct+'%</strong></div>'+
+            '<div class="budget-track '+tone+'"><i style="width:'+Math.min(100,pct)+'%"></i></div><div class="budget-numbers">'+
+            '<span>已用 '+esc(used)+'</span><span>上限 '+esc(limit)+'</span><span>剩余 '+esc(remaining)+'</span></div>'+reserved+'</div>';
+        }).join('')+((budget.state==='restricted'||budget.state==='soft_limit'||stopped)?
+          '<p class="budget-instruction">探索工具已禁用，仅可复用已有证据并完成报告。</p>':'')+
+          '<div class="budget-actions"><small>剩余量已扣除未结算 Token 预留。</small><button type="button" id="requestBudgetExtension">申请扩额</button></div>';
+      $('requestBudgetExtension').addEventListener('click',()=>$('budgetDialog').showModal());
+    }else{$('budgetState').textContent='读取失败';$('budgetPanel').innerHTML='<div class="load-error">预算面板加载失败：'+esc(budgetResult.reason?.message||'未知错误')+'</div>';}
+    if(evidenceResult.status==='fulfilled')renderEvidence(evidenceResult.value);
+    else $('evidencePanel').innerHTML='<div class="panelhead">证据登记簿</div><div class="load-error">证据登记簿加载失败：'+esc(evidenceResult.reason?.message||'未知错误')+'</div>';
+    if(memoryResult.status==='fulfilled'){
+      const memory=memoryResult.value;$('memoryPanel').innerHTML='<div class="panelhead">长期研究记忆</div>'+
+        (memory.content?'<pre>'+esc(memory.content)+'</pre>':'<small>Agent 尚未保存研究记忆</small>');
+    }else $('memoryPanel').innerHTML='<div class="load-error">研究记忆加载失败：'+esc(memoryResult.reason?.message||'未知错误')+'</div>';
+  });
+}
+function safeHttpUrl(value) {
+  try { const url = new URL(value); return ['http:','https:'].includes(url.protocol) ? url.href : '#'; }
+  catch { return '#'; }
+}
+function sourceDomain(url) { try{return new URL(safeHttpUrl(url)).hostname.replace(/^www\./,'');}catch{return '未知域名';} }
+function renderEvidence(evidence) {
+  const sources=Array.isArray(evidence.sources)?evidence.sources:[],findings=Array.isArray(evidence.findings)?evidence.findings:[];
+  const validation=latestValidation()?.payload||{},coverage=validation.evidence_coverage;
+  $('evidencePanel').innerHTML='<div class="panelhead">证据登记簿 <span>'+sources.length+' 个来源</span></div>'+
+    (sources.length?'<div class="evidence-summary"><span>来源 '+esc(evidence.source_count||sources.length)+'</span><span>已核验 '+
+      esc(evidence.verified_source_count||0)+'</span><span>研究发现 '+esc(evidence.finding_count||findings.length)+'</span><span>报告证据覆盖率 '+
+      (coverage==null?'未记录':Math.round(Number(coverage)*100)+'%')+'</span></div>'+
+      '<div class="table-wrap"><table class="evidence-table"><thead><tr><th>来源编号</th><th>标题 / 域名</th><th>类型</th><th>核验状态</th><th>快照</th></tr></thead><tbody>'+
+      sources.map(source=>'<tr><td><code>'+esc(source.source_id||'—')+'</code></td><td><b>'+esc(compact(source.title||source.url,90))+
+        '</b><small>'+esc(sourceDomain(source.url))+'</small><a href="'+esc(safeHttpUrl(source.url))+'" target="_blank" rel="noopener noreferrer">原始来源 ↗</a></td><td>'+
+        (/pdf/i.test(source.source_type||'')||/\.pdf(?:$|\?)/i.test(source.url||'')?'PDF':'网页')+'</td><td><span class="verify-state '+
+        (source.verified?'verified':'unverified')+'">'+(source.verified?'已核验':'未核验')+'</span></td><td><button type="button" class="snapshot-open" data-snapshot="'+
+        esc(source.snapshot_path||'')+'" '+(source.snapshot_path?'':'disabled')+'>查看快照</button></td></tr>').join('')+
+      '</tbody></table></div>'+(findings.length?'<div class="finding-list"><b>研究发现</b>'+findings.map(finding=>
+        '<article><p>'+esc(compact(finding.claim,240))+'</p><small>关联来源：'+esc((finding.source_ids||[]).join('、'))+
+        ' · 置信度：'+esc(({low:'低',medium:'中',high:'高'})[finding.confidence]||finding.confidence||'未记录')+
+        '</small></article>').join('')+'</div>':'<p class="muted">尚未登记研究发现。</p>'):
+      '<div class="empty"><b>尚未登记证据</b><p>Agent 完成搜索和网页读取后，会将来源、核验状态与快照登记在这里。</p></div>');
+  document.querySelectorAll('[data-snapshot]').forEach(button=>button.addEventListener('click',()=>openFile(button.dataset.snapshot)));
+}
+function renderQuality() {
+  const root=$('qualityPanel'),event=latestValidation();
+  if(!event){root.innerHTML='<div class="panelhead">交付质量</div><div class="empty">尚无交付校验记录；报告生成后将在这里显示校验结论。</div>';return;}
+  const payload=event.payload||{},role=getAgent(detail?.agent_type),maxRevisions=Number(role?.max_revisions??0);
+  const revision=Number(payload.revision||0),exhausted=detail?.error_code==='DELIVERY_VALIDATION_EXHAUSTED';
+  const errors=Array.isArray(payload.errors)?payload.errors:String(payload.errors||'').split(';').filter(Boolean);
+  root.innerHTML='<div class="panelhead">交付质量 <span class="quality-'+(payload.valid?'pass':'fail')+'">'+
+    (payload.valid?'校验通过':'校验未通过')+'</span></div><div class="quality-metrics"><span>修订轮次 <b>'+
+    (revision+1)+' / '+(maxRevisions+1)+'</b></span><span>证据覆盖率 <b>'+
+    (payload.evidence_coverage==null?'未记录':Math.round(Number(payload.evidence_coverage)*100)+'%')+
+    '</b></span><span>核验来源 <b>'+esc(payload.source_count??'—')+'</b></span></div>'+
+    (exhausted?'<p class="quality-exhausted">修订已耗尽，任务终止。</p>':'')+
+    (!payload.valid?'<div class="quality-issues"><b>未通过项</b><ul>'+errors.map(error=>'<li>'+esc(error)+'</li>').join('')+'</ul></div>':'<p class="muted">最近一次交付校验已通过。</p>');
 }
 
 function renderInstanceDiagnostics() {
@@ -326,13 +466,11 @@ function renderInstanceDiagnostics() {
 
 function renderArtifacts() {
   $('artifacts').innerHTML = artifacts.map(file =>
-    '<div class="file ' + (activeFile === file.path ? 'active' : '') +
+    '<button type="button" class="file ' + (activeFile === file.path ? 'active' : '') +
     '" data-file="' + esc(file.path) + '">▤　' + esc(file.path) +
-    '　<small>' + Math.round(file.size_bytes / 1024 * 10) / 10 + ' KB</small></div>'
+    '　<small>' + Math.round(file.size_bytes / 1024 * 10) / 10 + ' KB</small></button>'
   ).join('') || '<div class="empty">Agent 尚未保存文件</div>';
-  document.querySelectorAll('[data-file]').forEach(element => {
-    element.onclick = () => openFile(element.dataset.file);
-  });
+  document.querySelectorAll('[data-file]').forEach(element => element.addEventListener('click', () => openFile(element.dataset.file)));
 }
 
 function normalizedPlan(plan = {}) {
@@ -616,13 +754,12 @@ function upsertTraceEvent(event) {
 
 async function openFile(path, rerender = true) {
   try {
-    const response = await fetch('/tasks/' + selected + '/artifacts/' + path);
-    if (!response.ok) throw Error('读取文件失败');
-    fileText = await response.text();
-    activeFile = path;
-    renderArtifactPreview();
-    if (rerender) renderArtifacts();
-  } catch (error) { alert(error.message); }
+    const encoded=String(path).split('/').map(encodeURIComponent).join('/');
+    const response=await fetch('/tasks/'+encodeURIComponent(selected)+'/artifacts/'+encoded);
+    if(!response.ok)throw Error('读取快照 / 文件失败：HTTP '+response.status);
+    fileText=await response.text();activeFile=path;renderArtifactPreview();
+    if(rerender)renderArtifacts();
+  }catch(error){$('preview').innerHTML='<div class="load-error">'+esc(error.message)+'</div>';}
 }
 
 function renderMarkdown(source) {
@@ -749,43 +886,52 @@ async function deleteSelected() {
 $('previewRendered').onclick = () => { previewMode = 'rendered'; renderArtifactPreview(); };
 $('previewSource').onclick = () => { previewMode = 'source'; renderArtifactPreview(); };
 $('delete').onclick = deleteSelected;
-$('refresh').onclick = refresh;
+$('refresh').onclick = () => refresh(true);
 $('search').oninput = renderTasks;
 $('filter').onchange = renderTasks;
-$('newTask').onclick = () => $('createDialog').showModal();
+$('sort').onchange = renderTasks;
+$('agentType').onchange = renderAgentDefaults;
+$('newTask').onclick = async () => { await loadAgents(); $('createDialog').showModal(); };
 $('closeDialog').onclick = () => $('createDialog').close();
+$('closeBudgetDialog').onclick = () => $('budgetDialog').close();
 
 $('createForm').onsubmit = async event => {
   event.preventDefault();
-  const form = new FormData(event.target);
-  try {
-    const task = await req('/tasks', {
-      method: 'POST',
-      body: JSON.stringify({
-        goal: form.get('goal'),
-        max_steps: Number(form.get('max_steps')),
-        max_runtime_seconds: Number(form.get('max_runtime_seconds')),
-        max_attempts: Number(form.get('max_attempts')),
-        max_total_tokens: Number(form.get('max_total_tokens')),
-        budget_enabled: form.get('budget_enabled') === 'on'
-      })
-    });
-    $('createDialog').close();
-    event.target.reset();
-    selected = task.task_id;
-    await load(selected);
-    await refresh();
-  } catch (error) { alert(error.message); }
+  const form=new FormData(event.target);
+  const body={goal:form.get('goal'),agent_type:form.get('agent_type'),
+    max_attempts:Number(form.get('max_attempts')),budget_enabled:form.get('budget_enabled')==='on'};
+  for(const key of ['max_steps','max_runtime_seconds','max_total_tokens']){
+    const value=String(form.get(key)||'').trim();if(value)body[key]=Number(value);
+  }
+  try{
+    const task=await req('/tasks',{method:'POST',body:JSON.stringify(body)});
+    $('createDialog').close();event.target.reset();renderAgentDefaults();
+    selected=task.task_id;await load(selected);await refresh();
+  }catch(error){alert(error.message);}
 };
 
-['pause', 'resume', 'cancel', 'retry'].forEach(name => {
-  $(name).onclick = () => {
-    if (name === 'cancel' || name === 'retry') {
-      if (!confirm(name === 'cancel' ? '确认取消任务？' : '重新执行失败任务并尝试恢复 Checkpoint？')) return;
+$('budgetForm').onsubmit = async event => {
+  event.preventDefault();if(!detail)return;
+  const form=new FormData(event.target);
+  const body={reason:form.get('reason'),additional_steps:Number(form.get('additional_steps')||0),
+    additional_runtime_seconds:Number(form.get('additional_runtime_seconds')||0),additional_tokens:Number(form.get('additional_tokens')||0)};
+  try{
+    const result=await req('/tasks/'+detail.task_id+'/budget/approve',{method:'POST',body:JSON.stringify(body)});
+    $('budgetDialog').close();event.target.reset();await refresh(true);
+    setStreamStatus(result.resumed_from_checkpoint?'额度已叠加、可从断点续跑':'额度已叠加',false);
+  }catch(error){alert(error.message);}
+};
+
+['pause','resume','cancel','retry'].forEach(name=>{
+  $(name).onclick=()=>{
+    if(name==='cancel'||name==='retry'){
+      if(!confirm(name==='cancel'?'确认取消任务？':'重新执行失败任务并尝试恢复 Checkpoint？'))return;
     }
     action(name);
   };
 });
+
+
 
 $('download').onclick = () => {
   if (!fileText) return;
@@ -796,5 +942,15 @@ $('download').onclick = () => {
   URL.revokeObjectURL(anchor.href);
 };
 
+loadAgents();
 refresh();
-setInterval(refresh, 3000);
+let listRefreshTimer=setInterval(()=>refresh(),3000);
+document.addEventListener('visibilitychange',()=>{
+  if(document.visibilityState==='hidden'){
+    if(listRefreshTimer)clearInterval(listRefreshTimer);
+    if(eventPollTimer)clearInterval(eventPollTimer);
+  }else{
+    refresh();listRefreshTimer=setInterval(()=>refresh(),3000);
+    if(selected&&eventStreamMode==='polling')startEventPolling(selected);
+  }
+});

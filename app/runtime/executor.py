@@ -451,6 +451,10 @@ class ResearchExecutor:
                         "agent_type": registration.agent_type, "valid": valid,
                         "errors": errors[:4000], "revision": revision,
                         "artifact_path": artifact_path,
+                        "evidence_coverage": getattr(validation, "evidence_coverage", None),
+                        "source_count": getattr(validation, "source_count", None),
+                        "finding_count": getattr(validation, "finding_count", None),
+                        "cited_source_ids": list(getattr(validation, "cited_source_ids", ()) or ()),
                     })
                     if valid:
                         break
