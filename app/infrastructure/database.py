@@ -237,6 +237,289 @@ class Database:
             result.append(item)
         return result
 
+
+    def get_stale_running_tasks(self, lease_seconds: int) -> list[dict[str, Any]]:
+        cutoff = time.time() - max(1, int(lease_seconds))
+        with closing(self.connect()) as conn:
+            rows = conn.execute(
+                """SELECT * FROM tasks WHERE status='running' AND runtime_generation=2
+                   AND COALESCE(heartbeat_at, 0) < ? ORDER BY created_at""",
+                (cutoff,),
+            ).fetchall()
+        return [dict(row) for row in rows]
+
+    def save_research_control_state(self, task_id: str, state: dict[str, Any]) -> dict[str, Any]:
+        now = utc_now()
+        values = (
+            str(state.get("phase") or "planning"),
+            max(0, int(state.get("cycle") or 0)),
+            max(0, int(state.get("requirements_version") or 0)),
+            json.dumps(state.get("requirements") or {}, ensure_ascii=False, default=str),
+            json.dumps(state.get("coverage") or {}, ensure_ascii=False, default=str),
+            json.dumps(state.get("progress_vector") or {}, ensure_ascii=False, default=str),
+            max(0, int(state.get("stagnation_count") or 0)),
+            state.get("last_assessment_id"),
+        )
+        with self.transaction() as conn:
+            conn.execute(
+                """INSERT INTO research_control_state(
+                    task_id,phase,cycle,requirements_version,requirements_json,coverage_json,
+                    progress_vector_json,stagnation_count,last_assessment_id,updated_at
+                ) VALUES(?,?,?,?,?,?,?,?,?,?)
+                ON CONFLICT(task_id) DO UPDATE SET
+                    phase=excluded.phase,cycle=excluded.cycle,
+                    requirements_version=excluded.requirements_version,
+                    requirements_json=excluded.requirements_json,
+                    coverage_json=excluded.coverage_json,
+                    progress_vector_json=excluded.progress_vector_json,
+                    stagnation_count=excluded.stagnation_count,
+                    last_assessment_id=COALESCE(excluded.last_assessment_id,research_control_state.last_assessment_id),
+                    updated_at=excluded.updated_at""",
+                (task_id, *values, now),
+            )
+        return self.get_research_control_state(task_id) or {}
+
+    def get_research_control_state(self, task_id: str) -> dict[str, Any] | None:
+        with closing(self.connect()) as conn:
+            row = conn.execute("SELECT * FROM research_control_state WHERE task_id=?", (task_id,)).fetchone()
+        if not row:
+            return None
+        item = dict(row)
+        for column, key in (("requirements_json", "requirements"), ("coverage_json", "coverage"),
+                            ("progress_vector_json", "progress_vector")):
+            item[key] = json.loads(item.pop(column) or "{}")
+        return item
+
+    def save_quality_assessment(self, task_id: str, assessment: dict[str, Any]) -> str:
+        assessment_id = str(assessment.get("assessment_id") or uuid.uuid4())
+        with self.transaction() as conn:
+            conn.execute(
+                """INSERT INTO quality_assessments(
+                    assessment_id,task_id,stage,total_score,dimension_scores_json,
+                    hard_blocks_json,defects_json,reviewer_json,passed,created_at
+                ) VALUES(?,?,?,?,?,?,?,?,?,?)""",
+                (assessment_id, task_id, str(assessment.get("stage") or "final"),
+                 float(assessment.get("total_score") or 0),
+                 json.dumps(assessment.get("dimension_scores") or {}, ensure_ascii=False),
+                 json.dumps(assessment.get("hard_blocks") or [], ensure_ascii=False),
+                 json.dumps(assessment.get("defects") or [], ensure_ascii=False),
+                 json.dumps(assessment.get("reviewer") or {}, ensure_ascii=False, default=str),
+                 int(bool(assessment.get("passed"))), utc_now()),
+            )
+        self.add_event(task_id, "research_quality_assessed", {
+            "assessment_id": assessment_id, "stage": assessment.get("stage", "final"),
+            "total_score": assessment.get("total_score", 0),
+            "dimension_scores": assessment.get("dimension_scores", {}),
+            "passed": bool(assessment.get("passed")),
+            "hard_blocks": assessment.get("hard_blocks", []),
+            "defect_count": len(assessment.get("defects") or []),
+        })
+        return assessment_id
+
+    def list_quality_assessments(self, task_id: str, limit: int = 20) -> list[dict[str, Any]]:
+        with closing(self.connect()) as conn:
+            rows = conn.execute(
+                "SELECT * FROM quality_assessments WHERE task_id=? ORDER BY created_at DESC LIMIT ?",
+                (task_id, max(1, min(int(limit), 100))),
+            ).fetchall()
+        result = []
+        for row in rows:
+            item = dict(row)
+            for column, key in (("dimension_scores_json", "dimension_scores"), ("hard_blocks_json", "hard_blocks"),
+                                ("defects_json", "defects"), ("reviewer_json", "reviewer")):
+                item[key] = json.loads(item.pop(column) or "{}")
+            item["passed"] = bool(item["passed"])
+            result.append(item)
+        return list(reversed(result))
+
+    def begin_tool_call(self, task_id: str, call_id: str, idempotency_key: str, tool_name: str,
+                        input_json: str, input_hash: str, worker_generation: int = 0) -> dict[str, Any]:
+        now = utc_now()
+        with self.transaction() as conn:
+            existing = conn.execute(
+                "SELECT * FROM tool_calls WHERE task_id=? AND idempotency_key=?",
+                (task_id, idempotency_key),
+            ).fetchone()
+            if existing:
+                if existing["status"] in {"failed", "unknown"}:
+                    conn.execute(
+                        """UPDATE tool_calls SET status='running',attempts=attempts+1,
+                           worker_generation=?,started_at=?,completed_at=NULL,error_json=NULL
+                           WHERE task_id=? AND call_id=?""",
+                        (worker_generation, now, task_id, existing["call_id"]),
+                    )
+                row = conn.execute(
+                    "SELECT * FROM tool_calls WHERE task_id=? AND call_id=?",
+                    (task_id, existing["call_id"]),
+                ).fetchone()
+                return dict(row)
+            conn.execute(
+                """INSERT INTO tool_calls(task_id,call_id,idempotency_key,tool_name,input_json,
+                   input_hash,status,worker_generation,started_at)
+                   VALUES(?,?,?,?,?,?,'running',?,?)""",
+                (task_id, call_id, idempotency_key, tool_name, input_json[:30000],
+                 input_hash, worker_generation, now),
+            )
+            row = conn.execute(
+                "SELECT * FROM tool_calls WHERE task_id=? AND call_id=?",
+                (task_id, call_id),
+            ).fetchone()
+        return dict(row)
+
+    def finish_tool_call(self, task_id: str, call_id: str, result: str) -> bool:
+        from hashlib import sha256
+        value = str(result or "")
+        digest = sha256(value.encode("utf-8")).hexdigest()
+        with self.transaction() as conn:
+            cur = conn.execute(
+                """UPDATE tool_calls SET status='succeeded',result_json=?,result_hash=?,completed_at=?,error_json=NULL
+                   WHERE task_id=? AND call_id=? AND status IN ('running','unknown')""",
+                (json.dumps({"summary": value[:20000]}, ensure_ascii=False), digest, utc_now(), task_id, call_id),
+            )
+        return cur.rowcount == 1
+
+    def fail_tool_call(self, task_id: str, call_id: str, error: str, category: str = "unknown") -> bool:
+        with self.transaction() as conn:
+            cur = conn.execute(
+                """UPDATE tool_calls SET status='failed',error_json=?,completed_at=?
+                   WHERE task_id=? AND call_id=? AND status IN ('running','unknown')""",
+                (json.dumps({"category": category, "error": str(error)[:3000]}, ensure_ascii=False),
+                 utc_now(), task_id, call_id),
+            )
+        return cur.rowcount == 1
+
+    def get_open_tool_calls(self, task_id: str) -> list[dict[str, Any]]:
+        with closing(self.connect()) as conn:
+            rows = conn.execute(
+                """SELECT * FROM tool_calls WHERE task_id=? AND status IN ('prepared','running','unknown')
+                   ORDER BY started_at""", (task_id,),
+            ).fetchall()
+        return [dict(row) for row in rows]
+
+    def mark_tool_call_unknown(self, task_id: str, call_id: str, reason: str) -> bool:
+        with self.transaction() as conn:
+            cur = conn.execute(
+                """UPDATE tool_calls SET status='unknown',error_json=?
+                   WHERE task_id=? AND call_id=? AND status IN ('prepared','running')""",
+                (json.dumps({"category": "worker_interruption", "error": reason[:1000]}, ensure_ascii=False),
+                 task_id, call_id),
+            )
+        return cur.rowcount == 1
+
+    def record_recovery_decision(self, task_id: str, category: str, action: str,
+                                 confidence: str, details: dict[str, Any]) -> str:
+        recovery_id = str(uuid.uuid4())
+        payload = json.dumps(details or {}, ensure_ascii=False, default=str)
+        with self.transaction() as conn:
+            conn.execute(
+                """INSERT INTO recovery_decisions(recovery_id,task_id,category,action,confidence,details_json,created_at)
+                   VALUES(?,?,?,?,?,?,?)""",
+                (recovery_id, task_id, category, action, confidence, payload, utc_now()),
+            )
+        self.add_event(task_id, "recovery_decision_recorded", {
+            "recovery_id": recovery_id, "category": category, "action": action,
+            "confidence": confidence, "details": details or {},
+        })
+        return recovery_id
+
+    def list_recovery_decisions(self, task_id: str, limit: int = 50) -> list[dict[str, Any]]:
+        with closing(self.connect()) as conn:
+            rows = conn.execute(
+                "SELECT * FROM recovery_decisions WHERE task_id=? ORDER BY created_at DESC LIMIT ?",
+                (task_id, max(1, min(int(limit), 200))),
+            ).fetchall()
+        result = []
+        for row in rows:
+            item = dict(row)
+            item["details"] = json.loads(item.pop("details_json") or "{}")
+            result.append(item)
+        return list(reversed(result))
+
+    def set_waiting_for_human(self, task_id: str, category: str, request: dict[str, Any],
+                              worker_id: str | None = None) -> str | None:
+        self.release_pending_token_reservations(task_id)
+        intervention_id = str(uuid.uuid4())
+        now_ts, now_iso = time.time(), utc_now()
+        with self.transaction() as conn:
+            row = conn.execute("SELECT status,worker_id FROM tasks WHERE task_id=?", (task_id,)).fetchone()
+            if not row:
+                return None
+            if row["status"] not in {"running", "queued", "retry_wait", "paused", "waiting_for_human"}:
+                return None
+            if worker_id and row["worker_id"] != worker_id:
+                return None
+            conn.execute(
+                """UPDATE tasks SET status='waiting_for_human',worker_id=NULL,heartbeat_at=NULL,
+                   runtime_seconds_used=runtime_seconds_used+MAX(0.0,?-COALESCE(runtime_last_accounted_at,heartbeat_at,?)),
+                   runtime_last_accounted_at=NULL,pause_requested=0,updated_at=? WHERE task_id=?""",
+                (now_ts, now_ts, now_iso, task_id),
+            )
+            conn.execute(
+                """INSERT INTO human_interventions(intervention_id,task_id,status,category,request_json,created_at)
+                   VALUES(?,?,'pending',?,?,?)""",
+                (intervention_id, task_id, category, json.dumps(request, ensure_ascii=False, default=str), now_iso),
+            )
+            conn.execute(
+                "INSERT INTO events(task_id,timestamp,event_type,payload_json) VALUES(?,?,?,?)",
+                (task_id, now_iso, "human_intervention_requested",
+                 json.dumps({"intervention_id": intervention_id, "category": category, "request": request},
+                            ensure_ascii=False, default=str)),
+            )
+        return intervention_id
+
+    def get_pending_human_intervention(self, task_id: str) -> dict[str, Any] | None:
+        with closing(self.connect()) as conn:
+            row = conn.execute(
+                "SELECT * FROM human_interventions WHERE task_id=? AND status='pending' ORDER BY created_at DESC LIMIT 1",
+                (task_id,),
+            ).fetchone()
+        if not row:
+            return None
+        item = dict(row)
+        item["request"] = json.loads(item.pop("request_json") or "{}")
+        item["decision"] = json.loads(item.pop("decision_json") or "null")
+        return item
+
+    def resolve_human_intervention(self, task_id: str, intervention_id: str, action: str,
+                                   payload: dict[str, Any] | None = None) -> dict[str, Any] | None:
+        payload = payload or {}
+        now = utc_now()
+        with self.transaction() as conn:
+            task = conn.execute("SELECT * FROM tasks WHERE task_id=?", (task_id,)).fetchone()
+            intervention = conn.execute(
+                "SELECT * FROM human_interventions WHERE task_id=? AND intervention_id=? AND status='pending'",
+                (task_id, intervention_id),
+            ).fetchone()
+            if not task or not intervention or task["status"] != "waiting_for_human":
+                return None
+            if int(task["runtime_generation"] or 1) != 2:
+                return None
+            if action not in {"continue_research", "change_research_direction", "add_research_requirements",
+                              "continue_repair", "approve_degraded_delivery", "terminate"}:
+                raise ValueError("unsupported human decision action")
+            new_status = "cancelled" if action == "terminate" else (
+                "completed" if action == "approve_degraded_delivery" else "queued"
+            )
+            conn.execute(
+                """UPDATE human_interventions SET status='resolved',decision_json=?,resolved_at=?
+                   WHERE intervention_id=?""",
+                (json.dumps({"action": action, **payload}, ensure_ascii=False, default=str), now, intervention_id),
+            )
+            conn.execute(
+                """UPDATE tasks SET status=?,worker_id=NULL,heartbeat_at=NULL,next_run_at=0,
+                   resume_mode=1,pause_requested=0,cancel_requested=0,updated_at=?,
+                   completed_at=CASE WHEN ?='completed' THEN ? ELSE NULL END
+                   WHERE task_id=?""",
+                (new_status, now, new_status, now, task_id),
+            )
+            conn.execute(
+                "INSERT INTO events(task_id,timestamp,event_type,payload_json) VALUES(?,?,?,?)",
+                (task_id, now, "human_intervention_resolved",
+                 json.dumps({"intervention_id": intervention_id, "action": action, "payload": payload,
+                             "next_status": new_status}, ensure_ascii=False, default=str)),
+            )
+        return self.get_task(task_id)
+
     def begin_delete(self, task_id: str) -> dict[str, Any] | None:
         with self.transaction() as conn:
             row = conn.execute("SELECT * FROM tasks WHERE task_id=?", (task_id,)).fetchone()
