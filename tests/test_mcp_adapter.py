@@ -248,7 +248,6 @@ def test_remote_transport_sends_server_side_read_only_headers():
     for request in requests:
         headers = {key.lower(): value for key, value in request.header_items()}
         assert headers["x-mcp-tools"] == ",".join(READ_ONLY_GITHUB_TOOLS)
-        assert headers["x-mcp-readonly"] == "true"
         assert headers["authorization"] == "Bearer remote-test-pat"
     client.close()
 

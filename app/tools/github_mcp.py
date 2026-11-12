@@ -145,6 +145,9 @@ class GitHubMCPClient:
             "--tools=" + ",".join(READ_ONLY_GITHUB_TOOLS),
         ])
         env = os.environ.copy()
+        # Toolsets are additive to --tools in the official server; remove inherited
+        # GITHUB_TOOLSETS so an ambient setting cannot widen the allow-list.
+        env.pop("GITHUB_TOOLSETS", None)
         env["GITHUB_PERSONAL_ACCESS_TOKEN"] = self.token
         env["GITHUB_TOOLS"] = ",".join(READ_ONLY_GITHUB_TOOLS)
         env["GITHUB_READ_ONLY"] = "true"
@@ -368,9 +371,15 @@ class GitHubMCPClient:
                     error_type="rate_limited", code="GITHUB_RATE_LIMITED",
                     retryable=True, retry_after_seconds=wait or 60,
                 ) from exc
-            if status in {401, 403}:
+            if status == 401:
                 raise GitHubMCPConfigurationError(
-                    "GitHub MCP authentication or repository permission was rejected."
+                    "GitHub MCP authentication was rejected; verify the PAT."
+                ) from exc
+            if status == 403:
+                raise GitHubMCPToolError(
+                    "GitHub repository permission denied (HTTP 403).",
+                    error_type="permission_denied", code="GITHUB_PERMISSION_DENIED",
+                    retryable=False,
                 ) from exc
             if status == 404:
                 raise GitHubMCPToolError(
