@@ -3,13 +3,13 @@ from __future__ import annotations
 import json
 import sqlite3
 import time
-
-from app.infrastructure.budget_policy import convergence_reserve_tokens
 import uuid
 from contextlib import contextmanager, closing
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Iterator
-from datetime import datetime, timezone
+
+from app.infrastructure.budget_policy import convergence_reserve_tokens
 
 
 TASK_STATUSES = {"queued", "running", "retry_wait", "paused", "completed", "failed", "cancelled", "deleting"}

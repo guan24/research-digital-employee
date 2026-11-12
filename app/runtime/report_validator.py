@@ -144,8 +144,6 @@ class ReportValidator:
                 for part in re.split(r"\n\s*\n", body_text)
                 if len(part.strip()) >= 80
                 and not part.lstrip().startswith("#")
-                and not part.lstrip().startswith("- ")
-                and not part.lstrip().startswith("|")
             ]
             if paragraphs:
                 coverage = (

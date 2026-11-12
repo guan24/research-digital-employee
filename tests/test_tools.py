@@ -58,3 +58,29 @@ def test_read_artifact_supports_bounded_chunks_and_save_readback_verification(se
     ][-1]
     assert saved_event["payload"]["read_back_verified"] is True
     assert len(saved_event["payload"]["sha256"]) == 64
+
+def test_update_research_plan_tool_uses_structured_step_arguments(settings, db):
+    task = db.create_task("Validate the structured research plan tool schema")
+    task = db.claim_next_task("worker-plan-schema")
+    artifacts = ArtifactStore(settings.workspace_dir, task["task_id"])
+    service = ResearchToolService(settings, db, task["task_id"], artifacts, __import__("time").monotonic())
+
+    tools = {item.name: item for item in service.as_langchain_tools()}
+    plan_tool = tools["update_research_plan"]
+    schema = plan_tool.args_schema.model_json_schema()
+
+    assert "plan_json" not in schema["properties"]
+    assert {"title", "objective", "steps"}.issubset(schema["properties"])
+    assert {"title", "objective", "steps"}.issubset(set(schema["required"]))
+    result = plan_tool.invoke({
+        "title": "Structured plan",
+        "objective": "Verify the tool schema and persist the plan",
+        "steps": [{
+            "id": "scope",
+            "title": "Confirm scope",
+            "objective": "Define the research boundary",
+            "expected_output": "A saved scope definition",
+        }],
+    })
+    assert "Saved initial research plan" in result
+    assert artifacts.exists("notes/research_plan.json")

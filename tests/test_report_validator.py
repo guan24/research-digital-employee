@@ -81,6 +81,28 @@ def test_validator_reports_registered_sources_separately_from_report_urls(tmp_pa
     assert any("结论级来源引用" in error for error in result.errors)
 
 
+def test_validator_counts_citations_in_bullet_and_table_blocks(tmp_path):
+    from app.infrastructure.artifact_store import ArtifactStore
+    from app.infrastructure.evidence_registry import EvidenceRegistry
+
+    registry = EvidenceRegistry(ArtifactStore(tmp_path, "bullet-evidence-task"))
+    source = registry.register_source(
+        url="https://example.org/primary",
+        title="Primary source",
+        content="Primary source evidence for the report. " * 20,
+    )
+    report = (
+        "# Research report\n\n## Findings\n\n"
+        + ("- The first verified finding is grounded in the primary source and explains the observed design choice. [" + source["source_id"] + "]\n")
+        + ("- The second finding compares the evidence and describes the consequence for implementation. [" + source["source_id"] + "]\n\n")
+        + "## Sources\n- https://example.org/primary"
+    )
+    result = ReportValidator().validate(report, evidence_registry=registry.summary())
+
+    assert result.valid
+    assert result.evidence_coverage == 1.0
+
+
 def test_validator_rejects_a_cited_source_without_an_intact_snapshot(tmp_path):
     from app.infrastructure.artifact_store import ArtifactStore
     from app.infrastructure.evidence_registry import EvidenceRegistry
