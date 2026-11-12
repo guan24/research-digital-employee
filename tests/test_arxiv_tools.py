@@ -2,12 +2,15 @@ from __future__ import annotations
 
 import json
 import time
+
+import pytest
 from urllib.parse import parse_qs, urlparse
 
 from app.infrastructure.artifact_store import ArtifactStore
 from app.infrastructure.evidence_registry import EvidenceRegistry
 from app.tools.arxiv import ArxivAdapter, ArxivClient, ArxivRequestError, normalize_search_query
 from app.tools.research_tools import ResearchToolService
+from app.runtime.control import TaskPaused
 
 ATOM = b'''<?xml version="1.0" encoding="UTF-8"?>
 <feed xmlns="http://www.w3.org/2005/Atom"
@@ -233,3 +236,66 @@ def test_arxiv_search_caps_max_results_at_twenty():
     client.search("large result set", max_results=99)
     query = parse_qs(urlparse(requests[0]).query)
     assert query["max_results"] == ["20"]
+
+
+def test_arxiv_search_checks_task_control_after_provider_response_before_evidence(settings, db):
+    task = db.create_task("Pause after arXiv search response")
+    task = db.claim_next_task("arxiv-control-worker")
+    artifacts = ArtifactStore(settings.workspace_dir, task["task_id"])
+    service = ResearchToolService(settings, db, task["task_id"], artifacts, time.monotonic())
+
+    class FakeArxivClient:
+        def search(self, *args):
+            return [ArxivClient._parse_atom(ATOM)[0]], False, "all:anomaly"
+
+    checks = {"count": 0}
+    def check_control():
+        checks["count"] += 1
+        if checks["count"] == 2:
+            raise TaskPaused("operator requested pause")
+
+    service.check_control = check_control
+    service.budget_tool_gate = lambda tool_name: None
+    adapter = ArxivAdapter(settings, db, task["task_id"], artifacts, service, client=FakeArxivClient())
+
+    with pytest.raises(TaskPaused):
+        adapter.search("anomaly")
+
+    assert checks["count"] == 2
+    assert EvidenceRegistry(artifacts).summary()["source_count"] == 0
+    assert not any(event["event_type"] == "arxiv_search_completed" for event in db.get_events(task["task_id"]))
+
+
+def test_arxiv_paper_checks_task_control_after_pdf_before_completion_event(settings, db, monkeypatch):
+    task = db.create_task("Pause after arXiv PDF extraction")
+    task = db.claim_next_task("arxiv-control-worker")
+    artifacts = ArtifactStore(settings.workspace_dir, task["task_id"])
+    service = ResearchToolService(settings, db, task["task_id"], artifacts, time.monotonic())
+
+    class FakeArxivClient:
+        def paper(self, arxiv_id):
+            return ArxivClient._parse_atom(ATOM)[0]
+
+    fetch_calls = []
+    def fake_fetch_pdf(url, **kwargs):
+        fetch_calls.append(url)
+        return json.dumps({"success": True, "source_id": "S0002"})
+
+    monkeypatch.setattr(service, "fetch_pdf", fake_fetch_pdf)
+    checks = {"count": 0}
+    def check_control():
+        checks["count"] += 1
+        if checks["count"] == 3:
+            raise TaskPaused("operator requested pause")
+
+    service.check_control = check_control
+    service.budget_tool_gate = lambda tool_name: None
+    adapter = ArxivAdapter(settings, db, task["task_id"], artifacts, service, client=FakeArxivClient())
+
+    with pytest.raises(TaskPaused):
+        adapter.paper("2401.01234v2")
+
+    assert fetch_calls == ["https://arxiv.org/pdf/2401.01234v2"]
+    assert checks["count"] == 3
+    assert any(item["source_type"] == "arxiv" for item in EvidenceRegistry(artifacts).summary()["sources"])
+    assert not any(event["event_type"] == "arxiv_paper_read_completed" for event in db.get_events(task["task_id"]))
