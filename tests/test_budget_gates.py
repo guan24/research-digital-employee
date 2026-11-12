@@ -440,7 +440,7 @@ def test_token_budget_protects_a_convergence_reserve_before_exploration_stops(db
     assert status["state"] == "warning"
     assert status["phase"] == "convergence"
     assert status["convergence"]["reserve_tokens"] == 30_000
-    assert status["convergence"]["reserve_tool_calls"] == 6
+    assert status["convergence"]["reserve_tool_calls"] == 7
     assert status["convergence"]["reserve_runtime_seconds"] == 720
     assert status["dimensions"]["tokens"]["exploration_remaining"] == 0
     assert status["dimensions"]["tokens"]["convergence_remaining"] == 29_000
