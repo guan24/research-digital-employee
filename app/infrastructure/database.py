@@ -9,7 +9,11 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Iterator
 
-from app.infrastructure.budget_policy import convergence_reserve_tokens
+from app.infrastructure.budget_policy import (
+    convergence_reserve_runtime_seconds,
+    convergence_reserve_tokens,
+    convergence_reserve_tool_calls,
+)
 
 
 TASK_STATUSES = {"queued", "running", "retry_wait", "paused", "completed", "failed", "cancelled", "deleting"}
@@ -760,27 +764,42 @@ class Database:
                 "limit": int(task.get("max_total_tokens") or 0),
             },
         }
-        for item in dimensions.values():
-            item["remaining"] = max(0, item["limit"] - item["used"] - int(item.get("reserved", 0)))
-            item["ratio"] = (
-                (item["used"] + int(item.get("reserved", 0))) / item["limit"]
-                if item["limit"] else 0
-            )
-
         enabled = bool(task.get("budget_enabled", 1))
-        token = dimensions["tokens"]
-        token_limit = int(token["limit"])
-        token_consumed = int(token["used"]) + int(token["reserved"])
-        reserve = convergence_reserve_tokens(token_limit) if enabled else 0
-        exploration_limit = max(0, token_limit - reserve)
-        convergence_active = bool(enabled and token_limit > 0 and token_consumed >= exploration_limit)
-        token["convergence_reserve"] = reserve
-        token["exploration_limit"] = exploration_limit
-        token["exploration_remaining"] = max(0, exploration_limit - token_consumed)
-        token["convergence_remaining"] = max(0, token_limit - token_consumed)
+        reserve_by_dimension = {
+            "tool_calls": convergence_reserve_tool_calls,
+            "runtime_seconds": convergence_reserve_runtime_seconds,
+            "tokens": convergence_reserve_tokens,
+        }
+        active_dimensions = []
+        ratios = {}
+        for name, item in dimensions.items():
+            used = int(item["used"])
+            reserved = int(item.get("reserved", 0))
+            limit = int(item["limit"])
+            reserve = reserve_by_dimension[name](limit) if enabled else 0
+            exploration_limit = max(0, limit - reserve)
+            consumed = used + reserved
+            item["remaining"] = max(0, limit - consumed)
+            item["ratio"] = consumed / limit if limit else 0
+            item["convergence_reserve"] = reserve
+            item["exploration_limit"] = exploration_limit
+            item["exploration_remaining"] = max(0, exploration_limit - consumed)
+            item["convergence_remaining"] = max(0, limit - consumed)
+            ratios[name] = item["ratio"]
+            if enabled and limit > 0 and consumed >= exploration_limit:
+                active_dimensions.append(name)
 
-        ratios = {name: item["ratio"] for name, item in dimensions.items()}
-        trigger = "tokens" if convergence_active else max(ratios, key=ratios.get)
+        convergence_active = bool(active_dimensions)
+        if convergence_active:
+            trigger = max(
+                active_dimensions,
+                key=lambda name: (
+                    (dimensions[name]["used"] + int(dimensions[name].get("reserved", 0)))
+                    / max(1, dimensions[name]["exploration_limit"])
+                ),
+            )
+        else:
+            trigger = max(ratios, key=ratios.get)
         peak = max(ratios.values(), default=0)
         if not enabled:
             state, phase = "disabled", "unbounded"
@@ -808,12 +827,16 @@ class Database:
             "trigger_dimension": trigger,
             "dimensions": dimensions,
             "convergence": {
-                "reserve_tokens": reserve,
-                "exploration_limit": exploration_limit,
                 "active": convergence_active,
-                "remaining_tokens": token["convergence_remaining"],
+                "active_dimensions": active_dimensions,
+                "reserve_tokens": dimensions["tokens"]["convergence_reserve"],
+                "reserve_tool_calls": dimensions["tool_calls"]["convergence_reserve"],
+                "reserve_runtime_seconds": dimensions["runtime_seconds"]["convergence_reserve"],
+                "remaining_tokens": dimensions["tokens"]["convergence_remaining"],
+                "remaining_tool_calls": dimensions["tool_calls"]["convergence_remaining"],
+                "remaining_runtime_seconds": dimensions["runtime_seconds"]["convergence_remaining"],
             },
-            "policy": "hard tool/runtime gates; model calls reserve before provider invocation; 30% token pool protected for convergence",
+            "policy": "hard total limits; exploration stops at per-dimension reserve thresholds; 30% tokens, 25% tool calls and 20% runtime protected for convergence",
             "instruction": instruction,
         }
 

@@ -389,6 +389,41 @@ def test_stale_generation_cannot_settle_or_release_a_token_reservation(db):
     assert current["total_tokens_used"] == 0
     assert current["reserved_tokens"] == 2500
 
+def test_tool_call_budget_enters_convergence_before_hard_step_limit(db, settings):
+    task = db.create_task("Protect tool calls for final report delivery", max_steps=30)
+    db.claim_next_task("worker-step-reserve")
+    for _ in range(23):
+        assert db.consume_execution_step(task["task_id"]) is not None
+
+    status = db.get_budget_status(task["task_id"])
+    assert status["phase"] == "convergence"
+    assert status["trigger_dimension"] == "tool_calls"
+    assert status["dimensions"]["tool_calls"]["convergence_reserve"] == 7
+    assert status["dimensions"]["tool_calls"]["exploration_remaining"] == 0
+    assert status["dimensions"]["tool_calls"]["convergence_remaining"] == 7
+
+    artifacts = ArtifactStore(settings.workspace_dir, task["task_id"])
+    service = ResearchToolService(settings, db, task["task_id"], artifacts, time.monotonic())
+    blocked = json.loads(service.web_search("must be blocked during convergence"))
+    assert blocked["error_type"] == "budget_intercept"
+
+
+def test_runtime_budget_enters_convergence_before_hard_timeout(db):
+    task = db.create_task("Protect runtime for report validation", max_runtime_seconds=3_600)
+    db.claim_next_task("worker-runtime-reserve")
+    with db.transaction() as conn:
+        conn.execute(
+            "UPDATE tasks SET runtime_seconds_used=2880,runtime_last_accounted_at=? WHERE task_id=?",
+            (time.time(), task["task_id"]),
+        )
+
+    status = db.get_budget_status(task["task_id"])
+    assert status["phase"] == "convergence"
+    assert status["trigger_dimension"] == "runtime_seconds"
+    assert status["dimensions"]["runtime_seconds"]["convergence_reserve"] == 720
+    assert status["dimensions"]["runtime_seconds"]["exploration_remaining"] == 0
+
+
 def test_token_budget_protects_a_convergence_reserve_before_exploration_stops(db, settings):
     task = db.create_task("Exercise the protected report convergence pool", max_total_tokens=100_000)
     db.claim_next_task("convergence-worker")
@@ -405,6 +440,8 @@ def test_token_budget_protects_a_convergence_reserve_before_exploration_stops(db
     assert status["state"] == "warning"
     assert status["phase"] == "convergence"
     assert status["convergence"]["reserve_tokens"] == 30_000
+    assert status["convergence"]["reserve_tool_calls"] == 6
+    assert status["convergence"]["reserve_runtime_seconds"] == 720
     assert status["dimensions"]["tokens"]["exploration_remaining"] == 0
     assert status["dimensions"]["tokens"]["convergence_remaining"] == 29_000
     assert any(
