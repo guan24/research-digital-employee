@@ -425,7 +425,7 @@ def test_runtime_budget_enters_convergence_before_hard_timeout(db):
 
 
 def test_token_budget_protects_a_convergence_reserve_before_exploration_stops(db, settings):
-    task = db.create_task("Exercise the protected report convergence pool", max_total_tokens=100_000)
+    task = db.create_task("Exercise the protected report convergence pool", max_total_tokens=100_000, max_steps=30, max_runtime_seconds=3_600)
     db.claim_next_task("convergence-worker")
 
     research_call = db.reserve_tokens(task["task_id"], "research-call", 69_000)
