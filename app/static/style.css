@@ -232,7 +232,8 @@ button:focus-visible,a:focus-visible,summary:focus-visible,input:focus-visible,s
   .health-summary{grid-template-columns:repeat(2,minmax(0,1fr))}
 }
 @media(max-width:560px){
-  .appbar{position:relative;align-items:flex-start}.appbar .brand{font-size:15px}.appbar .brand small{display:block;margin:2px 0 0 25px}
+  .appbar{position:sticky;top:0;align-items:flex-start}
+  .detail-panel{order:-1}.appbar .brand{font-size:15px}.appbar .brand small{display:block;margin:2px 0 0 25px}
   .appbar nav{order:3;width:100%}.appbar .worker{padding:6px 8px;gap:6px;flex-wrap:wrap}
   .appbar .worker p{display:none}.appbar .worker div{font-size:10px}.appbar .worker small{font-size:9px}
   .health-summary{grid-template-columns:repeat(2,minmax(0,1fr))}
