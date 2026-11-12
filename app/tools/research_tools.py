@@ -554,6 +554,7 @@ class ResearchToolService(TaskToolService):
             if not step_id:
                 continue
             progress[step_id] = {
+                "step_id": step_id,
                 "status": payload.get("status") or "pending",
                 "updated_at": event.get("timestamp"),
                 "note": payload.get("note") or "",
@@ -598,9 +599,6 @@ class ResearchToolService(TaskToolService):
             return "reading"
         if name == "record_finding":
             return "analysis"
-        if name == "get_evidence_registry":
-            return "validation"
-
         try:
             arguments = json.loads(str(input_value or ""))
         except (TypeError, json.JSONDecodeError):
