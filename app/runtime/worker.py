@@ -10,6 +10,7 @@ from pathlib import Path
 
 from app.config import Settings
 from app.infrastructure.database import Database
+from app.infrastructure.lifecycle import close_registered_resources
 from app.runtime.executor import ResearchExecutor
 from app.runtime.errors import TaskCancelled, TaskDeadlineExceeded, TaskPaused, TaskStepLimitExceeded, WorkerLeaseLost, BudgetExhausted, classify_exception
 
@@ -130,6 +131,7 @@ class Worker:
             self._heartbeat_stop.set()
             heartbeat.join(timeout=2)
             self.db.release_worker_lease(self.worker_id)
+            close_registered_resources()
 
     def run_forever(self) -> None:
         while not self._stop.is_set() and not self.db.acquire_worker_lease(self.worker_id, self.settings.worker_lease_seconds):
@@ -152,6 +154,7 @@ class Worker:
             self._heartbeat_stop.set()
             heartbeat.join(timeout=2)
             self.db.release_worker_lease(self.worker_id)
+            close_registered_resources()
             logger.info("worker stopped: %s", self.worker_id)
 
 
