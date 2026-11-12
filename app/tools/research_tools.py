@@ -559,8 +559,190 @@ class ResearchToolService(TaskToolService):
                 "note": payload.get("note") or "",
                 "plan_version": payload.get("plan_version"),
                 "source": payload.get("source") or "agent",
+                "phase": payload.get("phase"),
+                "event_id": event.get("event_id", 0),
             }
         return progress
+
+    @staticmethod
+    def _plan_step_phase(step: dict) -> str | None:
+        text = " ".join(
+            str(step.get(key) or "")
+            for key in ("title", "objective", "expected_output")
+        ).lower()
+        keywords = {
+            "scope": ("研究范围", "明确范围", "界定范围", "研究目标", "研究问题", "评价标准", "scope", "research question", "criteria"),
+            "discovery": ("搜索", "检索", "搜集", "收集", "查找", "调研", "文献", "资料", "search", "discover", "collect", "literature", "repository"),
+            "reading": ("阅读", "读取", "研读", "解读", "提取", "源码", "文档", "论文", "材料", "read", "inspect", "review", "extract", "documentation", "paper", "source code"),
+            "analysis": ("分析", "比较", "对比", "归纳", "综合", "评估", "评价", "总结", "研究发现", "analysis", "compare", "evaluate", "synthesize", "findings", "assess"),
+            "report": ("报告", "撰写", "写作", "编写", "成稿", "交付", "report", "write", "draft", "deliver"),
+            "validation": ("核验", "验证", "校验", "复核", "检查", "引用", "来源", "质量", "verify", "validate", "audit", "citation", "quality"),
+        }
+        for phase in ("report", "reading", "analysis", "validation", "discovery", "scope"):
+            if any(term in text for term in keywords[phase]):
+                return phase
+        return None
+
+    @staticmethod
+    def _tool_execution_phase(tool_name: str, input_value: str) -> str | None:
+        name = str(tool_name or "").strip().lower().rsplit(".", 1)[-1]
+        if name in {
+            "update_research_plan", "update_plan_step_status",
+            "read_research_memory", "save_research_memory",
+            "get_budget_status", "request_budget_extension", "list_artifacts",
+        }:
+            return None
+        if name in {"web_search", "arxiv_search", "github_repo", "github_tree", "github_releases"}:
+            return "discovery"
+        if name in {"fetch_url", "fetch_pdf", "github_read", "arxiv_paper"}:
+            return "reading"
+        if name == "record_finding":
+            return "analysis"
+        if name == "get_evidence_registry":
+            return "validation"
+
+        try:
+            arguments = json.loads(str(input_value or ""))
+        except (TypeError, json.JSONDecodeError):
+            arguments = {}
+        path = str(arguments.get("path") or "").strip().lower() if isinstance(arguments, dict) else ""
+        if name == "save_artifact":
+            if path in {"notes/research_plan.json", "notes/research_memory.md"} or "memory_versions/" in path:
+                return None
+            if "report" in path or path.startswith("reports/"):
+                return "report"
+            return "analysis"
+        if name == "read_artifact":
+            if "report" in path or path.startswith("reports/"):
+                return "validation"
+            return "reading" if path.startswith("sources/") else "analysis"
+        return None
+
+    def sync_plan_progress_for_tool(self, tool_name: str, input_value: str) -> str | None:
+        phase = self._tool_execution_phase(tool_name, input_value)
+        if phase is None:
+            return None
+        return self.sync_plan_progress_for_phase(
+            phase, f"检测到工具 {tool_name} 开始执行"
+        )
+
+    def sync_plan_progress_for_phase(self, phase: str, note: str = "") -> str | None:
+        """Infer coarse step transitions from actual runtime work, without extra LLM tool calls."""
+        phase_order = {
+            "scope": 0, "discovery": 1, "reading": 2,
+            "analysis": 3, "report": 4, "validation": 5,
+        }
+        phase_labels = {
+            "scope": "研究范围确认", "discovery": "资料检索",
+            "reading": "来源阅读", "analysis": "证据分析",
+            "report": "报告撰写", "validation": "交付校验",
+        }
+        if phase not in phase_order:
+            return None
+        self.check_control()
+        events = self.db.get_events(self.task_id, limit=5000)
+        plan_events = [
+            event for event in events
+            if event.get("event_type") == "research_plan_updated"
+        ]
+        if not plan_events:
+            return None
+        plan_event = plan_events[-1]
+        plan = self._normalize_plan_structure((plan_event.get("payload") or {}).get("plan") or {})
+        if not plan["steps"]:
+            return None
+        progress = self._latest_step_progress(events)
+
+        if any(
+            item.get("status") == "in_progress" and item.get("source") == "agent"
+            for item in progress.values()
+        ):
+            return None
+
+        runtime_progress = [
+            item for item in progress.values()
+            if item.get("source") == "runtime" and item.get("phase") in phase_order
+        ]
+        latest_runtime = max(runtime_progress, key=lambda item: item.get("event_id", 0), default=None)
+        current_runtime = max(
+            (
+                item for item in runtime_progress
+                if item.get("status") == "in_progress"
+            ),
+            key=lambda item: item.get("event_id", 0),
+            default=None,
+        )
+        current_phase = latest_runtime.get("phase") if latest_runtime else None
+        if current_phase and phase_order[phase] < phase_order[current_phase]:
+            return None
+        if current_phase == phase and current_runtime:
+            return None
+
+        if current_runtime and current_phase and phase_order[phase] > phase_order[current_phase]:
+            self.update_plan_step_status(
+                current_runtime["step_id"], "completed",
+                f"自动跟踪：Agent 已进入「{phase_labels[phase]}」阶段，上一阶段工具执行结束。",
+                source="runtime", phase=current_phase, enforce_control=False,
+            )
+            events = self.db.get_events(self.task_id, limit=5000)
+            progress = self._latest_step_progress(events)
+
+        candidates = []
+        for step in plan["steps"]:
+            state = progress.get(step["id"], {})
+            if state.get("status", "pending") not in {"completed", "skipped", "failed", "in_progress"}:
+                candidates.append(step)
+        phase_candidates = [
+            step for step in candidates
+            if self._plan_step_phase(step) == phase
+        ]
+        candidate = (phase_candidates or candidates or [None])[0]
+        if candidate is None:
+            return None
+
+        candidate_index = plan["steps"].index(candidate)
+        for prerequisite in plan["steps"][:candidate_index]:
+            prerequisite_state = progress.get(prerequisite["id"], {})
+            if (
+                prerequisite_state.get("status", "pending") == "pending"
+                and self._plan_step_phase(prerequisite) == "scope"
+            ):
+                self.update_plan_step_status(
+                    prerequisite["id"], "completed",
+                    "自动跟踪：初始规划已明确研究范围与目标。",
+                    source="runtime", phase="scope", enforce_control=False,
+                )
+                events = self.db.get_events(self.task_id, limit=5000)
+                progress = self._latest_step_progress(events)
+
+        candidate_state = progress.get(candidate["id"], {})
+        if candidate_state.get("status") == "in_progress":
+            return None
+        return self.update_plan_step_status(
+            candidate["id"], "in_progress",
+            f"自动跟踪：Agent 已进入「{phase_labels[phase]}」阶段。",
+            source="runtime", phase=phase, enforce_control=False,
+        )
+
+    def complete_active_plan_step(self, note: str = "最终交付已完成") -> int:
+        events = self.db.get_events(self.task_id, limit=5000)
+        progress = self._latest_step_progress(events)
+        active = sorted(
+            (
+                (step_id, item) for step_id, item in progress.items()
+                if item.get("status") == "in_progress" and item.get("source") == "runtime"
+            ),
+            key=lambda pair: pair[1].get("event_id", 0),
+            reverse=True,
+        )
+        completed = 0
+        for step_id, item in active:
+            self.update_plan_step_status(
+                step_id, "completed", note,
+                source="runtime", phase=item.get("phase"), enforce_control=False,
+            )
+            completed += 1
+        return completed
 
     @staticmethod
     def mark_open_plan_steps_failed(db: Database, task_id: str, reason: str) -> int:
@@ -931,9 +1113,13 @@ class ResearchToolService(TaskToolService):
         step_id: str,
         status: str,
         note: str = "",
+        source: str = "agent",
+        phase: str | None = None,
+        enforce_control: bool = True,
     ) -> str:
         """Persist one step's execution progress without creating a strategic plan version."""
-        self.check_control()
+        if enforce_control:
+            self.check_control()
         allowed_statuses = {"pending", "in_progress", "completed", "skipped", "failed"}
         normalized_status = str(status or "").strip().lower()
         normalized_step_id = str(step_id or "").strip()
@@ -984,7 +1170,8 @@ class ResearchToolService(TaskToolService):
                 "previous_status": previous_status,
                 "note": normalized_note[:1500],
                 "plan_version": version,
-                "source": "agent",
+                "source": source,
+                "phase": phase,
             },
         )
         current_events = self.db.get_events(self.task_id, limit=5000)

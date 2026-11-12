@@ -121,16 +121,65 @@ def test_final_plan_archive_preserves_all_material_versions(settings, db):
     assert finalized[0]["payload"]["history_count"] == 2
 
 
-def test_tool_callbacks_do_not_mutate_plan_step_status(settings, db):
-    task, _ = make_service(settings, db)
-    callback = TaskEventCallback(db, task["task_id"], __import__("time").monotonic(), 3600)
-    callback.on_tool_start({"name": "web_search"}, '{"query":"new evidence"}', run_id="tool-1")
-    callback.on_tool_end('{"results":[]}', run_id="tool-1")
-    event_types = [event["event_type"] for event in db.get_events(task["task_id"])]
-    assert "tool_call_started" in event_types
-    assert "tool_call_completed" in event_types
-    assert "research_plan_step_status" not in event_types
-    assert "research_plan_activity" not in event_types
+def test_tool_callbacks_automatically_advance_plan_steps_from_real_work(settings, db):
+    task, service = make_service(settings, db)
+    service.update_research_plan(json.dumps({
+        "title": "研究计划",
+        "objective": "完成有证据支持的研究报告",
+        "steps": [
+            {"id": "discover", "title": "检索官方资料", "expected_output": "官方资料清单"},
+            {"id": "read", "title": "阅读关键来源材料", "expected_output": "来源证据摘要"},
+            {"id": "analyze", "title": "分析比较研究发现", "expected_output": "比较分析结果"},
+            {"id": "report", "title": "撰写最终研究报告", "expected_output": "report.md"},
+            {"id": "validate", "title": "核验报告结构与引用", "expected_output": "通过交付校验"},
+        ],
+    }, ensure_ascii=False))
+    callback = TaskEventCallback(
+        db, task["task_id"], __import__("time").monotonic(), 3600,
+        plan_progress_service=service,
+    )
+
+    callback.on_tool_start({"name": "web_search"}, '{"query":"official documentation"}', run_id="tool-search")
+    callback.on_tool_end('{"results":[{"title":"Official docs"}]}', run_id="tool-search")
+    callback.on_tool_start({"name": "fetch_url"}, '{"url":"https://example.org/docs"}', run_id="tool-read")
+    callback.on_tool_end('{"success":true,"text":"source text"}', run_id="tool-read")
+    callback.on_tool_start({"name": "record_finding"}, '{"claim":"verified finding","source_ids":["S0001"]}', run_id="tool-analysis")
+    callback.on_tool_end('{"finding_id":"F0001"}', run_id="tool-analysis")
+    callback.on_tool_start({"name": "save_artifact"}, '{"path":"report.md","content":"# Report"}', run_id="tool-report")
+    callback.on_tool_end('Saved report.md', run_id="tool-report")
+    callback.sync_plan_progress_for_phase("validation", "系统开始交付校验")
+    callback.complete_active_plan_step("报告已通过校验并交付")
+
+    events = db.get_events(task["task_id"])
+    progress_events = [event for event in events if event["event_type"] == "research_plan_step_status"]
+    latest = service._latest_step_progress(events)
+    assert [latest[key]["status"] for key in ("discover", "read", "analyze", "report", "validate")] == [
+        "completed", "completed", "completed", "completed", "completed"
+    ]
+    assert all(latest[key]["source"] == "runtime" for key in latest)
+    assert [event["event_type"] for event in events].count("tool_call_started") == 4
+    assert [event["event_type"] for event in events].count("tool_call_completed") == 4
+    assert len(progress_events) >= 9
+    assert "research_plan_activity" not in [event["event_type"] for event in events]
+
+
+def test_progress_tracker_does_not_override_explicit_agent_status(settings, db):
+    task, service = make_service(settings, db)
+    service.update_research_plan(json.dumps({
+        "title": "计划", "objective": "研究",
+        "steps": [{"id": "research", "title": "检索并阅读资料"}],
+    }, ensure_ascii=False))
+    service.update_plan_step_status("research", "in_progress", "Agent 明确报告正在执行")
+    callback = TaskEventCallback(
+        db, task["task_id"], __import__("time").monotonic(), 3600,
+        plan_progress_service=service,
+    )
+    callback.on_tool_start({"name": "web_search"}, '{"query":"test"}', run_id="tool-explicit")
+    callback.on_tool_end('{"results":[]}', run_id="tool-explicit")
+
+    latest = service._latest_step_progress(db.get_events(task["task_id"]))
+    assert latest["research"]["status"] == "in_progress"
+    assert latest["research"]["source"] == "agent"
 
 
 def test_plan_step_progress_is_separate_from_strategic_versions(settings, db):
