@@ -47,6 +47,24 @@ class ResearchToolService(TaskToolService):
         worker_generation: int | None = None,
     ):
         super().__init__(settings, db, task_id, artifacts, started_monotonic, worker_id, worker_generation)
+        self._github_source_adapter = None
+        self._arxiv_adapter = None
+
+    def _github_sources(self):
+        if self._github_source_adapter is None:
+            from app.tools.github_sources import GitHubSourceAdapter
+            self._github_source_adapter = GitHubSourceAdapter(
+                self.settings, self.db, self.task_id, self.artifacts, self
+            )
+        return self._github_source_adapter
+
+    def _arxiv_sources(self):
+        if self._arxiv_adapter is None:
+            from app.tools.arxiv import ArxivAdapter
+            self._arxiv_adapter = ArxivAdapter(
+                self.settings, self.db, self.task_id, self.artifacts, self
+            )
+        return self._arxiv_adapter
 
     @staticmethod
     def _slug(value: str) -> str:
@@ -433,7 +451,11 @@ class ResearchToolService(TaskToolService):
             failed_url,
         )
 
-    def fetch_pdf(self, url: str) -> str:
+    def fetch_pdf(
+        self, url: str, *, source_type: str = "pdf",
+        evidence_url: str | None = None, evidence_title: str | None = None,
+        evidence_metadata: dict | None = None,
+    ) -> str:
         """Download and extract a public PDF into the task evidence workspace."""
         self.check_control()
         blocked = self.budget_tool_gate("fetch_pdf")
@@ -463,17 +485,28 @@ class ResearchToolService(TaskToolService):
             extracted = "\n\n".join(pages)
             if len(extracted) < 80:
                 raise ValueError("PDF contains insufficient extractable text; OCR may be required")
-            evidence = EvidenceRegistry(self.artifacts).register_source(url=requested, title="PDF source", content=extracted, source_type="pdf")
-            digest = hashlib.sha256((requested + evidence["content_hash"]).encode("utf-8")).hexdigest()[:12]
+            registered_url = evidence_url or requested
+            registered_title = evidence_title or "PDF source"
+            registered_metadata = dict(evidence_metadata or {})
+            registered_metadata.setdefault("pdf_url", requested)
+            evidence = EvidenceRegistry(self.artifacts).register_source(
+                url=registered_url, title=registered_title, content=extracted,
+                source_type=source_type, metadata=registered_metadata,
+            )
+            digest = hashlib.sha256((registered_url + evidence["content_hash"]).encode("utf-8")).hexdigest()[:12]
             path = self.artifacts.write_text(
                 f"sources/pdf_{digest}.md",
                 f"# PDF source\n\nSource: {requested}\n\n{extracted[:60000]}\n",
             )
             self.db.add_event(self.task_id, "research_pdf_fetched", {
-                "url": requested, "pages": len(reader.pages), "characters": len(extracted), "artifact": path, "source_id": evidence["source_id"]
+                "url": registered_url, "pdf_url": requested, "source_type": source_type,
+                "pages": len(reader.pages), "characters": len(extracted),
+                "artifact": path, "source_id": evidence["source_id"]
             })
-            return json.dumps({"success": True, "url": requested, "pages": len(reader.pages),
-                               "characters": len(extracted), "saved_to": path, "source_id": evidence["source_id"]}, ensure_ascii=False)
+            return json.dumps({"success": True, "url": registered_url, "pdf_url": requested,
+                               "source_type": source_type, "pages": len(reader.pages),
+                               "characters": len(extracted), "saved_to": path,
+                               "source_id": evidence["source_id"]}, ensure_ascii=False)
         except TaskControlSignal:
             raise
         except Exception as exc:
@@ -1049,6 +1082,39 @@ class ResearchToolService(TaskToolService):
             """Download a public PDF, extract its text by page, and save it as task evidence."""
             return self.fetch_pdf(url)
 
+        @tool("github_repo")
+        def github_repo_tool(repo: str) -> str:
+            """Read a GitHub repository overview: description, default branch, language, license, stars and latest push time."""
+            return self._github_sources().github_repo(repo)
+
+        @tool("github_tree")
+        def github_tree_tool(repo: str, path: str = "", ref: str | None = None) -> str:
+            """Read a filtered directory/file index for a GitHub repository path."""
+            return self._github_sources().github_tree(repo, path, ref)
+
+        @tool("github_read")
+        def github_read_tool(repo: str, paths: list[str], ref: str | None = None) -> str:
+            """Batch-read up to five safe text files from a GitHub repository; files are snapshotted and registered as evidence in one tool step."""
+            return self._github_sources().github_read(repo, paths, ref)
+
+        @tool("github_releases")
+        def github_releases_tool(repo: str, limit: int = 10) -> str:
+            """Read a repository's recent GitHub release timeline."""
+            return self._github_sources().github_releases(repo, limit)
+
+        @tool("arxiv_search")
+        def arxiv_search_tool(
+            query: str, max_results: int = 5, sort_by: str = "relevance",
+            category: str | None = None,
+        ) -> str:
+            """Search arXiv using its official Atom API; supports field qualifiers, boolean queries and an optional category."""
+            return self._arxiv_sources().search(query, max_results, sort_by, category)
+
+        @tool("arxiv_paper")
+        def arxiv_paper_tool(arxiv_id: str) -> str:
+            """Read arXiv paper metadata and extract its public PDF through the existing SSRF-safe PDF evidence pipeline."""
+            return self._arxiv_sources().paper(arxiv_id)
+
         @tool("save_artifact")
         def save_artifact_tool(path: str, content: str) -> str:
             """Persist research notes, plans, evidence tables or report files in the task workspace. Use relative paths ending in .md, .txt, .json, .csv or .yaml."""
@@ -1073,4 +1139,10 @@ class ResearchToolService(TaskToolService):
             web_search_tool,
             fetch_url_tool,
             fetch_pdf_tool,
+            github_repo_tool,
+            github_tree_tool,
+            github_read_tool,
+            github_releases_tool,
+            arxiv_search_tool,
+            arxiv_paper_tool,
         ]
