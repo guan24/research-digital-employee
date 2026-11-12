@@ -744,6 +744,37 @@ class Database:
             )
             return amount
 
+    def record_budget_convergence_started(self, task_id: str, status: dict[str, Any]) -> bool:
+        """Persist one convergence-start event regardless of which budget dimension triggered it."""
+        convergence = status.get("convergence") or {}
+        dimensions = status.get("dimensions") or {}
+        payload = {
+            "trigger_dimension": status.get("trigger_dimension"),
+            "active_dimensions": convergence.get("active_dimensions", []),
+            "reserve": {
+                "tokens": convergence.get("reserve_tokens", 0),
+                "tool_calls": convergence.get("reserve_tool_calls", 0),
+                "runtime_seconds": convergence.get("reserve_runtime_seconds", 0),
+            },
+            "remaining": {
+                name: item.get("convergence_remaining", 0)
+                for name, item in dimensions.items()
+            },
+            "policy": "exploration stopped; protected resources reserved for synthesis, persistence and repair",
+        }
+        with self.transaction() as conn:
+            exists = conn.execute(
+                "SELECT 1 FROM events WHERE task_id=? AND event_type='budget_convergence_started' LIMIT 1",
+                (task_id,),
+            ).fetchone()
+            if exists:
+                return False
+            conn.execute(
+                "INSERT INTO events(task_id,timestamp,event_type,payload_json) VALUES(?,?,?,?)",
+                (task_id, utc_now(), "budget_convergence_started", json.dumps(payload, ensure_ascii=False)),
+            )
+        return True
+
     def get_budget_status(self, task_id: str) -> dict[str, Any]:
         task = self.get_task(task_id)
         if not task:
@@ -820,7 +851,7 @@ class Database:
                 else ("Budget gates are disabled for this task." if not enabled else "Budget normal.")
             )
         )
-        return {
+        result = {
             "enabled": enabled,
             "state": state,
             "phase": phase,
@@ -839,6 +870,9 @@ class Database:
             "policy": "hard total limits; exploration stops at per-dimension reserve thresholds; 30% tokens, 25% tool calls and 20% runtime protected for convergence",
             "instruction": instruction,
         }
+        if phase == "convergence":
+            self.record_budget_convergence_started(task_id, result)
+        return result
 
     def approve_budget_extension(self, task_id: str, *, reason: str,
                                  additional_steps: int = 0,

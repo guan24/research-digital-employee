@@ -406,6 +406,10 @@ def test_tool_call_budget_enters_convergence_before_hard_step_limit(db, settings
     service = ResearchToolService(settings, db, task["task_id"], artifacts, time.monotonic())
     blocked = json.loads(service.web_search("must be blocked during convergence"))
     assert blocked["error_type"] == "budget_intercept"
+    assert any(
+        event["event_type"] == "budget_convergence_started"
+        for event in db.get_events(task["task_id"])
+    )
 
 
 def test_runtime_budget_enters_convergence_before_hard_timeout(db):
@@ -422,6 +426,10 @@ def test_runtime_budget_enters_convergence_before_hard_timeout(db):
     assert status["trigger_dimension"] == "runtime_seconds"
     assert status["dimensions"]["runtime_seconds"]["convergence_reserve"] == 720
     assert status["dimensions"]["runtime_seconds"]["exploration_remaining"] == 0
+    assert any(
+        event["event_type"] == "budget_convergence_started"
+        for event in db.get_events(task["task_id"])
+    )
 
 
 def test_token_budget_protects_a_convergence_reserve_before_exploration_stops(db, settings):
