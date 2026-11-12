@@ -166,6 +166,40 @@ def test_tool_callbacks_automatically_advance_plan_steps_from_real_work(settings
     assert "research_plan_activity" not in [event["event_type"] for event in events]
 
 
+def test_report_phase_completes_an_analysis_step_without_a_separate_analysis_tool(settings, db):
+    from app.runtime.plan_progress import PlanProgressTracker
+
+    task, service = make_service(settings, db)
+    service.update_research_plan(json.dumps({
+        "title": "研究计划",
+        "objective": "完成研究报告",
+        "steps": [
+            {"id": "discover", "title": "检索资料"},
+            {"id": "read", "title": "阅读关键来源"},
+            {"id": "analyze", "title": "分析并比较研究发现"},
+            {"id": "report", "title": "撰写研究报告", "expected_output": "report.md"},
+            {"id": "validate", "title": "核验报告引用"},
+        ],
+    }, ensure_ascii=False))
+    tracker = PlanProgressTracker(db, task["task_id"], service.artifacts)
+    callback = TaskEventCallback(
+        db, task["task_id"], __import__("time").monotonic(), 3600,
+        plan_progress_service=tracker,
+    )
+    callback.on_tool_start({"name": "web_search"}, '{"query":"research"}', run_id="search")
+    callback.on_tool_end('{"results":[]}', run_id="search")
+    callback.on_tool_start({"name": "fetch_url"}, '{"url":"https://example.org"}', run_id="read")
+    callback.on_tool_end('{"success":true}', run_id="read")
+    callback.on_tool_start({"name": "save_artifact"}, '{"path":"report.md","content":"# Report"}', run_id="report")
+
+    latest = service._latest_step_progress(db.get_events(task["task_id"]))
+    assert latest["discover"]["status"] == "completed"
+    assert latest["read"]["status"] == "completed"
+    assert latest["analyze"]["status"] == "completed"
+    assert latest["report"]["status"] == "in_progress"
+    assert latest["validate"]["status"] == "pending"
+
+
 def test_progress_tracker_does_not_override_explicit_agent_status(settings, db):
     from app.runtime.plan_progress import PlanProgressTracker
 

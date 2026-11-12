@@ -241,11 +241,21 @@ class PlanProgressTracker:
         candidate_index = plan["steps"].index(candidate)
         for prerequisite in plan["steps"][:candidate_index]:
             state = progress.get(prerequisite["id"], {})
-            if state.get("status", "pending") == "pending" and self._step_phase(prerequisite) == "scope":
+            prerequisite_phase = self._step_phase(prerequisite)
+            complete_as_prerequisite = (
+                prerequisite_phase == "scope"
+                or (phase == "report" and prerequisite_phase == "analysis")
+                or (phase == "validation" and prerequisite_phase == "report")
+            )
+            if state.get("status", "pending") == "pending" and complete_as_prerequisite:
+                prerequisite_note = (
+                    "自动跟踪：初始规划已明确研究范围与目标。"
+                    if prerequisite_phase == "scope"
+                    else "自动跟踪：Agent 已进入报告/校验阶段，该前置工作流已纳入最终交付。"
+                )
                 self._append_status(
-                    prerequisite, "completed",
-                    "自动跟踪：初始规划已明确研究范围与目标。",
-                    "scope", version,
+                    prerequisite, "completed", prerequisite_note,
+                    prerequisite_phase or phase, version,
                 )
                 events = self.db.get_events(self.task_id, limit=5000)
                 progress = self._latest_progress(events)
