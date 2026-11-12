@@ -165,13 +165,13 @@ class PlanProgressTracker:
             json.dumps(plan_with_progress, ensure_ascii=False, indent=2),
         )
 
-    def sync_for_tool(self, tool_name: str, input_value: str) -> str | None:
+    def sync_plan_progress_for_tool(self, tool_name: str, input_value: str) -> str | None:
         phase = self._tool_phase(tool_name, input_value)
         if phase is None:
             return None
-        return self.sync_for_phase(phase, f"检测到工具 {tool_name} 开始执行")
+        return self.sync_plan_progress_for_phase(phase, f"检测到工具 {tool_name} 开始执行")
 
-    def sync_for_phase(self, phase: str, note: str = "") -> str | None:
+    def sync_plan_progress_for_phase(self, phase: str, note: str = "") -> str | None:
         if phase not in self.PHASE_ORDER:
             return None
         events = self.db.get_events(self.task_id, limit=5000)
@@ -260,7 +260,7 @@ class PlanProgressTracker:
         )
         return f"Runtime progress: {candidate['id']} -> in_progress ({phase})."
 
-    def complete_active_step(self, note: str = "最终交付已完成") -> int:
+    def complete_active_plan_step(self, note: str = "最终交付已完成") -> int:
         events = self.db.get_events(self.task_id, limit=5000)
         plan_event = next(
             (event for event in reversed(events) if event.get("event_type") == "research_plan_updated"),
