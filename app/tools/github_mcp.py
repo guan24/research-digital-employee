@@ -331,6 +331,7 @@ class GitHubMCPClient:
         }
         if self._session_id:
             headers["MCP-Session-Id"] = self._session_id
+            headers["MCP-Protocol-Version"] = "2024-11-05"
         request = urllib.request.Request(
             self.remote_url, data=json.dumps(message).encode("utf-8"),
             headers=headers, method="POST",
@@ -347,15 +348,36 @@ class GitHubMCPClient:
             status = int(exc.code)
             retry_after = exc.headers.get("Retry-After")
             wait = int(retry_after) if retry_after and retry_after.isdigit() else None
-            if status == 429:
+            try:
+                error_body = exc.read().decode("utf-8", errors="replace")
+            except Exception:
+                error_body = ""
+            rate_limited = (
+                status == 429
+                or (status == 403 and (
+                    "rate limit" in error_body.lower()
+                    or exc.headers.get("X-RateLimit-Remaining") == "0"
+                ))
+            )
+            if rate_limited:
+                if wait is None:
+                    reset = exc.headers.get("X-RateLimit-Reset")
+                    if reset and reset.isdigit():
+                        wait = max(1, int(reset) - int(time.time()))
                 raise GitHubMCPToolError(
                     "GitHub MCP rate limit reached.",
                     error_type="rate_limited", code="GITHUB_RATE_LIMITED",
-                    retryable=True, retry_after_seconds=wait,
+                    retryable=True, retry_after_seconds=wait or 60,
                 ) from exc
             if status in {401, 403}:
                 raise GitHubMCPConfigurationError(
                     "GitHub MCP authentication or repository permission was rejected."
+                ) from exc
+            if status == 404:
+                raise GitHubMCPToolError(
+                    "GitHub MCP resource was not found (HTTP 404).",
+                    error_type="not_found", code="GITHUB_NOT_FOUND",
+                    retryable=False,
                 ) from exc
             if status >= 500 or status in {408, 425}:
                 raise GitHubMCPTransportError(
@@ -443,7 +465,6 @@ class GitHubMCPClient:
                 f"GitHub MCP tool '{name}' is not in the read-only allow-list."
             )
         with self._lock:
-            attempts = 0
             while True:
                 try:
                     self._ensure_ready()
@@ -466,12 +487,10 @@ class GitHubMCPClient:
                             code="GITHUB_MCP_TOOL_ERROR",
                             retryable=False,
                         )
-                    self._restart_count = 0
                     return result
                 except GitHubMCPTransportError:
-                    if attempts >= self.max_restarts:
+                    if self._restart_count >= self.max_restarts:
                         raise
-                    attempts += 1
                     self._restart_count += 1
                     self._restart()
 

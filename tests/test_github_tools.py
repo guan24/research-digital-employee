@@ -263,3 +263,39 @@ def test_research_role_registers_exactly_six_new_tools(settings, db):
         "github_repo", "github_tree", "github_read", "github_releases",
         "arxiv_search", "arxiv_paper",
     }.issubset(names)
+
+
+def test_missing_github_pat_is_a_structured_tool_error_and_does_not_fail_task(settings, db):
+    from app.tools.github_mcp import GitHubMCPClient
+
+    task = db.create_task("Continue research when optional GitHub credentials are absent")
+    task = db.claim_next_task("no-token-worker")
+    artifacts = ArtifactStore(settings.workspace_dir, task["task_id"])
+    service = ResearchToolService(settings, db, task["task_id"], artifacts, time.monotonic())
+    client = GitHubMCPClient(token="")
+    adapter = GitHubSourceAdapter(settings, db, task["task_id"], artifacts, service, client=client)
+
+    result = json.loads(adapter.github_repo(REPO))
+    current = db.get_task(task["task_id"])
+    assert result["success"] is False
+    assert result["error_type"] == "configuration_error"
+    assert result["retryable"] is False
+    assert current["status"] == "running"
+    assert current["error_code"] == "GITHUB_MCP_NOT_CONFIGURED"
+
+
+def test_all_six_source_tools_are_individual_task_step_gated(settings, db):
+    task = db.create_task("Count each newly registered research source tool", max_steps=10)
+    task = db.claim_next_task("six-source-tools-worker")
+    artifacts = ArtifactStore(settings.workspace_dir, task["task_id"])
+    service = ResearchToolService(settings, db, task["task_id"], artifacts, time.monotonic())
+    source_names = {
+        "github_repo", "github_tree", "github_read", "github_releases",
+        "arxiv_search", "arxiv_paper",
+    }
+    tools = {item.name: item for item in service.as_langchain_tools()}
+    assert source_names.issubset(tools)
+    callback = TaskEventCallback(db, task["task_id"], time.monotonic(), 60)
+    for index, name in enumerate(sorted(source_names), start=1):
+        callback.on_tool_start({"name": name}, "{}", run_id=f"source-tool-{index}")
+    assert db.get_task(task["task_id"])["execution_steps"] == 6

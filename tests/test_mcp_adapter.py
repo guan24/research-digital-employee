@@ -151,7 +151,7 @@ def test_mcp_crash_restarts_once_and_retries_the_read_call():
     result = client.call_tool("get_file_contents", {"owner": "octo", "repo": "demo"})
     assert result["content"][0]["text"] == "read-only-result"
     assert len(processes) == 2
-    assert client._restart_count == 0
+    assert client._restart_count == 1
     client.close()
     assert all(not process.alive for process in processes)
 
@@ -196,3 +196,56 @@ def test_worker_run_once_closes_registered_github_mcp_process(settings, db, monk
     worker = Worker(settings_with_pat, db, executor=object())
     assert worker.run_once() is False
     assert process.alive is False
+
+
+def test_remote_transport_sends_server_side_read_only_headers():
+    requests = []
+
+    class Response:
+        def __init__(self, payload, status=200):
+            self.payload = payload
+            self.status = status
+            self.headers = {"Content-Type": "application/json", "MCP-Session-Id": "session-1"}
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *args):
+            return False
+
+        def read(self):
+            return self.payload
+
+    def opener(request, timeout):
+        requests.append(request)
+        message = json.loads(request.data.decode("utf-8"))
+        method = message["method"]
+        if method == "initialize":
+            payload = {"jsonrpc": "2.0", "id": message["id"], "result": {"protocolVersion": "2024-11-05"}}
+            return Response(json.dumps(payload).encode())
+        if method == "notifications/initialized":
+            return Response(b"", status=202)
+        if method == "tools/list":
+            payload = {"jsonrpc": "2.0", "id": message["id"], "result": {
+                "tools": [{"name": name} for name in READ_ONLY_GITHUB_TOOLS],
+            }}
+            return Response(json.dumps(payload).encode())
+        payload = {"jsonrpc": "2.0", "id": message["id"], "result": {
+            "content": [{"type": "text", "text": "remote-read-only"}],
+        }}
+        return Response(json.dumps(payload).encode())
+
+    client = GitHubMCPClient(
+        token="remote-test-pat", transport="remote",
+        remote_url="https://api.githubcopilot.com/mcp/",
+        urlopen_factory=opener,
+    )
+    result = client.call_tool("get_file_contents", {"owner": "octo", "repo": "demo"})
+    assert result["content"][0]["text"] == "remote-read-only"
+    assert len(requests) == 4
+    for request in requests:
+        headers = {key.lower(): value for key, value in request.header_items()}
+        assert headers["x-mcp-tools"] == ",".join(READ_ONLY_GITHUB_TOOLS)
+        assert headers["x-mcp-readonly"] == "true"
+        assert headers["authorization"] == "Bearer remote-test-pat"
+    client.close()
