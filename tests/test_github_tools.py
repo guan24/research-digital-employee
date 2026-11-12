@@ -254,6 +254,9 @@ def test_github_file_evidence_satisfies_existing_report_validator(settings, db):
         + ("该仓库通过模块化方式组织研究逻辑，README 描述了主要功能和项目边界，"
            "可将其作为分析入口并进一步结合实现文件核验关键职责。" * 2)
         + f" [{source_id}]\n\n"
+        + ("进一步检查目录树和关键实现文件，可以把 README 中的功能描述映射到具体模块，"
+           "并据此核验模块边界和职责是否与文档一致。" * 2)
+        + f" [{source_id}]\n\n"
         "## 结论\n\n"
         + ("从一手仓库文件可以核验项目的核心结构与模块边界，结论应以源代码和项目文档为依据。"
            * 2)
