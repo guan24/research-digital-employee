@@ -130,3 +130,14 @@ Token 预留采用保守的 UTF-8 字节数启发式估算，包含 2048 Token �
 岗位注册可选声明产物路径（默认 `result.md`）、校验器、受控后处理/修订次数、终态收尾函数和默认预算。公共 Executor 不再固定研究报告文件名或研究校验器；研究岗位保留 `report.md`、原证据覆盖率判据、最多两次定向修订及终态计划归档。
 
 错误分为可重试、终态、控制信号和未知类。鉴权/权限/非法请求/交付校验耗尽直接失败，不消耗自动重试；网络与上游临时错误按退避策略重试；未知错误标记为 `UNKNOWN_EXCEPTION` 并默认可重试。任务保存最新错误、首个根因及完整错误历史。
+
+
+## 研究数据源：GitHub MCP 与 arXiv
+
+研究岗位新增六个专属工具：github_repo、github_tree、github_read、github_releases、arxiv_search 和 arxiv_paper。GitHub MCP 采用只读模式：Worker 首次调用时懒启动官方 github/github-mcp-server，同一 Worker 生命周期复用；本地 stdio 启动参数同时包含 --read-only 和精确的 --tools 白名单，写操作工具不会注册。未配置 PAT 或 MCP 服务不可用时，工具返回结构化配置错误，研究任务仍可继续使用网页和 PDF 工具。可选远程模式使用 X-MCP-Tools 请求头。
+
+本地模式需要安装官方 github-mcp-server 并加入 PATH，配置 GITHUB_PERSONAL_ACCESS_TOKEN；Docker 或没有本地二进制的环境可设置 GITHUB_MCP_TRANSPORT=remote，使用 https://api.githubcopilot.com/mcp/。PAT 不得提交到仓库。一次 github_read 最多读取 5 个文件，只计一个 Agent 工具步数；适配器执行路径安全检查，将文本快照保存至 sources/github/{commit_sha}/，登记 github_file 类型证据并沿用 [Sxxxx] 编号。二进制、密钥、危险路径和超过硬大小限制的文件会被拒绝；超过快照阈值但未超过硬限制的文本会截断并明确标记。
+
+arxiv_search 和 arxiv_paper 使用 Python 标准库调用 arXiv 官方 Atom API，全局请求间隔至少 3 秒，相同检索式缓存 5 分钟。检索结果和论文元数据登记为 arxiv 类型证据；全文读取复用现有 SSRF 校验、大小限制和 PDF 文本提取流程。不新增 Python 解析依赖。
+
+新增事件包括 github_repo_lookup_started、github_repo_lookup_completed、github_tree_index_started、github_tree_indexed、github_files_read_started、github_file_read_completed、github_files_read_completed、github_releases_listed、github_repo_failed、github_tree_failed、github_files_read_failed、github_releases_failed、arxiv_search_completed、arxiv_search_failed、arxiv_paper_read_completed 和 arxiv_paper_failed。失败事件包含 error_type、error_code、retryable；限流时还包含 retry_after_seconds。工具层错误同步写入任务错误历史，但不会自动终止整个研究任务。

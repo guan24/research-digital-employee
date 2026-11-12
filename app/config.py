@@ -29,6 +29,13 @@ class Settings:
     default_max_attempts: int
     default_max_steps: int
     default_max_runtime_seconds: int
+    github_personal_access_token: str = ""
+    github_mcp_transport: str = "stdio"
+    github_mcp_server_command: str = "github-mcp-server"
+    github_mcp_remote_url: str = "https://api.githubcopilot.com/mcp/"
+    github_mcp_timeout_seconds: float = 20.0
+    github_mcp_max_restarts: int = 1
+    github_mcp_max_file_bytes: int = 200_000
 
     @classmethod
     def from_env(cls) -> "Settings":
@@ -57,6 +64,13 @@ class Settings:
             default_max_attempts=int(os.getenv("DEFAULT_MAX_ATTEMPTS", "3")),
             default_max_steps=int(os.getenv("DEFAULT_MAX_STEPS", "12")),
             default_max_runtime_seconds=int(os.getenv("DEFAULT_MAX_RUNTIME_SECONDS", "3600")),
+            github_personal_access_token=os.getenv("GITHUB_PERSONAL_ACCESS_TOKEN", "").strip(),
+            github_mcp_transport=os.getenv("GITHUB_MCP_TRANSPORT", "stdio").strip().lower(),
+            github_mcp_server_command=os.getenv("GITHUB_MCP_SERVER_COMMAND", "github-mcp-server").strip(),
+            github_mcp_remote_url=os.getenv("GITHUB_MCP_REMOTE_URL", "https://api.githubcopilot.com/mcp/").strip(),
+            github_mcp_timeout_seconds=float(os.getenv("GITHUB_MCP_TIMEOUT_SECONDS", "20")),
+            github_mcp_max_restarts=int(os.getenv("GITHUB_MCP_MAX_RESTARTS", "1")),
+            github_mcp_max_file_bytes=int(os.getenv("GITHUB_MCP_MAX_FILE_BYTES", "200000")),
         )
 
     def ensure_directories(self) -> None:

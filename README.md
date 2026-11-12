@@ -123,3 +123,14 @@ Additional endpoints: `GET /tasks/{task_id}/budget` and role discovery through `
 
 
 Research role budget defaults are declared once in `app/agents/research/profile.toml`; the registration derives its effective API defaults from that profile. Explicit task-level limits override the role defaults.
+
+
+## Research data sources: GitHub MCP and arXiv
+
+The research role optionally exposes six source tools: github_repo, github_tree, github_read, github_releases, arxiv_search and arxiv_paper. GitHub MCP is read-only: the official server is launched lazily and reused for the Worker process lifetime. The local stdio transport passes both --read-only and an exact --tools allow-list; write tools are not registered. A missing PAT or unavailable server is returned as a structured tool configuration error so web/PDF research can continue. The optional remote transport uses X-MCP-Tools headers.
+
+Configure GITHUB_PERSONAL_ACCESS_TOKEN and install the official github/github-mcp-server executable on PATH for local stdio mode. In Docker or environments without the binary, set GITHUB_MCP_TRANSPORT=remote and optionally GITHUB_MCP_REMOTE_URL=https://api.githubcopilot.com/mcp/. Never commit the PAT. Each github_read call accepts at most five paths and counts as one Agent tool step; the adapter validates paths, snapshots text under sources/github/{commit_sha}/, registers immutable github_file evidence with [Sxxxx] IDs, and normalizes failures. Binary, secret, unsafe and over-limit paths are rejected; snapshots above the snapshot threshold are truncated and marked.
+
+arxiv_search and arxiv_paper use the official arXiv Atom API with the Python standard library, a process-wide minimum three-second request interval and a five-minute query cache. Search results and paper metadata are registered as arxiv evidence. Full text reuses the existing SSRF-checked, size-limited PDF extraction pipeline. No new Python dependency is required.
+
+New observable events include github_repo_lookup_started, github_repo_lookup_completed, github_tree_index_started, github_tree_indexed, github_files_read_started, github_file_read_completed, github_files_read_completed, github_releases_listed, github_repo_failed, github_tree_failed, github_files_read_failed, github_releases_failed, arxiv_search_completed, arxiv_search_failed, arxiv_paper_read_completed and arxiv_paper_failed. Failure events include error_type, error_code, retryable and, for rate limits, retry_after_seconds. Tool failures are also appended to the task error history without automatically failing the whole research task.
