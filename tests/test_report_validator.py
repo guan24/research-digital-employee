@@ -94,7 +94,8 @@ def test_validator_counts_citations_in_bullet_and_table_blocks(tmp_path):
     report = (
         "# Research report\n\n## Findings\n\n"
         + ("- The first verified finding is grounded in the primary source and explains the observed design choice. [" + source["source_id"] + "]\n")
-        + ("- The second finding compares the evidence and describes the consequence for implementation. [" + source["source_id"] + "]\n\n")
+        + ("- The second finding compares the evidence and describes the consequence for implementation. [" + source["source_id"] + "]\n")
+        + ("- The third finding records the limitations and identifies what additional evidence would be needed to validate the interpretation. [" + source["source_id"] + "]\n\n")
         + "## Sources\n- https://example.org/primary"
     )
     result = ReportValidator().validate(report, evidence_registry=registry.summary())
