@@ -215,7 +215,7 @@ async function load(taskId) {
   if (eventSource) eventSource.close();
   if (eventPollTimer) clearInterval(eventPollTimer);
   eventSource = null; eventPollTimer = null;
-  detail = null; events = []; artifacts = []; activeFile = ''; fileText = '';
+  detail = null; events = []; artifacts = []; activeFile = ''; fileText = ''; lastBudget = null;
   $('taskStatus').textContent = '加载中';
   setStreamStatus('');
   $('qualityPanel').innerHTML = '<div class="empty">正在读取交付校验记录…</div>';
@@ -432,8 +432,8 @@ function renderQuality() {
   const revision=Number(payload.revision||0),exhausted=detail?.error_code==='DELIVERY_VALIDATION_EXHAUSTED';
   const errors=Array.isArray(payload.errors)?payload.errors:String(payload.errors||'').split(';').filter(Boolean);
   root.innerHTML='<div class="panelhead">交付质量 <span class="quality-'+(payload.valid?'pass':'fail')+'">'+
-    (payload.valid?'校验通过':'校验未通过')+'</span></div><div class="quality-metrics"><span>修订轮次 <b>'+
-    (revision+1)+' / '+(maxRevisions+1)+'</b></span><span>证据覆盖率 <b>'+
+    (payload.valid?'校验通过':'校验未通过')+'</span></div><div class="quality-metrics"><span>已修订轮次 <b>'+
+    revision+' / '+maxRevisions+'</b></span><span>证据覆盖率 <b>'+
     (payload.evidence_coverage==null?'未记录':Math.round(Number(payload.evidence_coverage)*100)+'%')+
     '</b></span><span>核验来源 <b>'+esc(payload.source_count??'—')+'</b></span></div>'+
     (exhausted?'<p class="quality-exhausted">修订已耗尽，任务终止。</p>':'')+
