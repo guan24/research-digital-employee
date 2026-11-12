@@ -64,29 +64,60 @@ class TaskToolService:
         status = self.db.get_budget_status(self.task_id)
         if not status.get("enabled"):
             return None
-        if status.get("state") in {"restricted", "soft_limit", "hard_limit"}:
-            allowed = {"save_artifact", "read_artifact", "list_artifacts", "save_research_memory", "read_research_memory", "get_budget_status", "get_evidence_registry", "record_finding"}
+        restricted = (
+            status.get("phase") == "convergence"
+            or status.get("state") in {"restricted", "soft_limit", "hard_limit"}
+        )
+        if restricted:
+            allowed = {
+                "save_artifact", "read_artifact", "list_artifacts",
+                "save_research_memory", "read_research_memory",
+                "get_budget_status", "get_evidence_registry", "record_finding",
+                "update_plan_step_status", "request_budget_extension",
+            }
             if tool_name not in allowed:
-                payload = {"success": False, "error_type": "budget_intercept", "reason": "task is in restricted convergence mode", "dimension": status.get("trigger_dimension"), "remaining": status.get("dimensions", {}), "tool": tool_name}
+                payload = {
+                    "success": False,
+                    "error_type": "budget_intercept",
+                    "reason": "Protected convergence reserve active. Stop exploration and use saved evidence to write and validate the deliverable.",
+                    "dimension": status.get("trigger_dimension"),
+                    "phase": status.get("phase"),
+                    "remaining": status.get("dimensions", {}),
+                    "tool": tool_name,
+                }
                 self.db.add_event(self.task_id, "budget_tool_rejected", payload)
                 return __import__("json").dumps(payload, ensure_ascii=False)
         return None
 
     def save_artifact(self, path: str, content: str) -> str:
         self.check_control()
-        saved = self.artifacts.write_text(path, content)
+        normalized = str(content if content is not None else "")
+        saved = self.artifacts.write_text(path, normalized)
+        persisted = self.artifacts.read_text(path)
+        if persisted != normalized:
+            raise OSError(f"artifact read-back verification failed: {path}")
+        digest = hashlib.sha256(persisted.encode("utf-8")).hexdigest()
         self.db.add_event(self.task_id, "artifact_saved", {
-            "path": saved, "bytes": len(content.encode("utf-8")),
+            "path": saved,
+            "bytes": len(persisted.encode("utf-8")),
+            "sha256": digest,
+            "read_back_verified": True,
         })
-        return f"Saved artifact: {saved}"
+        return f"Saved and read-back verified artifact: {saved} (sha256={digest[:12]})"
 
-    def read_artifact(self, path: str) -> str:
+    def read_artifact(self, path: str, start_char: int = 0, max_chars: int = 8_000) -> str:
         self.check_control()
-        return self.artifacts.read_text(path)[:20_000]
-
-    def list_artifacts(self) -> str:
-        self.check_control()
-        return __import__("json").dumps(self.artifacts.list_files(), ensure_ascii=False)
+        content = self.artifacts.read_text(path)
+        start = max(0, int(start_char or 0))
+        limit = max(1_000, min(int(max_chars or 8_000), 12_000))
+        end = min(len(content), start + limit)
+        excerpt = content[start:end]
+        if start == 0 and end == len(content):
+            return excerpt
+        return (
+            f"[Artifact excerpt: characters {start}-{end} of {len(content)}. "
+            f"Read the next chunk with start_char={end}.]\n\n{excerpt}"
+        )
 
     def save_research_memory(self, content: str) -> str:
         self.check_control()
@@ -143,9 +174,9 @@ class TaskToolService:
             return self.save_artifact(path, content)
 
         @tool("read_artifact")
-        def read_artifact_tool(path: str) -> str:
-            """Read a previously saved task artifact."""
-            return self.read_artifact(path)
+        def read_artifact_tool(path: str, start_char: int = 0, max_chars: int = 8_000) -> str:
+            """Read a bounded chunk of a saved artifact; use start_char to continue large files."""
+            return self.read_artifact(path, start_char, max_chars)
 
         @tool("list_artifacts")
         def list_artifacts_tool() -> str:
