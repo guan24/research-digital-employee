@@ -148,14 +148,29 @@ def _build_research(settings, db, task, checkpointer, started):
 def _validate_research(report: str, task: dict, artifacts):
     from app.infrastructure.evidence_registry import EvidenceRegistry
     from app.runtime.report_validator import ReportValidator
-    return ReportValidator().validate(report, task.get("goal", ""), EvidenceRegistry(artifacts).summary())
+
+    registry = EvidenceRegistry(artifacts).summary()
+    for source in registry.get("sources", []):
+        snapshot_path = source.get("snapshot_path")
+        exists = bool(snapshot_path and artifacts.exists(snapshot_path))
+        source["snapshot_exists"] = exists
+        if exists:
+            snapshot = artifacts.read_text(snapshot_path)
+            source["snapshot_integrity"] = (
+                bool(source.get("content_hash"))
+                and source["content_hash"] in snapshot
+                and bool(source.get("url"))
+                and source["url"] in snapshot
+            )
+        else:
+            source["snapshot_integrity"] = False
+    return ReportValidator().validate(report, task.get("goal", ""), registry)
 
 
 def _postprocess_research(agent, result, config, task, artifacts, validation):
     from app.runtime.report_validator import validation_feedback
     feedback = validation_feedback(validation)
-    agent.invoke({"messages": [{"role": "user", "content": feedback}]}, config=config)
-    return None
+    return agent.invoke({"messages": [{"role": "user", "content": feedback}]}, config=config)
 
 
 def _finalize_research(db, task_id: str, artifacts, status: str, task: dict):
@@ -166,6 +181,6 @@ def _finalize_research(db, task_id: str, artifacts, status: str, task: dict):
 register_agent(
     "research", _build_research, profile_loader=load_research_profile,
     output_artifact="report.md", validator=_validate_research,
-    postprocessor=_postprocess_research, max_revisions=2,
+    postprocessor=_postprocess_research, max_revisions=3,
     finalizer=_finalize_research,
 )

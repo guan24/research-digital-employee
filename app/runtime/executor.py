@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 import json
 import logging
 import time
@@ -44,7 +45,7 @@ def _content_as_text(content: Any) -> str:
 
 
 def _serialize_model_response(response: Any) -> dict[str, Any]:
-    """Preserve assistant content and tool calls, including tool-only ChatOpenAI turns."""
+    """Preserve text, valid/invalid tool calls and provider finish diagnostics."""
     generations = getattr(response, "generations", None) or []
     serialized: list[dict[str, Any]] = []
     for group in generations:
@@ -52,18 +53,32 @@ def _serialize_model_response(response: Any) -> dict[str, Any]:
         for generation in group_items:
             message = getattr(generation, "message", None)
             if message is not None:
-                item: dict[str, Any] = {
-                    "content": getattr(message, "content", None) or ""
-                }
+                item: dict[str, Any] = {"content": getattr(message, "content", None) or ""}
                 for attribute, key in (
                     ("tool_calls", "tool_calls"),
                     ("invalid_tool_calls", "invalid_tool_calls"),
-                    ("additional_kwargs", "additional_kwargs"),
                 ):
                     value = getattr(message, attribute, None)
                     if value:
                         item[key] = value
-                if not item["content"] and not item.get("tool_calls") and not item.get("additional_kwargs"):
+                additional = getattr(message, "additional_kwargs", None) or {}
+                if isinstance(additional, dict):
+                    cleaned = {key: value for key, value in additional.items() if value is not None}
+                    if cleaned:
+                        item["additional_kwargs"] = cleaned
+                metadata = getattr(message, "response_metadata", None) or {}
+                if isinstance(metadata, dict):
+                    diagnostic = {
+                        key: metadata[key]
+                        for key in ("finish_reason", "model_name", "system_fingerprint", "refusal")
+                        if metadata.get(key) is not None
+                    }
+                    if diagnostic:
+                        item["response_metadata"] = diagnostic
+                generation_info = getattr(generation, "generation_info", None)
+                if isinstance(generation_info, dict) and generation_info:
+                    item["generation_info"] = generation_info
+                if not item["content"] and not item.get("tool_calls") and not item.get("invalid_tool_calls"):
                     text_value = getattr(generation, "text", None)
                     if text_value:
                         item["text"] = text_value
@@ -88,24 +103,70 @@ def _serialize_model_response(response: Any) -> dict[str, Any]:
     return {"unparsed_response": repr(response)[:20_000]}
 
 
+def _response_items(raw_response: dict[str, Any]) -> list[dict[str, Any]]:
+    generations = raw_response.get("generations")
+    if isinstance(generations, list):
+        return [item for item in generations if isinstance(item, dict)]
+    return [raw_response]
+
+
 def _model_response_summary(raw_response: dict[str, Any]) -> str:
-    content = _content_as_text(raw_response.get("content") or raw_response.get("text"))
-    if content.strip():
-        return content.strip()[:1200]
-    calls = raw_response.get("tool_calls") or []
-    if not calls and isinstance(raw_response.get("additional_kwargs"), dict):
-        calls = raw_response["additional_kwargs"].get("tool_calls") or []
+    items = _response_items(raw_response)
+    for item in items:
+        content = _content_as_text(item.get("content") or item.get("text"))
+        if content.strip():
+            return content.strip()[:1200]
+
+    invalid_calls = [
+        call for item in items for call in (item.get("invalid_tool_calls") or [])
+        if isinstance(call, dict)
+    ]
+    if invalid_calls:
+        details = []
+        for call in invalid_calls[:5]:
+            name = call.get("name") or (call.get("function") or {}).get("name") or "unknown_tool"
+            error = str(call.get("error") or call.get("args") or "")[:180]
+            details.append(f"{name}: {error}" if error else str(name))
+        return "模型生成了无法解析的工具调用：" + "；".join(details)
+
+    calls = []
+    for item in items:
+        current = item.get("tool_calls") or []
+        if not current and isinstance(item.get("additional_kwargs"), dict):
+            current = item["additional_kwargs"].get("tool_calls") or []
+        calls.extend(call for call in current if isinstance(call, dict))
     names = []
     for call in calls:
-        if isinstance(call, dict):
-            function = call.get("function") or {}
-            names.append(function.get("name") or call.get("name") or "tool")
+        function = call.get("function") or {}
+        names.append(function.get("name") or call.get("name") or "tool")
     if names:
-        return "模型决定调用工具：" + "、".join(names[:8])
-    if raw_response.get("unparsed_response"):
-        return "模型返回了结构化响应，已保留原始响应供查看。"
-    return "模型已返回响应（无纯文本内容）。"
+        return "模型请求调用工具：" + "、".join(names[:8])
 
+    for item in items:
+        additional = item.get("additional_kwargs") or {}
+        refusal = additional.get("refusal") if isinstance(additional, dict) else None
+        if refusal:
+            return "模型返回拒绝响应：" + str(refusal)[:500]
+        metadata = item.get("response_metadata") or {}
+        finish_reason = metadata.get("finish_reason") or (item.get("generation_info") or {}).get("finish_reason")
+        if finish_reason == "length":
+            return "模型输出达到 max_tokens 上限，响应可能被截断；请缩短上下文或增加输出配额。"
+    if raw_response.get("unparsed_response"):
+        return "模型返回了未解析的结构化响应，已保留原始内容供诊断。"
+    return "模型返回空响应：没有正文、有效工具调用或可识别的结构化输出。"
+
+
+def _model_response_kind(raw_response: dict[str, Any]) -> str:
+    items = _response_items(raw_response)
+    if any(_content_as_text(item.get("content") or item.get("text")).strip() for item in items):
+        return "text"
+    if any(item.get("invalid_tool_calls") for item in items):
+        return "invalid_tool_calls"
+    if any(item.get("tool_calls") for item in items):
+        return "tool_calls"
+    if raw_response.get("unparsed_response") or raw_response.get("response"):
+        return "structured"
+    return "empty"
 
 def _model_usage(response: Any) -> dict[str, Any]:
     llm_output = getattr(response, "llm_output", None) or {}
@@ -229,7 +290,10 @@ class TaskEventCallback(BaseCallbackHandler):
         usage = _model_usage(response)
         total_tokens = usage.get("total_tokens") or usage.get("totalTokens")
         if total_tokens is None:
-            total_tokens = (usage.get("prompt_tokens") or usage.get("input_tokens") or 0) + (usage.get("completion_tokens") or usage.get("output_tokens") or 0)
+            total_tokens = (
+                (usage.get("prompt_tokens") or usage.get("input_tokens") or 0)
+                + (usage.get("completion_tokens") or usage.get("output_tokens") or 0)
+            )
         try:
             total_tokens = max(0, int(total_tokens))
         except (TypeError, ValueError):
@@ -240,20 +304,28 @@ class TaskEventCallback(BaseCallbackHandler):
             self.worker_id, self.worker_generation,
         )
         self._token_reservations.discard(reservation_id)
+        summary = _model_response_summary(raw_response)
+        response_kind = _model_response_kind(raw_response)
         self.db.add_event(
             self.task_id,
             "model_call_completed",
             {
                 "duration_ms": int((time.monotonic() - started) * 1000),
                 "usage": usage,
-                "decision_summary": _model_response_summary(raw_response),
+                "decision_summary": summary,
+                "response_kind": response_kind,
                 "raw_response": raw_response,
                 "response_type": type(response).__name__,
                 "run_id": str(run_id),
             },
         )
+        if response_kind in {"empty", "invalid_tool_calls"}:
+            self.db.add_event(
+                self.task_id,
+                "model_response_anomaly",
+                {"kind": response_kind, "summary": summary[:1200], "run_id": str(run_id), "usage": usage},
+            )
         self._check_control()
-
     def on_llm_error(self, error, *, run_id, **kwargs):
         started = self._llm_started.pop(str(run_id), time.monotonic())
         reservation_id = str(run_id)
@@ -304,30 +376,36 @@ class TaskEventCallback(BaseCallbackHandler):
 
 
 def extract_final_text(state_or_result: Any) -> str:
+    """Extract only the final assistant turn; never substitute an earlier progress sentence."""
     if state_or_result is None:
         return ""
-    if isinstance(state_or_result, dict):
-        values = state_or_result
-    else:
-        values = getattr(state_or_result, "values", None)
+    values = state_or_result if isinstance(state_or_result, dict) else getattr(state_or_result, "values", None)
     if not isinstance(values, dict):
         return ""
     messages = values.get("messages", [])
-    for message in reversed(messages if isinstance(messages, list) else []):
+    assistant_messages = []
+    for message in messages if isinstance(messages, list) else []:
         message_type = getattr(message, "type", None)
         content = getattr(message, "content", None)
-        if content is None and isinstance(message, dict):
+        if isinstance(message, dict):
             message_type = message.get("type") or message.get("role")
             content = message.get("content")
-        if message_type in {"ai", "assistant"} and content:
-            if isinstance(content, str):
-                return content
-            if isinstance(content, list):
-                text_parts = [item.get("text", "") for item in content if isinstance(item, dict) and item.get("type") == "text"]
-                if text_parts:
-                    return "\n".join(text_parts)
+        if message_type in {"ai", "assistant"}:
+            assistant_messages.append(content)
+    if not assistant_messages:
+        return ""
+    content = assistant_messages[-1]
+    if isinstance(content, str):
+        return content.strip()
+    if isinstance(content, list):
+        parts = []
+        for item in content:
+            if isinstance(item, str):
+                parts.append(item)
+            elif isinstance(item, dict) and item.get("type") in {"text", "output_text"}:
+                parts.append(str(item.get("text") or item.get("content") or ""))
+        return "\n".join(part for part in parts if part).strip()
     return ""
-
 
 @contextmanager
 def sqlite_checkpointer(checkpoint_path: Path) -> Iterator[Any]:
@@ -387,6 +465,26 @@ class ResearchExecutor:
             return errors
         return "; ".join(str(item) for item in errors) or "delivery validation failed"
 
+    def _verify_artifact(self, task_id: str, artifacts: ArtifactStore, path: str, source: str) -> str:
+        content = artifacts.read_text(path)
+        if not content.strip():
+            raise ValueError(f"artifact is empty after persistence: {path}")
+        digest = hashlib.sha256(content.encode("utf-8")).hexdigest()
+        self.db.add_event(task_id, "artifact_persisted_verified", {
+            "path": path, "bytes": len(content.encode("utf-8")),
+            "sha256": digest, "source": source, "read_back_verified": True,
+        })
+        return content
+
+    def _persist_artifact(
+        self, task_id: str, artifacts: ArtifactStore, path: str, content: str, source: str,
+    ) -> str:
+        normalized = str(content or "").strip()
+        if not normalized:
+            raise ValueError(f"cannot persist empty artifact content: {path}")
+        artifacts.write_text(path, normalized + "\n")
+        return self._verify_artifact(task_id, artifacts, path, source)
+
     def run(self, task: dict[str, Any], worker_id: str | None = None) -> str:
         from app.runtime.errors import DeliveryValidationExhausted
         task_id = task["task_id"]
@@ -430,44 +528,123 @@ class ResearchExecutor:
             # deadline cannot be accepted as a successful final response.
             callback._check_control()
 
-            if not artifacts.exists(artifact_path):
+            existing_report = artifacts.read_text(artifact_path) if artifacts.exists(artifact_path) else ""
+            if not existing_report.strip():
                 final_text = extract_final_text(result)
                 if not final_text.strip():
-                    raise RuntimeError(f"agent finished without final answer or {artifact_path}")
-                artifacts.write_text(artifact_path, final_text.strip() + "\n")
+                    self.db.add_event(task_id, "model_empty_final_response_recovery_started", {
+                        "artifact_path": artifact_path,
+                        "reason": "Agent completed without a persisted artifact or final assistant text",
+                    })
+                    retry_result = agent.invoke(
+                        {"messages": [{
+                            "role": "user",
+                            "content": (
+                                "Your previous assistant turn contained no final text and no report artifact was saved. "
+                                "Recover from the current checkpoint and saved evidence. Do not repeat completed research. "
+                                "Write the complete deliverable to the required artifact path using save_artifact, "
+                                "then provide a concise completion message."
+                            ),
+                        }]},
+                        config=config,
+                    )
+                    result = retry_result
+                    callback._check_control()
+                    final_text = extract_final_text(result)
+                if not final_text.strip():
+                    raise DeliveryValidationExhausted(
+                        f"Agent returned an empty final response and did not persist {artifact_path} after one recovery attempt."
+                    )
+                self._persist_artifact(task_id, artifacts, artifact_path, final_text, "final_assistant_response")
                 self.db.add_event(task_id, "artifact_materialized_from_final_answer", {"path": artifact_path})
             else:
+                self._verify_artifact(task_id, artifacts, artifact_path, "agent_saved_artifact")
                 self.db.add_event(task_id, "artifact_saved_by_agent", {"path": artifact_path})
 
             if registration.validator is not None:
                 valid = False
-                feedback = None
                 for revision in range(registration.max_revisions + 1):
                     report = artifacts.read_text(artifact_path)
                     validation = registration.validator(report, task, artifacts)
                     valid = self._validation_ok(validation)
                     errors = self._validation_errors(validation)
-                    self.db.add_event(task_id, "delivery_validation_completed", {
-                        "agent_type": registration.agent_type, "valid": valid,
-                        "errors": errors[:4000], "revision": revision,
+                    validation_payload = {
+                        "agent_type": registration.agent_type,
+                        "valid": valid,
+                        "errors": errors[:4000],
+                        "revision": revision,
                         "artifact_path": artifact_path,
                         "evidence_coverage": getattr(validation, "evidence_coverage", None),
                         "source_count": getattr(validation, "source_count", None),
+                        "registered_source_count": getattr(validation, "registered_source_count", None),
+                        "verified_source_count": getattr(validation, "verified_source_count", None),
+                        "report_url_count": getattr(validation, "report_url_count", None),
+                        "cited_source_count": getattr(validation, "cited_source_count", None),
                         "finding_count": getattr(validation, "finding_count", None),
                         "cited_source_ids": list(getattr(validation, "cited_source_ids", ()) or ()),
-                    })
+                        "cited_finding_ids": list(getattr(validation, "cited_finding_ids", ()) or ()),
+                    }
+                    self.db.add_event(task_id, "delivery_validation_completed", validation_payload)
                     if valid:
+                        persisted = self._verify_artifact(task_id, artifacts, artifact_path, "validated_report")
+                        digest = hashlib.sha256(persisted.encode("utf-8")).hexdigest()
+                        self.db.add_event(task_id, "report_delivered", {
+                            "artifact_path": artifact_path,
+                            "bytes": len(persisted.encode("utf-8")),
+                            "sha256": digest,
+                            "validation_revision": revision,
+                            "evidence_coverage": getattr(validation, "evidence_coverage", None),
+                            "source_count": getattr(validation, "source_count", None),
+                            "report_url_count": getattr(validation, "report_url_count", None),
+                        })
                         break
+
                     if revision >= registration.max_revisions:
+                        self.db.add_event(task_id, "delivery_validation_exhausted", {
+                            "artifact_path": artifact_path,
+                            "revisions": registration.max_revisions,
+                            "errors": errors[:4000],
+                            "artifact_preserved": artifacts.exists(artifact_path),
+                        })
                         raise DeliveryValidationExhausted(
                             f"delivery validation failed after {registration.max_revisions} revisions: {errors}"
                         )
-                    if registration.postprocessor:
-                        registration.postprocessor(agent, result, config, task, artifacts, validation)
-                    else:
+                    if not registration.postprocessor:
                         raise DeliveryValidationExhausted(
                             f"delivery validation failed and role has no repair handler: {errors}"
                         )
+
+                    before_digest = hashlib.sha256(report.encode("utf-8")).hexdigest()
+                    repaired_result = registration.postprocessor(
+                        agent, result, config, task, artifacts, validation
+                    )
+                    if repaired_result is not None:
+                        result = repaired_result
+                    callback._check_control()
+
+                    updated_report = artifacts.read_text(artifact_path) if artifacts.exists(artifact_path) else ""
+                    after_digest = hashlib.sha256(updated_report.encode("utf-8")).hexdigest()
+                    if not updated_report.strip() or after_digest == before_digest:
+                        candidate = extract_final_text(result)
+                        if candidate.strip() and candidate.strip() != report.strip():
+                            self._persist_artifact(
+                                task_id, artifacts, artifact_path, candidate,
+                                f"repair_response_{revision + 1}",
+                            )
+                        else:
+                            self.db.add_event(task_id, "delivery_repair_no_change", {
+                                "artifact_path": artifact_path,
+                                "revision": revision + 1,
+                                "reason": "repair turn did not change the persisted report",
+                            })
                 if not valid:
                     raise DeliveryValidationExhausted("delivery validation did not pass")
+            else:
+                persisted = self._verify_artifact(task_id, artifacts, artifact_path, "artifact_delivery")
+                self.db.add_event(task_id, "artifact_delivered", {
+                    "artifact_path": artifact_path,
+                    "bytes": len(persisted.encode("utf-8")),
+                    "sha256": hashlib.sha256(persisted.encode("utf-8")).hexdigest(),
+                    "validation_required": False,
+                })
         return str((artifacts.workspace / artifact_path).resolve())
