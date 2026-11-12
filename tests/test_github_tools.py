@@ -338,7 +338,9 @@ def test_unavailable_local_server_is_configuration_error_and_task_keeps_running(
     def missing_binary(*args, **kwargs):
         raise FileNotFoundError("github-mcp-server not installed")
 
-    client = GitHubMCPClient(token="configured-pat", popen_factory=missing_binary)
+    client = GitHubMCPClient(
+        token="configured-pat", transport="stdio", popen_factory=missing_binary
+    )
     adapter = GitHubSourceAdapter(settings, db, task["task_id"], artifacts, service, client=client)
     result = json.loads(adapter.github_repo(REPO))
     current = db.get_task(task["task_id"])

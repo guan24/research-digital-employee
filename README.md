@@ -124,6 +124,8 @@ Additional endpoints: `GET /tasks/{task_id}/budget` and role discovery through `
 
 Research role budget defaults are declared once in `app/agents/research/profile.toml`; the registration derives its effective API defaults from that profile. Explicit task-level limits override the role defaults.
 
+Context summarization uses absolute token thresholds calculated from the model's maximum input window, so OpenAI-compatible models do not need to expose LangChain profile metadata. The limit is resolved from an explicit `MODEL_MAX_INPUT_TOKENS` setting, the model profile, or a known-model fallback. `qwen3.8-flash` uses its documented 991,808-token input limit; unknown compatible models fall back to 128,000 tokens until configured explicitly.
+
 
 ## Research data sources: GitHub MCP and arXiv
 

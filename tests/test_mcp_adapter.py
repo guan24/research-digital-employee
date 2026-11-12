@@ -105,7 +105,7 @@ def test_local_server_is_started_with_server_side_read_only_allow_list(monkeypat
         return process
 
     client = GitHubMCPClient(
-        token="test-pat", command="github-mcp-server", popen_factory=popen,
+        token="test-pat", transport="stdio", command="github-mcp-server", popen_factory=popen,
     )
     result = client.call_tool("get_file_contents", {"owner": "octo", "repo": "demo"})
     assert result["content"][0]["text"] == "read-only-result"
@@ -131,6 +131,11 @@ def test_write_tool_is_rejected_before_server_start():
     assert calls == []
 
 
+def test_settings_default_to_github_hosted_readonly_mcp(settings):
+    assert settings.github_mcp_transport == "remote"
+    assert settings.github_mcp_remote_url == "https://api.githubcopilot.com/mcp/readonly"
+
+
 def test_missing_token_returns_configuration_error_without_starting_process():
     calls = []
     client = GitHubMCPClient(token="", popen_factory=lambda *args, **kwargs: calls.append(args))
@@ -148,7 +153,7 @@ def test_mcp_crash_restarts_once_and_retries_the_read_call():
         return process
 
     client = GitHubMCPClient(
-        token="test-pat", popen_factory=popen, max_restarts=1,
+        token="test-pat", transport="stdio", popen_factory=popen, max_restarts=1,
     )
     result = client.call_tool("get_file_contents", {"owner": "octo", "repo": "demo"})
     assert result["content"][0]["text"] == "read-only-result"
@@ -158,12 +163,17 @@ def test_mcp_crash_restarts_once_and_retries_the_read_call():
     assert all(not process.alive for process in processes)
 
 
-def test_server_exposing_any_non_allowlisted_tool_fails_closed():
+def test_client_rejects_non_allowlisted_calls_even_if_server_advertises_extra_tools():
     process = FakeProcess(expose_write_tool=True)
-    client = GitHubMCPClient(token="test-pat", popen_factory=lambda *args, **kwargs: process)
-    with pytest.raises(GitHubMCPConfigurationError, match="outside the read-only allow-list"):
-        client.call_tool("get_file_contents", {"owner": "octo", "repo": "demo"})
-    assert process.alive is False
+    client = GitHubMCPClient(
+        token="test-pat", transport="stdio", popen_factory=lambda *args, **kwargs: process,
+    )
+    result = client.call_tool("get_file_contents", {"owner": "octo", "repo": "demo"})
+    assert result["content"][0]["text"] == "read-only-result"
+    assert "create_issue" in client.server_tools
+    with pytest.raises(GitHubMCPConfigurationError, match="not in the read-only allow-list"):
+        client.call_tool("create_issue", {"title": "must never be possible"})
+    client.close()
 
 
 def test_shared_runtime_has_no_github_or_arxiv_provider_imports():
@@ -189,7 +199,9 @@ def test_worker_run_once_closes_registered_github_mcp_process(settings, db, monk
     from app.tools import github_mcp
 
     process = FakeProcess()
-    settings_with_pat = replace(settings, github_personal_access_token="worker-test-pat")
+    settings_with_pat = replace(
+        settings, github_personal_access_token="worker-test-pat", github_mcp_transport="stdio"
+    )
     monkeypatch.setattr(github_mcp.subprocess, "Popen", lambda *args, **kwargs: process)
     client = get_github_mcp_client(settings_with_pat)
     client.call_tool("get_file_contents", {"owner": "octo", "repo": "demo"})
@@ -198,6 +210,13 @@ def test_worker_run_once_closes_registered_github_mcp_process(settings, db, monk
     worker = Worker(settings_with_pat, db, executor=object())
     assert worker.run_once() is False
     assert process.alive is False
+
+
+def test_default_transport_uses_github_hosted_readonly_endpoint():
+    client = GitHubMCPClient(token="test-pat")
+    assert client.transport == "remote"
+    assert client.remote_url == "https://api.githubcopilot.com/mcp/readonly"
+    client.close()
 
 
 def test_remote_transport_sends_server_side_read_only_headers():
@@ -239,7 +258,7 @@ def test_remote_transport_sends_server_side_read_only_headers():
 
     client = GitHubMCPClient(
         token="remote-test-pat", transport="remote",
-        remote_url="https://api.githubcopilot.com/mcp/",
+        remote_url="https://api.githubcopilot.com/mcp/readonly",
         urlopen_factory=opener,
     )
     result = client.call_tool("get_file_contents", {"owner": "octo", "repo": "demo"})
@@ -248,7 +267,9 @@ def test_remote_transport_sends_server_side_read_only_headers():
     for request in requests:
         headers = {key.lower(): value for key, value in request.header_items()}
         assert headers["x-mcp-tools"] == ",".join(READ_ONLY_GITHUB_TOOLS)
+        assert headers["x-mcp-readonly"] == "true"
         assert headers["authorization"] == "Bearer remote-test-pat"
+        assert request.full_url == "https://api.githubcopilot.com/mcp/readonly"
     client.close()
 
 
@@ -292,7 +313,7 @@ def test_remote_http_403_is_permission_denied_not_configuration_or_retryable():
     from app.tools.github_mcp import GitHubMCPToolError
     client = GitHubMCPClient(
         token="permission-pat", transport="remote",
-        remote_url="https://api.githubcopilot.com/mcp/", urlopen_factory=opener,
+        remote_url="https://api.githubcopilot.com/mcp/readonly", urlopen_factory=opener,
     )
     with pytest.raises(GitHubMCPToolError) as captured:
         client.call_tool("get_file_contents", {"owner": "octo", "repo": "private"})
@@ -306,6 +327,8 @@ def test_missing_official_server_binary_is_a_nonretryable_configuration_error():
     def missing_binary(*args, **kwargs):
         raise FileNotFoundError("not installed")
 
-    client = GitHubMCPClient(token="configured-pat", popen_factory=missing_binary)
+    client = GitHubMCPClient(
+        token="configured-pat", transport="stdio", popen_factory=missing_binary
+    )
     with pytest.raises(GitHubMCPConfigurationError, match="Install github-mcp-server"):
         client.call_tool("get_file_contents", {"owner": "octo", "repo": "demo"})

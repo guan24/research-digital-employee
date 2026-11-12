@@ -60,15 +60,15 @@ class GitHubMCPToolError(GitHubMCPError):
 
 
 class GitHubMCPClient:
-    """Worker-process-scoped GitHub MCP client with a server-enforced read-only allow-list."""
+    """Worker-scoped GitHub MCP client with server-side read-only mode and an app-level tool allow-list."""
 
     def __init__(
         self,
         *,
         token: str,
-        transport: str = "stdio",
+        transport: str = "remote",
         command: str = "github-mcp-server",
-        remote_url: str = "https://api.githubcopilot.com/mcp/",
+        remote_url: str = "https://api.githubcopilot.com/mcp/readonly",
         timeout_seconds: float = 20.0,
         max_restarts: int = 1,
         popen_factory=None,
@@ -207,12 +207,13 @@ class GitHubMCPClient:
             for item in tools
             if isinstance(item, dict) and item.get("name")
         }
-        unexpected = sorted(names.difference(READ_ONLY_GITHUB_TOOLS))
-        if unexpected:
+        missing = sorted(set(READ_ONLY_GITHUB_TOOLS).difference(names))
+        if missing:
             raise GitHubMCPConfigurationError(
-                "GitHub MCP server exposed tools outside the read-only allow-list: "
-                + ", ".join(unexpected)
+                "GitHub MCP server did not expose required tools: " + ", ".join(missing)
             )
+        # The remote server may advertise additional read-only tools from its default
+        # toolsets. call_tool() independently restricts every callable name to this allow-list.
         self._server_tools = names
 
     def _rpc_stdio(self, method: str, params: dict[str, Any]) -> Any:
@@ -330,6 +331,7 @@ class GitHubMCPClient:
             "Accept": "application/json, text/event-stream",
             "Authorization": "Bearer " + self.token,
             "X-MCP-Tools": ",".join(READ_ONLY_GITHUB_TOOLS),
+            "X-MCP-Readonly": "true",
         }
         if self._session_id:
             headers["MCP-Session-Id"] = self._session_id
@@ -539,9 +541,9 @@ _CLIENTS_LOCK = threading.Lock()
 def get_github_mcp_client(settings) -> GitHubMCPClient:
     token = getattr(settings, "github_personal_access_token", "") or ""
     key = (
-        str(getattr(settings, "github_mcp_transport", "stdio")),
+        str(getattr(settings, "github_mcp_transport", "remote")),
         str(getattr(settings, "github_mcp_server_command", "github-mcp-server")),
-        str(getattr(settings, "github_mcp_remote_url", "https://api.githubcopilot.com/mcp/")),
+        str(getattr(settings, "github_mcp_remote_url", "https://api.githubcopilot.com/mcp/readonly")),
         __import__("hashlib").sha256(token.encode("utf-8")).hexdigest(),
         float(getattr(settings, "github_mcp_timeout_seconds", 20.0)),
         int(getattr(settings, "github_mcp_max_restarts", 1)),

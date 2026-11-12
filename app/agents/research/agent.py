@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import os
+from collections.abc import Mapping
 from pathlib import Path
 from typing import Any
 
@@ -10,6 +11,43 @@ from app.infrastructure.artifact_store import ArtifactStore
 from app.infrastructure.database import Database
 from app.tools.research_tools import ResearchToolService
 from app.runtime.budget import MODEL_MAX_OUTPUT_TOKENS
+
+
+DEFAULT_MODEL_MAX_INPUT_TOKENS = 128_000
+KNOWN_MODEL_MAX_INPUT_TOKENS = {
+    # Alibaba Cloud Model Studio documents 991,808 max input tokens for qwen3.8-flash.
+    "qwen3.8-flash": 991_808,
+}
+
+
+def resolve_summarization_token_limits(
+    model_name: str,
+    configured_max_input_tokens: int = 0,
+    model_profile: Mapping[str, Any] | None = None,
+) -> tuple[int, int]:
+    """Return absolute (trigger, keep) token limits for context summarization.
+
+    An explicit environment setting wins, followed by LangChain model metadata and
+    known OpenAI-compatible model limits. Unknown compatible models use a conservative
+    128k fallback; set MODEL_MAX_INPUT_TOKENS to match their documented input window.
+    """
+    max_input_tokens = int(configured_max_input_tokens or 0)
+    if max_input_tokens <= 0 and isinstance(model_profile, Mapping):
+        profile_limit = model_profile.get("max_input_tokens")
+        if isinstance(profile_limit, int) and not isinstance(profile_limit, bool) and profile_limit > 0:
+            max_input_tokens = profile_limit
+    if max_input_tokens <= 0:
+        normalized_name = str(model_name or "").strip().lower().rsplit("/", 1)[-1]
+        for known_name, known_limit in KNOWN_MODEL_MAX_INPUT_TOKENS.items():
+            if normalized_name == known_name or normalized_name.startswith(known_name + "-"):
+                max_input_tokens = known_limit
+                break
+    if max_input_tokens <= 0:
+        max_input_tokens = DEFAULT_MODEL_MAX_INPUT_TOKENS
+
+    trigger_tokens = max(1, int(max_input_tokens * 0.78))
+    keep_tokens = max(1, int(max_input_tokens * 0.18))
+    return trigger_tokens, keep_tokens
 
 
 def build_research_agent(
@@ -57,8 +95,16 @@ def build_research_agent(
         default=StateBackend(),
         routes={"/research_memory/": FilesystemBackend(root_dir=str(artifacts.workspace), virtual_mode=True)},
     )
+    trigger_tokens, keep_tokens = resolve_summarization_token_limits(
+        settings.openai_model,
+        getattr(settings, "model_max_input_tokens", 0),
+        getattr(model, "profile", None),
+    )
     summarization = SummarizationMiddleware(
-        model=model, backend=backend, trigger=("fraction", 0.78), keep=("fraction", 0.18)
+        model=model,
+        backend=backend,
+        trigger=("tokens", trigger_tokens),
+        keep=("tokens", keep_tokens),
     )
     return create_deep_agent(
         model=model,

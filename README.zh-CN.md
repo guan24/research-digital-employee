@@ -116,7 +116,7 @@ Markdown 支持渲染和源码两种模式。JSON 仅展示原始文本，不做
 ## 长任务能力增强
 
 - **岗位注册表**：通过 `app/agents/registry.py` 注册岗位 Agent，定义岗位提示词、产物路径和质量门禁；API `GET /agents` 返回可用岗位。
-- **上下文压缩与长期记忆**：Deep Agents 的 `SummarizationMiddleware` 在上下文约 78% 时自动摘要并保留近期消息；LangGraph SQLite Checkpoint 负责运行状态恢复，任务工作区的 `notes/research_memory.md` 保存跨重启研究摘要。
+- **上下文压缩与长期记忆**：Deep Agents 的 `SummarizationMiddleware` 按模型最大输入 Token 数计算绝对阈值，在约 78% 时触发摘要并保留约 18% 的近期上下文；优先读取模型 profile，支持 `MODEL_MAX_INPUT_TOKENS` 覆盖，兼容没有 LangChain profile 的 OpenAI 兼容模型。Qwen3.8-Flash 自动采用 991,808 输入 Token 上限；未知模型默认按 128,000 Token 保守处理。LangGraph SQLite Checkpoint 负责运行状态恢复，任务工作区的 `notes/research_memory.md` 保存跨重启研究摘要。
 - **证据溯源**：成功读取的网页/PDF 自动写入 `evidence/registry.json` 和不可变内容快照，来源分配 `[S0001]` ID；Agent 可用 `record_finding` 将发现关联来源。报告质量门禁检查 URL、章节、来源 ID、快照和段落级引用覆盖率。
 - **任务预算强制执行**：工具调用步数与累计运行时长是硬闸门，分别在工具调用前及模型/工具/控制回调边界检查；超时终止为终态失败，不进入自动重试。每次模型调用前预留 UTF-8 输入字节数启发式估算 + 2048 Token 输出上限 + 128 Token 固定开销，ChatOpenAI 同时设置 2048 Token 输出上限；成功后按 Provider usage 结算，异常时释放预留，重复回调幂等。预留不足时不发起模型请求，任务以 `TOKEN_BUDGET_EXHAUSTED` 终态失败。达到 80% 告警、95% 禁止搜索/抓取，但产物/证据/记忆工具仍可用。人工扩额叠加额度并从 Checkpoint 恢复。API：`GET /tasks/{task_id}/budget`、`POST /tasks/{task_id}/budget/approve`。
 - **可观测性**：`GET /tasks/{task_id}/evidence` 与 `GET /tasks/{task_id}/memory` 提供证据和记忆查看，控制台展示预算、证据数量和最新记忆。
@@ -134,9 +134,9 @@ Token 预留采用保守的 UTF-8 字节数启发式估算，包含 2048 Token �
 
 ## 研究数据源：GitHub MCP 与 arXiv
 
-研究岗位新增六个专属工具：github_repo、github_tree、github_read、github_releases、arxiv_search 和 arxiv_paper。GitHub MCP 采用只读模式：Worker 首次调用时懒启动官方 github/github-mcp-server，同一 Worker 生命周期复用；本地 stdio 启动参数同时包含 --read-only 和精确的 --tools 白名单，写操作工具不会注册。未配置 PAT 或 MCP 服务不可用时，工具返回结构化配置错误，研究任务仍可继续使用网页和 PDF 工具。可选远程模式使用 X-MCP-Tools 请求头。
+研究岗位新增六个专属工具：github_repo、github_tree、github_read、github_releases、arxiv_search 和 arxiv_paper。GitHub MCP 默认连接 GitHub 官方托管的远程只读服务（https://api.githubcopilot.com/mcp/readonly），无需在部署环境安装或维护 github-mcp-server。Worker 首次调用时懒初始化并复用 MCP 会话；请求使用 Authorization: Bearer PAT、X-MCP-Readonly: true 和精确的 X-MCP-Tools 白名单。远程服务可能公布默认工具集中的其他只读工具，但应用层只允许调用代码白名单中的七个工具。未配置 PAT 或 MCP 服务不可用时，工具返回结构化配置错误，研究任务仍可继续使用网页和 PDF 工具。
 
-本地模式需要安装官方 github-mcp-server 并加入 PATH，配置 GITHUB_PERSONAL_ACCESS_TOKEN；Docker 或没有本地二进制的环境可设置 GITHUB_MCP_TRANSPORT=remote，使用 https://api.githubcopilot.com/mcp/。PAT 不得提交到仓库。一次 github_read 最多读取 5 个文件，只计一个 Agent 工具步数；适配器要求先通过 github_tree 为每个文件父目录建立大小索引，并使用索引返回的 commit SHA 固定读取版本；在任何文件读取请求前完成路径与文件大小检查。文本快照保存至 sources/github/{commit_sha}/，登记 github_file 类型证据并沿用 [Sxxxx] 编号。未建立索引的路径和超限文件会在发起 MCP 请求前被拒绝。二进制、密钥、危险路径和超过硬大小限制的文件会被拒绝；超过快照阈值但未超过硬限制的文本会截断并明确标记。
+默认配置为 GITHUB_MCP_TRANSPORT=remote，并设置 GITHUB_PERSONAL_ACCESS_TOKEN；PAT 建议使用仅对目标仓库具有必要读取权限的 Fine-grained PAT。PAT 不得提交到仓库。需要本地部署时，可安装官方 github/github-mcp-server 并设置 GITHUB_MCP_TRANSPORT=stdio。一次 github_read 最多读取 5 个文件，只计一个 Agent 工具步数；适配器要求先通过 github_tree 为每个文件父目录建立大小索引，并使用索引返回的 commit SHA 固定读取版本；在任何文件读取请求前完成路径与文件大小检查。文本快照保存至 sources/github/{commit_sha}/，登记 github_file 类型证据并沿用 [Sxxxx] 编号。未建立索引的路径和超限文件会在发起 MCP 请求前被拒绝。二进制、密钥、危险路径和超过硬大小限制的文件会被拒绝；超过快照阈值但未超过硬限制的文本会截断并明确标记。
 
 arxiv_search 和 arxiv_paper 使用 Python 标准库调用 arXiv 官方 Atom API，全局请求间隔至少 3 秒，相同检索式缓存 5 分钟。检索结果和论文元数据登记为 arxiv 类型证据；全文读取复用现有 SSRF 校验、大小限制和 PDF 文本提取流程。不新增 Python 解析依赖。
 

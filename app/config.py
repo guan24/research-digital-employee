@@ -29,10 +29,11 @@ class Settings:
     default_max_attempts: int
     default_max_steps: int
     default_max_runtime_seconds: int
+    model_max_input_tokens: int = 0
     github_personal_access_token: str = ""
-    github_mcp_transport: str = "stdio"
+    github_mcp_transport: str = "remote"
     github_mcp_server_command: str = "github-mcp-server"
-    github_mcp_remote_url: str = "https://api.githubcopilot.com/mcp/"
+    github_mcp_remote_url: str = "https://api.githubcopilot.com/mcp/readonly"
     github_mcp_timeout_seconds: float = 20.0
     github_mcp_max_restarts: int = 1
     github_mcp_max_file_bytes: int = 200_000
@@ -52,6 +53,7 @@ class Settings:
             openai_base_url=os.getenv("OPENAI_BASE_URL", "").strip() or None,
             openai_model=os.getenv("OPENAI_MODEL", "gpt-4.1-mini").strip(),
             model_timeout_seconds=float(os.getenv("MODEL_TIMEOUT_SECONDS", "90")),
+            model_max_input_tokens=int(os.getenv("MODEL_MAX_INPUT_TOKENS", "0")),
             tavily_api_key=os.getenv("TAVILY_API_KEY", "").strip(),
             search_timeout_seconds=float(os.getenv("SEARCH_TIMEOUT_SECONDS", "30")),
             fetch_timeout_seconds=float(os.getenv("FETCH_TIMEOUT_SECONDS", "25")),
@@ -65,9 +67,11 @@ class Settings:
             default_max_steps=int(os.getenv("DEFAULT_MAX_STEPS", "12")),
             default_max_runtime_seconds=int(os.getenv("DEFAULT_MAX_RUNTIME_SECONDS", "3600")),
             github_personal_access_token=os.getenv("GITHUB_PERSONAL_ACCESS_TOKEN", "").strip(),
-            github_mcp_transport=os.getenv("GITHUB_MCP_TRANSPORT", "stdio").strip().lower(),
+            github_mcp_transport=os.getenv("GITHUB_MCP_TRANSPORT", "remote").strip().lower(),
             github_mcp_server_command=os.getenv("GITHUB_MCP_SERVER_COMMAND", "github-mcp-server").strip(),
-            github_mcp_remote_url=os.getenv("GITHUB_MCP_REMOTE_URL", "https://api.githubcopilot.com/mcp/").strip(),
+            github_mcp_remote_url=os.getenv(
+                "GITHUB_MCP_REMOTE_URL", "https://api.githubcopilot.com/mcp/readonly"
+            ).strip(),
             github_mcp_timeout_seconds=float(os.getenv("GITHUB_MCP_TIMEOUT_SECONDS", "20")),
             github_mcp_max_restarts=int(os.getenv("GITHUB_MCP_MAX_RESTARTS", "1")),
             github_mcp_max_file_bytes=int(os.getenv("GITHUB_MCP_MAX_FILE_BYTES", "200000")),
