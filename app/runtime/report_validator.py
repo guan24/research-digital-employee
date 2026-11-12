@@ -61,8 +61,6 @@ class ReportValidator:
     ) -> ReportValidation:
         text = (report or "").strip()
         errors: list[str] = []
-        if len(text) < 300:
-            errors.append("报告正文过短，缺少足以支撑研究结论的内容（至少约 300 个字符）。")
         if not re.search(r"^#\s+\S+", text, re.MULTILINE):
             errors.append("缺少 Markdown 一级标题。")
 
@@ -72,6 +70,8 @@ class ReportValidator:
             body_text = text
         else:
             body_text = text[:source_heading_start]
+        if len(body_text.strip()) < 300:
+            errors.append("报告正文过短，缺少足以支撑研究结论的内容（至少约 300 个字符，不含来源列表）。")
         all_urls = {_normalize_url(value) for value in URL_RE.findall(text)}
         source_urls = {_normalize_url(value) for value in URL_RE.findall(sources_section)}
         if not all_urls:

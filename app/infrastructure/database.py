@@ -789,7 +789,7 @@ class Database:
             state = (
                 "soft_limit" if peak >= 1
                 else ("restricted" if peak >= 0.95
-                      else ("warning" if peak >= 0.8 else "normal"))
+                      else ("warning" if peak >= 0.8 or convergence_active else "normal"))
             )
 
         instruction = (
