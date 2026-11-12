@@ -238,8 +238,10 @@ class ArxivAdapter:
             if blocked:
                 return blocked
             papers, cache_hit, normalized = self.client.search(query, max_results, sort_by, category)
+            self.task_tools.check_control()
             registered = []
             for paper in papers:
+                self.task_tools.check_control()
                 evidence = EvidenceRegistry(self.artifacts).register_source(
                     url=paper["url"], title=paper["title"],
                     content=paper["summary"], source_type="arxiv",
@@ -276,6 +278,7 @@ class ArxivAdapter:
             if blocked:
                 return blocked
             paper = self.client.paper(arxiv_id)
+            self.task_tools.check_control()
             if paper is None:
                 raise ArxivRequestError(
                     f"arXiv paper not found: {arxiv_id}", error_type="not_found",
@@ -299,6 +302,7 @@ class ArxivAdapter:
                     "categories": paper["categories"],
                 },
             )
+            self.task_tools.check_control()
             try:
                 pdf_payload = json.loads(pdf_result)
             except (TypeError, ValueError):
