@@ -136,7 +136,7 @@ Token 预留采用保守的 UTF-8 字节数启发式估算，包含 2048 Token �
 
 研究岗位新增六个专属工具：github_repo、github_tree、github_read、github_releases、arxiv_search 和 arxiv_paper。GitHub MCP 采用只读模式：Worker 首次调用时懒启动官方 github/github-mcp-server，同一 Worker 生命周期复用；本地 stdio 启动参数同时包含 --read-only 和精确的 --tools 白名单，写操作工具不会注册。未配置 PAT 或 MCP 服务不可用时，工具返回结构化配置错误，研究任务仍可继续使用网页和 PDF 工具。可选远程模式使用 X-MCP-Tools 请求头。
 
-本地模式需要安装官方 github-mcp-server 并加入 PATH，配置 GITHUB_PERSONAL_ACCESS_TOKEN；Docker 或没有本地二进制的环境可设置 GITHUB_MCP_TRANSPORT=remote，使用 https://api.githubcopilot.com/mcp/。PAT 不得提交到仓库。一次 github_read 最多读取 5 个文件，只计一个 Agent 工具步数；适配器执行路径安全检查，将文本快照保存至 sources/github/{commit_sha}/，登记 github_file 类型证据并沿用 [Sxxxx] 编号。二进制、密钥、危险路径和超过硬大小限制的文件会被拒绝；超过快照阈值但未超过硬限制的文本会截断并明确标记。
+本地模式需要安装官方 github-mcp-server 并加入 PATH，配置 GITHUB_PERSONAL_ACCESS_TOKEN；Docker 或没有本地二进制的环境可设置 GITHUB_MCP_TRANSPORT=remote，使用 https://api.githubcopilot.com/mcp/。PAT 不得提交到仓库。一次 github_read 最多读取 5 个文件，只计一个 Agent 工具步数；适配器要求先通过 github_tree 为每个文件父目录建立大小索引，并使用索引返回的 commit SHA 固定读取版本；在任何文件读取请求前完成路径与文件大小检查。文本快照保存至 sources/github/{commit_sha}/，登记 github_file 类型证据并沿用 [Sxxxx] 编号。未建立索引的路径和超限文件会在发起 MCP 请求前被拒绝。二进制、密钥、危险路径和超过硬大小限制的文件会被拒绝；超过快照阈值但未超过硬限制的文本会截断并明确标记。
 
 arxiv_search 和 arxiv_paper 使用 Python 标准库调用 arXiv 官方 Atom API，全局请求间隔至少 3 秒，相同检索式缓存 5 分钟。检索结果和论文元数据登记为 arxiv 类型证据；全文读取复用现有 SSRF 校验、大小限制和 PDF 文本提取流程。不新增 Python 解析依赖。
 

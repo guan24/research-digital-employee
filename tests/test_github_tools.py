@@ -91,12 +91,16 @@ def build_service(settings, db, *, client=None, max_file_bytes=None):
 def test_batch_read_registers_four_github_file_sources_and_snapshots_in_one_tool_step(settings, db):
     client = FakeMCPClient()
     task, service, adapter, artifacts = build_service(settings, db, client=client)
+    root_tree = json.loads(adapter.github_tree(REPO))
+    commit_sha = root_tree["commit_sha"]
+    app_tree = json.loads(adapter.github_tree(REPO, "app", commit_sha))
+    assert app_tree["commit_sha"] == commit_sha
     callback = TaskEventCallback(db, task["task_id"], time.monotonic(), 60)
     callback.on_tool_start({"name": "github_read"}, "{}", run_id="one-batch-read")
 
     result = json.loads(adapter.github_read(REPO, [
         "README.md", "app/agent.py", "app/runtime.py", "app/tools.py",
-    ]))
+    ], ref=commit_sha))
 
     current = db.get_task(task["task_id"])
     registry = EvidenceRegistry(artifacts).summary()
@@ -133,6 +137,7 @@ def test_github_repo_tree_and_releases_expose_required_metadata_and_evidence(set
     assert repo_result["stars"] == 123
     assert repo_result["pushed_at"] == "2026-11-10T10:00:00Z"
     assert tree_result["success"] is True
+    assert len(tree_result["commit_sha"]) == 40
     assert {item["path"] for item in tree_result["entries"]} == {"README.md", "app"}
     assert release_result["success"] is True
     assert release_result["releases"][0]["tag_name"] == "v1.2.0"
@@ -239,7 +244,8 @@ def test_github_tools_are_restricted_at_tool_layer_but_artifact_writes_remain_av
 def test_github_file_evidence_satisfies_existing_report_validator(settings, db):
     client = FakeMCPClient()
     task, service, adapter, artifacts = build_service(settings, db, client=client)
-    result = json.loads(adapter.github_read(REPO, ["README.md"]))
+    tree_result = json.loads(adapter.github_tree(REPO))
+    result = json.loads(adapter.github_read(REPO, ["README.md"], ref=tree_result["commit_sha"]))
     source_id = result["files"][0]["source_id"]
     source_url = result["files"][0]["url"]
     report = (
@@ -341,3 +347,13 @@ def test_unavailable_local_server_is_configuration_error_and_task_keeps_running(
     assert result["error_code"] == "GITHUB_MCP_NOT_CONFIGURED"
     assert result["retryable"] is False
     assert current["status"] == "running"
+
+
+def test_github_read_without_cached_tree_metadata_is_rejected_without_network(settings, db):
+    client = FakeMCPClient()
+    task, service, adapter, artifacts = build_service(settings, db, client=client)
+    result = json.loads(adapter.github_read(REPO, ["README.md"]))
+    assert result["success"] is False
+    assert result["error_type"] == "policy_rejected"
+    assert "call github_tree" in result["error"]
+    assert client.calls == []

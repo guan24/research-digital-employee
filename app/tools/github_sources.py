@@ -142,6 +142,7 @@ class GitHubSourceAdapter:
         self.max_file_bytes = max(1024, int(getattr(settings, "github_mcp_max_file_bytes", 200_000)))
         self.snapshot_bytes = min(self.max_file_bytes, 120_000)
         self._tree_cache: dict[tuple[str, str, str], dict[str, dict]] = {}
+        self._tree_commit_cache: dict[tuple[str, str, str], str] = {}
 
     def _record_error(self, operation: str, exc: Exception, *, context: dict | None = None) -> dict:
         if isinstance(exc, GitHubMCPConfigurationError):
@@ -315,14 +316,21 @@ class GitHubSourceAdapter:
             self.db.add_event(self.task_id, "github_tree_index_started", {
                 "repo": repo, "path": safe_dir, "ref": ref,
             })
-            entries, _ = self._directory_entries(owner, name, repo, safe_dir, ref)
+            commit_sha = self._resolve_commit(owner, name, ref)
+            self.task_tools.check_control()
+            entries, index = self._directory_entries(owner, name, repo, safe_dir, commit_sha)
+            # Cache both the caller's ref alias and the immutable commit ref.
+            self._tree_cache[(repo.lower(), ref or "", safe_dir)] = index
+            self._tree_commit_cache[(repo.lower(), ref or "", safe_dir)] = commit_sha
+            self._tree_commit_cache[(repo.lower(), commit_sha, safe_dir)] = commit_sha
             self.task_tools.check_control()
             self.db.add_event(self.task_id, "github_tree_indexed", {
-                "repo": repo, "path": safe_dir, "ref": ref, "entry_count": len(entries),
+                "repo": repo, "path": safe_dir, "ref": ref,
+                "commit_sha": commit_sha, "entry_count": len(entries),
             })
             return json.dumps({
                 "success": True, "repo": repo, "path": safe_dir,
-                "ref": ref, "entries": entries,
+                "ref": ref, "commit_sha": commit_sha, "entries": entries,
             }, ensure_ascii=False, indent=2)
         except TaskControlSignal:
             raise
@@ -355,22 +363,24 @@ class GitHubSourceAdapter:
             return cache[path]
         return None
 
-    def _preflight_file_size(self, owner: str, name: str, repo: str, path: str, ref: str | None):
+    def _preflight_file_size(self, repo: str, path: str, ref: str | None):
         metadata = self._cached_file_metadata(repo, ref, path)
         if metadata is None:
-            parent = str(PurePosixPath(path).parent)
-            if parent == ".":
-                parent = ""
-            _, index = self._directory_entries(owner, name, repo, parent, ref)
-            metadata = index.get(path)
-        if metadata is not None:
-            if metadata.get("type") not in {None, "file"}:
-                raise GitHubPolicyError("only regular text files can be read")
-            size = metadata.get("size")
-            if size is not None and int(size) > self.max_file_bytes:
-                raise GitHubPolicyError(
-                    f"file exceeds GITHUB_MCP_MAX_FILE_BYTES ({self.max_file_bytes} bytes)"
-                )
+            raise GitHubPolicyError(
+                f"file size metadata is not cached for {path}; call github_tree for its parent "
+                "directory first. github_read performs no network request for uncached paths."
+            )
+        if metadata.get("type") not in {None, "file"}:
+            raise GitHubPolicyError("only regular text files can be read")
+        size = metadata.get("size")
+        if size is None:
+            raise GitHubPolicyError(
+                f"GitHub directory metadata did not include a file size for {path}; refusing to fetch it"
+            )
+        if int(size) > self.max_file_bytes:
+            raise GitHubPolicyError(
+                f"file exceeds GITHUB_MCP_MAX_FILE_BYTES ({self.max_file_bytes} bytes)"
+            )
         return metadata
 
     def github_read(self, repo: str, paths: list[str], ref: str | None = None) -> str:
@@ -390,17 +400,32 @@ class GitHubSourceAdapter:
             self.db.add_event(self.task_id, "github_files_read_started", {
                 "repo": repo, "paths": safe_paths, "ref": ref,
             })
+            metadata_by_path = {}
+            commit_candidates = set()
             for path in safe_paths:
-                cached = self._cached_file_metadata(repo, ref, path)
-                if cached is not None and int(cached.get("size") or 0) > self.max_file_bytes:
+                metadata = self._preflight_file_size(repo, path, ref)
+                metadata_by_path[path] = metadata
+                parent = str(PurePosixPath(path).parent)
+                if parent == ".":
+                    parent = ""
+                cache_key = (repo.lower(), ref or "", parent)
+                cached_commit = self._tree_commit_cache.get(cache_key)
+                if not cached_commit and ref and _COMMIT_RE.fullmatch(ref):
+                    cached_commit = ref
+                if not cached_commit:
                     raise GitHubPolicyError(
-                        f"file exceeds GITHUB_MCP_MAX_FILE_BYTES ({self.max_file_bytes} bytes): {path}"
+                        f"commit metadata is not cached for {path}; call github_tree first"
                     )
-            commit_sha = self._resolve_commit(owner, name, ref)
+                commit_candidates.add(cached_commit)
+            if len(commit_candidates) != 1:
+                raise GitHubPolicyError(
+                    "all github_read paths must be indexed at the same immutable commit SHA"
+                )
+            commit_sha = next(iter(commit_candidates))
             files = []
             for path in safe_paths:
                 self.task_tools.check_control()
-                metadata = self._preflight_file_size(owner, name, repo, path, ref)
+                metadata = metadata_by_path[path]
                 args = {"owner": owner, "repo": name, "path": path, "sha": commit_sha}
                 raw = self.client.call_tool("get_file_contents", args)
                 payload = _decode_result(raw, parse_text_json=False)
