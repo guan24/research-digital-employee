@@ -134,7 +134,7 @@ Token 预留采用保守的 UTF-8 字节数启发式估算，包含 2048 Token �
 
 ## 研究数据源：GitHub MCP 与 arXiv
 
-研究岗位新增六个专属工具：github_repo、github_tree、github_read、github_releases、arxiv_search 和 arxiv_paper。GitHub MCP 采用只读模式：Worker 首次调用时懒启动官方 github/github-mcp-server，同一 Worker 生命周期复用；本地 stdio 启动参数同时包含 --read-only 和精确的 --tools 白名单，写操作工具不会注册。未配置 PAT 或 MCP 服务不可用时，工具返回结构化配置错误，研究任务仍可继续使用网页和 PDF 工具。可选远程模式使用 X-MCP-Tools 与 X-MCP-Readonly 请求头。
+研究岗位新增六个专属工具：github_repo、github_tree、github_read、github_releases、arxiv_search 和 arxiv_paper。GitHub MCP 采用只读模式：Worker 首次调用时懒启动官方 github/github-mcp-server，同一 Worker 生命周期复用；本地 stdio 启动参数同时包含 --read-only 和精确的 --tools 白名单，写操作工具不会注册。未配置 PAT 或 MCP 服务不可用时，工具返回结构化配置错误，研究任务仍可继续使用网页和 PDF 工具。可选远程模式使用 X-MCP-Tools 请求头。
 
 本地模式需要安装官方 github-mcp-server 并加入 PATH，配置 GITHUB_PERSONAL_ACCESS_TOKEN；Docker 或没有本地二进制的环境可设置 GITHUB_MCP_TRANSPORT=remote，使用 https://api.githubcopilot.com/mcp/。PAT 不得提交到仓库。一次 github_read 最多读取 5 个文件，只计一个 Agent 工具步数；适配器执行路径安全检查，将文本快照保存至 sources/github/{commit_sha}/，登记 github_file 类型证据并沿用 [Sxxxx] 编号。二进制、密钥、危险路径和超过硬大小限制的文件会被拒绝；超过快照阈值但未超过硬限制的文本会截断并明确标记。
 

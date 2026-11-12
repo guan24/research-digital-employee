@@ -143,7 +143,11 @@ def test_unsafe_binary_and_oversized_paths_are_rejected_before_file_reads(settin
     client = FakeMCPClient()
     task, service, adapter, artifacts = build_service(settings, db, client=client)
 
-    for path in ["/etc/passwd", "../secret.md", ".env", "config/.env.local", "assets/logo.png", "keys/id_rsa"]:
+    for path in [
+        "/etc/passwd", "C:/Windows/win.ini", "../secret.md", ".env",
+        "config/.env.local", "assets/logo.png", "keys/id_rsa",
+        ".aws/credentials", ".ssh/config", ".npmrc",
+    ]:
         result = json.loads(adapter.github_read(REPO, [path]))
         assert result["success"] is False
         assert result["error_type"] == "policy_rejected"
@@ -299,3 +303,41 @@ def test_all_six_source_tools_are_individual_task_step_gated(settings, db):
     for index, name in enumerate(sorted(source_names), start=1):
         callback.on_tool_start({"name": name}, "{}", run_id=f"source-tool-{index}")
     assert db.get_task(task["task_id"])["execution_steps"] == 6
+
+
+def test_permission_denied_is_terminal_and_does_not_retry(settings, db):
+    client = FakeMCPClient()
+    task, service, adapter, artifacts = build_service(settings, db, client=client)
+    client.failures["list_releases"] = GitHubMCPToolError(
+        "403 Forbidden: repository permission denied",
+        error_type="mcp_tool_error", code="GITHUB_MCP_TOOL_ERROR", retryable=False,
+    )
+    result = json.loads(adapter.github_releases(REPO))
+    assert result["error_type"] == "permission_denied"
+    assert result["error_code"] == "GITHUB_PERMISSION_DENIED"
+    assert result["retryable"] is False
+    history = json.loads(db.get_task(task["task_id"])["error_history_json"])
+    assert history[0]["error_code"] == "GITHUB_PERMISSION_DENIED"
+    assert history[0]["retryable"] is False
+
+
+def test_unavailable_local_server_is_configuration_error_and_task_keeps_running(settings, db):
+    from app.tools.github_mcp import GitHubMCPClient
+
+    task = db.create_task("Continue with web sources if local GitHub MCP is unavailable")
+    task = db.claim_next_task("missing-mcp-binary-worker")
+    artifacts = ArtifactStore(settings.workspace_dir, task["task_id"])
+    service = ResearchToolService(settings, db, task["task_id"], artifacts, time.monotonic())
+
+    def missing_binary(*args, **kwargs):
+        raise FileNotFoundError("github-mcp-server not installed")
+
+    client = GitHubMCPClient(token="configured-pat", popen_factory=missing_binary)
+    adapter = GitHubSourceAdapter(settings, db, task["task_id"], artifacts, service, client=client)
+    result = json.loads(adapter.github_repo(REPO))
+    current = db.get_task(task["task_id"])
+
+    assert result["error_type"] == "configuration_error"
+    assert result["error_code"] == "GITHUB_MCP_NOT_CONFIGURED"
+    assert result["retryable"] is False
+    assert current["status"] == "running"

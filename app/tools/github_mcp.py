@@ -327,7 +327,6 @@ class GitHubMCPClient:
             "Accept": "application/json, text/event-stream",
             "Authorization": "Bearer " + self.token,
             "X-MCP-Tools": ",".join(READ_ONLY_GITHUB_TOOLS),
-            "X-MCP-Readonly": "true",
         }
         if self._session_id:
             headers["MCP-Session-Id"] = self._session_id

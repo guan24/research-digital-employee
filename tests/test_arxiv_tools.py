@@ -219,3 +219,17 @@ def test_arxiv_search_is_blocked_in_restricted_budget_state(settings, db):
     assert result["error_type"] == "budget_intercept"
     assert result["tool"] == "arxiv_search"
     assert client.called is False
+
+
+def test_arxiv_search_caps_max_results_at_twenty():
+    ArxivClient.reset_process_state_for_tests()
+    requests = []
+
+    def opener(request, timeout):
+        requests.append(request.full_url)
+        return FakeResponse(ATOM)
+
+    client = ArxivClient(urlopen_factory=opener)
+    client.search("large result set", max_results=99)
+    query = parse_qs(urlparse(requests[0]).query)
+    assert query["max_results"] == ["20"]

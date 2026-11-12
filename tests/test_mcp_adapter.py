@@ -93,7 +93,8 @@ class FakeProcess:
         self.messages.put(None)
 
 
-def test_local_server_is_started_with_server_side_read_only_allow_list():
+def test_local_server_is_started_with_server_side_read_only_allow_list(monkeypatch):
+    monkeypatch.setenv("GITHUB_TOOLSETS", "all")
     processes = []
     calls = []
 
@@ -115,6 +116,7 @@ def test_local_server_is_started_with_server_side_read_only_allow_list():
     assert env["env"]["GITHUB_PERSONAL_ACCESS_TOKEN"] == "test-pat"
     assert env["env"]["GITHUB_TOOLS"] == ",".join(READ_ONLY_GITHUB_TOOLS)
     assert env["env"]["GITHUB_READ_ONLY"] == "true"
+    assert "GITHUB_TOOLSETS" not in env["env"]
     assert set(client.server_tools) == set(READ_ONLY_GITHUB_TOOLS)
     client.close()
 
@@ -249,3 +251,62 @@ def test_remote_transport_sends_server_side_read_only_headers():
         assert headers["x-mcp-readonly"] == "true"
         assert headers["authorization"] == "Bearer remote-test-pat"
     client.close()
+
+
+def test_remote_http_403_is_permission_denied_not_configuration_or_retryable():
+    import io
+    import urllib.error
+
+    class Response:
+        def __init__(self, payload, status=200):
+            self.payload = payload
+            self.status = status
+            self.headers = {"Content-Type": "application/json", "MCP-Session-Id": "permission-session"}
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *args):
+            return False
+
+        def read(self):
+            return self.payload
+
+    def opener(request, timeout):
+        message = json.loads(request.data.decode("utf-8"))
+        if message["method"] == "initialize":
+            return Response(json.dumps({
+                "jsonrpc": "2.0", "id": message["id"], "result": {"protocolVersion": "2024-11-05"},
+            }).encode())
+        if message["method"] == "notifications/initialized":
+            return Response(b"", status=202)
+        if message["method"] == "tools/list":
+            return Response(json.dumps({
+                "jsonrpc": "2.0", "id": message["id"],
+                "result": {"tools": [{"name": name} for name in READ_ONLY_GITHUB_TOOLS]},
+            }).encode())
+        raise urllib.error.HTTPError(
+            request.full_url, 403, "Forbidden", {"Content-Type": "application/json"},
+            io.BytesIO(b'{"message":"Resource not accessible by integration"}'),
+        )
+
+    from app.tools.github_mcp import GitHubMCPToolError
+    client = GitHubMCPClient(
+        token="permission-pat", transport="remote",
+        remote_url="https://api.githubcopilot.com/mcp/", urlopen_factory=opener,
+    )
+    with pytest.raises(GitHubMCPToolError) as captured:
+        client.call_tool("get_file_contents", {"owner": "octo", "repo": "private"})
+    assert captured.value.error_type == "permission_denied"
+    assert captured.value.code == "GITHUB_PERMISSION_DENIED"
+    assert captured.value.retryable is False
+    client.close()
+
+
+def test_missing_official_server_binary_is_a_nonretryable_configuration_error():
+    def missing_binary(*args, **kwargs):
+        raise FileNotFoundError("not installed")
+
+    client = GitHubMCPClient(token="configured-pat", popen_factory=missing_binary)
+    with pytest.raises(GitHubMCPConfigurationError, match="Install github-mcp-server"):
+        client.call_tool("get_file_contents", {"owner": "octo", "repo": "demo"})

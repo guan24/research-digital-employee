@@ -27,6 +27,8 @@ _BINARY_SUFFIXES = {
 _SECRET_PARTS = {
     "id_rsa", "id_ed25519", "id_ecdsa", "credentials", "credential",
     "secrets", "secret", "password", "passwd", "token", "private_key",
+    ".ssh", ".aws", ".gnupg", ".kube", ".npmrc", ".pypirc", ".netrc",
+    ".dockerconfigjson",
 }
 _OWNER_REPO = re.compile(r"^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$")
 _COMMIT_RE = re.compile(r"^[0-9a-fA-F]{40}$")
@@ -50,7 +52,10 @@ def validate_github_path(path: str) -> str:
     value = str(path or "").strip()
     if not value:
         raise GitHubPolicyError("file path cannot be empty")
-    if value.startswith(("/", "~")) or "\\" in value:
+    if (
+        value.startswith(("/", "~")) or "\\" in value
+        or re.match(r"^[A-Za-z]:[/\\]", value)
+    ):
         raise GitHubPolicyError("absolute paths and backslash paths are not allowed")
     pure = PurePosixPath(value)
     if pure.is_absolute() or any(part in {"..", ".", "", "~"} for part in pure.parts):
