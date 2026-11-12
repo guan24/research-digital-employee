@@ -29,3 +29,19 @@ def test_langchain_model_profile_is_used_when_no_override_is_configured():
 def test_unknown_openai_compatible_model_uses_conservative_fallback():
     trigger_tokens, keep_tokens = resolve_summarization_token_limits("vendor/custom-model")
     assert (trigger_tokens, keep_tokens) == (99_840, 23_040)
+
+def test_task_budget_caps_summarization_for_large_context_models():
+    trigger_tokens, keep_tokens = resolve_summarization_token_limits(
+        "qwen3.8-flash",
+        task_max_total_tokens=100_000,
+    )
+    assert (trigger_tokens, keep_tokens) == (22_000, 8_000)
+
+
+def test_small_task_budget_still_keeps_a_valid_summarization_window():
+    trigger_tokens, keep_tokens = resolve_summarization_token_limits(
+        "vendor/custom-model",
+        task_max_total_tokens=10_000,
+    )
+    assert trigger_tokens == 2_200
+    assert keep_tokens == 800

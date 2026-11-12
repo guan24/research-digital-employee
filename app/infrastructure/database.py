@@ -5,9 +5,15 @@ import sqlite3
 import time
 import uuid
 from contextlib import contextmanager, closing
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Iterator
-from datetime import datetime, timezone
+
+from app.infrastructure.budget_policy import (
+    convergence_reserve_runtime_seconds,
+    convergence_reserve_tokens,
+    convergence_reserve_tool_calls,
+)
 
 
 TASK_STATUSES = {"queued", "running", "retry_wait", "paused", "completed", "failed", "cancelled", "deleting"}
@@ -497,8 +503,15 @@ class Database:
             conn.execute("UPDATE tasks SET error_category=?,error_code=?,first_error_json=?,error_history_json=?,last_error=? WHERE task_id=?",(category,code,first,json.dumps(history,ensure_ascii=False),str(error)[:4000],task_id))
         return {"first_error":json.loads(first),"error_history":history}
 
-    def reserve_tokens(self, task_id: str, reservation_id: str, estimate: int, worker_id: str | None = None, generation: int | None = None) -> dict[str, Any]:
-        """Atomically reserve model-call tokens before the provider request."""
+    def reserve_tokens(
+        self,
+        task_id: str,
+        reservation_id: str,
+        estimate: int,
+        worker_id: str | None = None,
+        generation: int | None = None,
+    ) -> dict[str, Any]:
+        """Reserve model-call tokens atomically while protecting the convergence pool."""
         amount = max(1, int(estimate))
         with self.transaction() as conn:
             row = conn.execute("SELECT * FROM tasks WHERE task_id=?", (task_id,)).fetchone()
@@ -509,32 +522,83 @@ class Database:
                 or (generation is not None and row["worker_generation"] != generation)
             ):
                 return {"allowed": False, "reason": "stale_generation"}
+
             existing = conn.execute(
                 "SELECT reserved_tokens,settled,generation FROM token_reservations WHERE task_id=? AND reservation_id=?",
                 (task_id, reservation_id),
             ).fetchone()
             if existing and generation is not None and int(existing["generation"]) != int(generation):
                 return {"allowed": False, "reason": "stale_reservation_generation"}
-            remaining = int(row["max_total_tokens"]) - int(row["total_tokens_used"]) - int(row["reserved_tokens"])
+
+            limit = max(0, int(row["max_total_tokens"] or 0))
+            used = int(row["total_tokens_used"] or 0)
+            reserved = int(row["reserved_tokens"] or 0)
+            remaining = max(0, limit - used - reserved)
+            enabled = bool(row["budget_enabled"])
+            reserve = convergence_reserve_tokens(limit) if enabled else 0
+            exploration_limit = max(0, limit - reserve)
+            projected = used + reserved + amount
+            phase = (
+                "convergence" if enabled and limit and projected > exploration_limit
+                else ("research" if enabled else "unbounded")
+            )
+
             if existing:
                 return {
-                    "allowed": True, "already_reserved": not bool(existing["settled"]),
+                    "allowed": True,
+                    "already_reserved": not bool(existing["settled"]),
                     "already_settled": bool(existing["settled"]),
                     "reserved": 0 if existing["settled"] else int(existing["reserved_tokens"]),
-                    "remaining": max(0, remaining),
+                    "remaining": remaining,
+                    "phase": "convergence" if enabled and used + reserved >= exploration_limit else phase,
+                    "convergence_reserve_tokens": reserve,
+                    "exploration_remaining": max(0, exploration_limit - used - reserved),
                 }
-            if row["budget_enabled"] and amount > remaining:
+
+            if enabled and amount > remaining:
                 payload = {
-                    "dimension": "tokens", "gate": "before_model_call",
-                    "requested": amount, "used": int(row["total_tokens_used"]),
-                    "reserved": int(row["reserved_tokens"]), "limit": int(row["max_total_tokens"]),
-                    "remaining": max(0, remaining), "generation": int(row["worker_generation"]),
+                    "dimension": "tokens",
+                    "gate": "before_model_call",
+                    "requested": amount,
+                    "used": used,
+                    "reserved": reserved,
+                    "limit": limit,
+                    "remaining": remaining,
+                    "convergence_reserve_tokens": reserve,
+                    "exploration_limit": exploration_limit,
+                    "phase": phase,
+                    "generation": int(row["worker_generation"] or 0),
                 }
                 conn.execute(
                     "INSERT INTO events(task_id,timestamp,event_type,payload_json) VALUES(?,?,?,?)",
                     (task_id, utc_now(), "budget_call_rejected", json.dumps(payload, ensure_ascii=False)),
                 )
                 return {"allowed": False, "reason": "token_budget_exhausted", **payload}
+
+            if phase == "convergence":
+                exists = conn.execute(
+                    "SELECT 1 FROM events WHERE task_id=? AND event_type='budget_convergence_started' LIMIT 1",
+                    (task_id,),
+                ).fetchone()
+                if not exists:
+                    conn.execute(
+                        "INSERT INTO events(task_id,timestamp,event_type,payload_json) VALUES(?,?,?,?)",
+                        (
+                            task_id, utc_now(), "budget_convergence_started",
+                            json.dumps({
+                                "dimension": "tokens",
+                                "used": used,
+                                "reserved": reserved,
+                                "requested": amount,
+                                "limit": limit,
+                                "exploration_limit": exploration_limit,
+                                "convergence_reserve_tokens": reserve,
+                                "convergence_remaining_before_call": remaining,
+                                "policy": "stop exploration; reserve tokens for synthesis, persistence and repair",
+                            }, ensure_ascii=False),
+                        ),
+                    )
+
             conn.execute(
                 "INSERT INTO token_reservations(task_id,reservation_id,reserved_tokens,generation) VALUES(?,?,?,?)",
                 (task_id, reservation_id, amount, int(generation or 0)),
@@ -544,8 +608,12 @@ class Database:
                 (amount, task_id),
             )
             return {
-                "allowed": True, "reserved": amount,
+                "allowed": True,
+                "reserved": amount,
                 "remaining": max(0, remaining - amount),
+                "phase": phase,
+                "convergence_reserve_tokens": reserve,
+                "exploration_remaining": max(0, exploration_limit - used - reserved - amount),
             }
 
     def release_pending_token_reservations(self, task_id: str) -> int:
@@ -676,24 +744,135 @@ class Database:
             )
             return amount
 
+    def record_budget_convergence_started(self, task_id: str, status: dict[str, Any]) -> bool:
+        """Persist one convergence-start event regardless of which budget dimension triggered it."""
+        convergence = status.get("convergence") or {}
+        dimensions = status.get("dimensions") or {}
+        payload = {
+            "trigger_dimension": status.get("trigger_dimension"),
+            "active_dimensions": convergence.get("active_dimensions", []),
+            "reserve": {
+                "tokens": convergence.get("reserve_tokens", 0),
+                "tool_calls": convergence.get("reserve_tool_calls", 0),
+                "runtime_seconds": convergence.get("reserve_runtime_seconds", 0),
+            },
+            "remaining": {
+                name: item.get("convergence_remaining", 0)
+                for name, item in dimensions.items()
+            },
+            "policy": "exploration stopped; protected resources reserved for synthesis, persistence and repair",
+        }
+        with self.transaction() as conn:
+            exists = conn.execute(
+                "SELECT 1 FROM events WHERE task_id=? AND event_type='budget_convergence_started' LIMIT 1",
+                (task_id,),
+            ).fetchone()
+            if exists:
+                return False
+            conn.execute(
+                "INSERT INTO events(task_id,timestamp,event_type,payload_json) VALUES(?,?,?,?)",
+                (task_id, utc_now(), "budget_convergence_started", json.dumps(payload, ensure_ascii=False)),
+            )
+        return True
+
     def get_budget_status(self, task_id: str) -> dict[str, Any]:
-        task=self.get_task(task_id)
-        if not task: return {"enabled":False,"state":"missing","dimensions":{}}
-        now=time.time(); accounted=task.get("runtime_last_accounted_at") or task.get("heartbeat_at") or now
-        runtime=float(task.get("runtime_seconds_used") or 0)
-        if task.get("status")=="running": runtime+=max(0.0,now-float(accounted))
-        dimensions={"tool_calls":{"used":int(task.get("execution_steps") or 0),"limit":int(task.get("max_steps") or 0)},
-          "runtime_seconds":{"used":round(runtime,2),"limit":int(task.get("max_runtime_seconds") or 0)},
-          "tokens":{"used":int(task.get("total_tokens_used") or 0),"reserved":int(task.get("reserved_tokens") or 0),"limit":int(task.get("max_total_tokens") or 0)}}
-        for item in dimensions.values():
-            item["remaining"]=max(0,item["limit"]-item["used"]-int(item.get("reserved",0)))
-            item["ratio"]=(item["used"]+int(item.get("reserved",0)))/item["limit"] if item["limit"] else 0
-        enabled=bool(task.get("budget_enabled",1)); ratios={k:v["ratio"] for k,v in dimensions.items()}
-        trigger=max(ratios,key=ratios.get); peak=max(ratios.values(),default=0)
-        state="disabled" if not enabled else ("soft_limit" if peak>=1 else ("restricted" if peak>=.95 else ("warning" if peak>=.8 else "normal")))
-        return {"enabled":enabled,"state":state,"trigger_dimension":trigger,"dimensions":dimensions,
-          "policy":"hard tool/runtime gates; token reservation before provider call",
-          "instruction":"Stop exploration and finish using saved evidence." if state in {"restricted","soft_limit"} else "Budget warning; converge." if state=="warning" else "Budget normal."}
+        task = self.get_task(task_id)
+        if not task:
+            return {"enabled": False, "state": "missing", "phase": "unbounded", "dimensions": {}}
+
+        now = time.time()
+        accounted = task.get("runtime_last_accounted_at") or task.get("heartbeat_at") or now
+        runtime = float(task.get("runtime_seconds_used") or 0)
+        if task.get("status") == "running":
+            runtime += max(0.0, now - float(accounted))
+
+        dimensions = {
+            "tool_calls": {"used": int(task.get("execution_steps") or 0), "limit": int(task.get("max_steps") or 0)},
+            "runtime_seconds": {"used": round(runtime, 2), "limit": int(task.get("max_runtime_seconds") or 0)},
+            "tokens": {
+                "used": int(task.get("total_tokens_used") or 0),
+                "reserved": int(task.get("reserved_tokens") or 0),
+                "limit": int(task.get("max_total_tokens") or 0),
+            },
+        }
+        enabled = bool(task.get("budget_enabled", 1))
+        reserve_by_dimension = {
+            "tool_calls": convergence_reserve_tool_calls,
+            "runtime_seconds": convergence_reserve_runtime_seconds,
+            "tokens": convergence_reserve_tokens,
+        }
+        active_dimensions = []
+        ratios = {}
+        for name, item in dimensions.items():
+            used = int(item["used"])
+            reserved = int(item.get("reserved", 0))
+            limit = int(item["limit"])
+            reserve = reserve_by_dimension[name](limit) if enabled else 0
+            exploration_limit = max(0, limit - reserve)
+            consumed = used + reserved
+            item["remaining"] = max(0, limit - consumed)
+            item["ratio"] = consumed / limit if limit else 0
+            item["convergence_reserve"] = reserve
+            item["exploration_limit"] = exploration_limit
+            item["exploration_remaining"] = max(0, exploration_limit - consumed)
+            item["convergence_remaining"] = max(0, limit - consumed)
+            ratios[name] = item["ratio"]
+            if enabled and limit > 0 and consumed >= exploration_limit:
+                active_dimensions.append(name)
+
+        convergence_active = bool(active_dimensions)
+        if convergence_active:
+            trigger = max(
+                active_dimensions,
+                key=lambda name: (
+                    (dimensions[name]["used"] + int(dimensions[name].get("reserved", 0)))
+                    / max(1, dimensions[name]["exploration_limit"])
+                ),
+            )
+        else:
+            trigger = max(ratios, key=ratios.get)
+        peak = max(ratios.values(), default=0)
+        if not enabled:
+            state, phase = "disabled", "unbounded"
+        else:
+            phase = "convergence" if convergence_active else "research"
+            state = (
+                "soft_limit" if peak >= 1
+                else ("restricted" if peak >= 0.95
+                      else ("warning" if peak >= 0.8 or convergence_active else "normal"))
+            )
+
+        instruction = (
+            "Convergence reserve active: stop new searches and source reads. Use registered evidence and saved notes; write, read back, validate and deliver the report."
+            if phase == "convergence"
+            else (
+                "Budget warning: stop low-value exploration and prepare synthesis."
+                if state == "warning"
+                else ("Budget gates are disabled for this task." if not enabled else "Budget normal.")
+            )
+        )
+        result = {
+            "enabled": enabled,
+            "state": state,
+            "phase": phase,
+            "trigger_dimension": trigger,
+            "dimensions": dimensions,
+            "convergence": {
+                "active": convergence_active,
+                "active_dimensions": active_dimensions,
+                "reserve_tokens": dimensions["tokens"]["convergence_reserve"],
+                "reserve_tool_calls": dimensions["tool_calls"]["convergence_reserve"],
+                "reserve_runtime_seconds": dimensions["runtime_seconds"]["convergence_reserve"],
+                "remaining_tokens": dimensions["tokens"]["convergence_remaining"],
+                "remaining_tool_calls": dimensions["tool_calls"]["convergence_remaining"],
+                "remaining_runtime_seconds": dimensions["runtime_seconds"]["convergence_remaining"],
+            },
+            "policy": "hard total limits; exploration stops at per-dimension reserve thresholds; 30% tokens, 25% tool calls and 20% runtime protected for convergence",
+            "instruction": instruction,
+        }
+        if phase == "convergence":
+            self.record_budget_convergence_started(task_id, result)
+        return result
 
     def approve_budget_extension(self, task_id: str, *, reason: str,
                                  additional_steps: int = 0,

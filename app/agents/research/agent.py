@@ -24,13 +24,9 @@ def resolve_summarization_token_limits(
     model_name: str,
     configured_max_input_tokens: int = 0,
     model_profile: Mapping[str, Any] | None = None,
+    task_max_total_tokens: int = 0,
 ) -> tuple[int, int]:
-    """Return absolute (trigger, keep) token limits for context summarization.
-
-    An explicit environment setting wins, followed by LangChain model metadata and
-    known OpenAI-compatible model limits. Unknown compatible models use a conservative
-    128k fallback; set MODEL_MAX_INPUT_TOKENS to match their documented input window.
-    """
+    """Bound context compaction by both the provider window and the task token budget."""
     max_input_tokens = int(configured_max_input_tokens or 0)
     if max_input_tokens <= 0 and isinstance(model_profile, Mapping):
         profile_limit = model_profile.get("max_input_tokens")
@@ -47,8 +43,11 @@ def resolve_summarization_token_limits(
 
     trigger_tokens = max(1, int(max_input_tokens * 0.78))
     keep_tokens = max(1, int(max_input_tokens * 0.18))
+    task_budget = max(0, int(task_max_total_tokens or 0))
+    if task_budget:
+        trigger_tokens = min(trigger_tokens, max(512, int(task_budget * 0.22)))
+        keep_tokens = min(keep_tokens, max(256, int(task_budget * 0.08)), max(1, trigger_tokens // 2))
     return trigger_tokens, keep_tokens
-
 
 def build_research_agent(
     settings: Settings,
@@ -99,6 +98,7 @@ def build_research_agent(
         settings.openai_model,
         getattr(settings, "model_max_input_tokens", 0),
         getattr(model, "profile", None),
+        int(task.get("max_total_tokens") or 0),
     )
     summarization = SummarizationMiddleware(
         model=model,

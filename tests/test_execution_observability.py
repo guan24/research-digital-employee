@@ -5,7 +5,7 @@ from pathlib import Path
 from types import SimpleNamespace
 
 from app.infrastructure.artifact_store import ArtifactStore
-from app.runtime.executor import ResearchExecutor, TaskEventCallback
+from app.runtime.executor import ResearchExecutor, TaskEventCallback, extract_final_text
 from app.tools.research_tools import ResearchToolService
 
 
@@ -293,3 +293,63 @@ def test_plan_text_fallback_extracts_markdown_steps(settings, db):
     plan = event["payload"]["plan"]
     assert plan["title"] == "执行计划（文本提取）"
     assert [step["title"] for step in plan["steps"]] == ["明确研究范围", "搜索官方资料", "对比并撰写报告"]
+
+def test_model_callback_surfaces_malformed_tool_arguments_and_anomaly_event(settings, db):
+    task, _ = make_service(settings, db)
+    callback = TaskEventCallback(db, task["task_id"], __import__("time").monotonic(), 3600)
+    message = SimpleNamespace(
+        content="",
+        tool_calls=[],
+        invalid_tool_calls=[{
+            "name": "update_research_plan",
+            "args": "{\"steps\":[",
+            "error": "arguments were malformed or truncated",
+        }],
+        additional_kwargs={"refusal": None},
+        response_metadata={"finish_reason": "length"},
+        usage_metadata={"input_tokens": 100, "output_tokens": 2048, "total_tokens": 2148},
+    )
+    callback.on_llm_end(
+        SimpleNamespace(generations=[[SimpleNamespace(message=message, text="")]], llm_output={}),
+        run_id="invalid-tool-call",
+    )
+    events = db.get_events(task["task_id"])
+    completed = [event for event in events if event["event_type"] == "model_call_completed"][-1]
+    anomaly = [event for event in events if event["event_type"] == "model_response_anomaly"][-1]
+
+    assert "无法解析的工具调用" in completed["payload"]["decision_summary"]
+    assert "malformed or truncated" in completed["payload"]["decision_summary"]
+    assert anomaly["payload"]["kind"] == "invalid_tool_calls"
+
+
+def test_model_callback_distinguishes_a_true_empty_response_from_tool_only_turn(settings, db):
+    task, _ = make_service(settings, db)
+    callback = TaskEventCallback(db, task["task_id"], __import__("time").monotonic(), 3600)
+    message = SimpleNamespace(
+        content="",
+        tool_calls=[],
+        invalid_tool_calls=[],
+        additional_kwargs={"refusal": None},
+        response_metadata={},
+        usage_metadata={"input_tokens": 11, "output_tokens": 0, "total_tokens": 11},
+    )
+    callback.on_llm_end(
+        SimpleNamespace(generations=[[SimpleNamespace(message=message, text="")]], llm_output={}),
+        run_id="empty-response",
+    )
+    events = db.get_events(task["task_id"])
+    completed = [event for event in events if event["event_type"] == "model_call_completed"][-1]
+    anomaly = [event for event in events if event["event_type"] == "model_response_anomaly"][-1]
+
+    assert "模型返回空响应" in completed["payload"]["decision_summary"]
+    assert completed["payload"]["response_kind"] == "empty"
+    assert anomaly["payload"]["kind"] == "empty"
+
+
+def test_final_text_extraction_does_not_fall_back_to_an_earlier_progress_message():
+    result = {"messages": [
+        {"role": "assistant", "content": "I will start the research now."},
+        {"role": "tool", "content": "Evidence was saved."},
+        {"role": "assistant", "content": ""},
+    ]}
+    assert extract_final_text(result) == ""

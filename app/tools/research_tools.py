@@ -375,7 +375,7 @@ class ResearchToolService(TaskToolService):
                         "success": True,
                         "url": final_url,
                         "title": title,
-                        "text": text[:14_000],
+                        "text": text[:8_000],
                         "saved_to": artifact_path,
                         "source_id": evidence["source_id"],
                         "attempts": attempt,
@@ -518,8 +518,8 @@ class ResearchToolService(TaskToolService):
     def save_artifact(self, path: str, content: str) -> str:
         return super().save_artifact(path, content)
 
-    def read_artifact(self, path: str) -> str:
-        return super().read_artifact(path)
+    def read_artifact(self, path: str, start_char: int = 0, max_chars: int = 8_000) -> str:
+        return super().read_artifact(path, start_char, max_chars)
 
     def list_artifacts(self) -> str:
         return super().list_artifacts()
@@ -1018,7 +1018,9 @@ class ResearchToolService(TaskToolService):
     def as_langchain_tools(self):
         @tool("update_research_plan")
         def update_research_plan_tool(
-            plan_json: str,
+            title: str,
+            objective: str,
+            steps: list[dict[str, str]],
             change_reason: str = "",
             trigger: str = "",
             new_information: str = "",
@@ -1026,19 +1028,18 @@ class ResearchToolService(TaskToolService):
             decision: str = "",
             changes: str = "",
         ) -> str:
-            """Create the initial overall research plan or record a material strategic replan.
-            Pass plan_json as JSON with title, objective and ordered steps [{id,title,objective,expected_output}].
-            Do NOT call this tool for routine step progress, searches, reads, or step completion.
-            For every later replan, explain trigger, new_information, problem_analysis, decision and changes.
-            The system records only meaningful plan revisions, not per-step status updates."""
+            """Create or materially revise the overall plan.
+            Supply title, objective and ordered step objects with id, title, objective and expected_output.
+            Do not send a JSON document inside a string argument.
+            Do not call for routine progress updates; use update_plan_step_status for those.
+            Every later strategic replan must explain trigger, new_information, problem_analysis, decision and changes."""
+            plan_json = json.dumps(
+                {"title": title, "objective": objective, "steps": steps},
+                ensure_ascii=False,
+            )
             return self.update_research_plan(
-                plan_json,
-                change_reason,
-                trigger,
-                new_information,
-                problem_analysis,
-                decision,
-                changes,
+                plan_json, change_reason, trigger, new_information,
+                problem_analysis, decision, changes,
             )
 
         @tool("update_plan_step_status")
@@ -1121,9 +1122,9 @@ class ResearchToolService(TaskToolService):
             return self.save_artifact(path, content)
 
         @tool("read_artifact")
-        def read_artifact_tool(path: str) -> str:
-            """Read a previously saved research artifact from the current task workspace."""
-            return self.read_artifact(path)
+        def read_artifact_tool(path: str, start_char: int = 0, max_chars: int = 8_000) -> str:
+            """Read a bounded chunk from a task artifact; continue large files with start_char."""
+            return self.read_artifact(path, start_char, max_chars)
 
         @tool("list_artifacts")
         def list_artifacts_tool() -> str:

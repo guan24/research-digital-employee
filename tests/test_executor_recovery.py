@@ -5,6 +5,7 @@ from pathlib import Path
 from types import SimpleNamespace
 
 from app.infrastructure.artifact_store import ArtifactStore
+from app.infrastructure.evidence_registry import EvidenceRegistry
 from app.runtime.executor import ResearchExecutor
 
 
@@ -17,7 +18,7 @@ class FakeAgent:
     def __init__(self, snapshot=None, result=None):
         self.snapshot = snapshot
         self.result = result or {"messages": [{"role": "assistant", "content": (
-            "# Research report\n\n## 摘要\n\n" + ("Evidence-backed result and analysis. " * 12)
+            "# Research report\n\n## 摘要\n\n" + ("Evidence-backed result and analysis is supported by the registered primary source [S0001]. " * 8)
             + "\n\n## Sources\n- https://example.org/research-source"
         )}]}
         self.invocations = []
@@ -32,6 +33,15 @@ class FakeAgent:
         return self.result
 
 
+def _register_evidence(settings, task):
+    artifacts = ArtifactStore(settings.workspace_dir, task["task_id"])
+    return EvidenceRegistry(artifacts).register_source(
+        url="https://example.org/research-source",
+        title="Registered primary source",
+        content="Verified primary evidence supporting the research report. " * 20,
+    )
+
+
 def _make_runner(settings, db, agent):
     def builder(_settings, _db, _task, _checkpointer, _started):
         return agent
@@ -42,6 +52,7 @@ def _make_runner(settings, db, agent):
 def test_executor_starts_new_task_without_checkpoint(settings, db):
     task = db.create_task("Research a topic with enough detail")
     task = db.claim_next_task("worker-a")
+    _register_evidence(settings, task)
     agent = FakeAgent(snapshot=None)
     runner = _make_runner(settings, db, agent)
     report_path = runner.run(task)
@@ -52,6 +63,7 @@ def test_executor_starts_new_task_without_checkpoint(settings, db):
 def test_executor_resumes_pending_graph_from_checkpoint(settings, db):
     task = db.create_task("Research a topic with enough detail")
     task = db.claim_next_task("worker-a")
+    _register_evidence(settings, task)
     snapshot = SimpleNamespace(next=("agent",), values={"messages": []})
     agent = FakeAgent(snapshot=snapshot)
     runner = _make_runner(settings, db, agent)
@@ -63,11 +75,12 @@ def test_executor_resumes_pending_graph_from_checkpoint(settings, db):
 def test_executor_recovers_completed_checkpoint_without_reinvoking(settings, db):
     task = db.create_task("Research a topic with enough detail")
     task = db.claim_next_task("worker-a")
+    _register_evidence(settings, task)
     snapshot = SimpleNamespace(
         next=(),
         values={"messages": [{"role": "assistant", "content": (
-                "# Already completed\n\n## 摘要\n\n" + ("Saved from checkpoint evidence. " * 12)
-                + "\n\n## Sources\n- https://example.org/checkpoint-source"
+                "# Already completed\n\n## 摘要\n\n" + ("Saved from checkpoint evidence and verified by the registered primary source [S0001]. " * 8)
+                + "\n\n## Sources\n- https://example.org/research-source"
             )}]},
     )
     agent = FakeAgent(snapshot=snapshot)
@@ -81,6 +94,7 @@ def test_executor_recovers_completed_checkpoint_without_reinvoking(settings, db)
 def test_manual_retry_resumes_original_checkpoint_thread_id(settings, db):
     task = db.create_task("Research a topic with enough detail", max_attempts=1)
     claimed = db.claim_next_task("worker-a")
+    _register_evidence(settings, claimed)
     assert db.schedule_retry(
         claimed, "OpenAI API quota exhausted", 0, "worker-a"
     ) == "failed"
@@ -168,3 +182,73 @@ def test_minimal_second_role_owns_artifact_and_finalizer(settings, db):
     assert Path(output).read_text(encoding="utf-8") == "A concise operations brief.\n"
     runner.finalize_task(task["task_id"], "completed")
     assert calls == [(task["task_id"], "completed", True)]
+
+def test_executor_retries_once_when_final_model_turn_is_empty(settings, db):
+    from app.agents.registry import register_agent
+
+    role = "empty_response_probe_" + __import__("uuid").uuid4().hex[:8]
+    class EmptyThenTextAgent:
+        def __init__(self):
+            self.calls = 0
+        def get_state(self, config):
+            return None
+        def invoke(self, payload, config):
+            self.calls += 1
+            content = "" if self.calls == 1 else "# Recovered artifact\n\nA complete persisted deliverable."
+            return {"messages": [{"role": "assistant", "content": content}]}
+
+    agent = EmptyThenTextAgent()
+    register_agent(role, lambda *_args: agent, output_artifact="reports/recovered.md")
+    task = db.create_task("Recover a missing final response", agent_type=role)
+    task = db.claim_next_task("worker-empty")
+    runner = ResearchExecutor(settings, db, checkpointer_factory=fake_checkpointer)
+
+    output = runner.run(task)
+    assert agent.calls == 2
+    assert Path(output).read_text(encoding="utf-8").startswith("# Recovered artifact")
+    assert any(event["event_type"] == "model_empty_final_response_recovery_started" for event in db.get_events(task["task_id"]))
+    assert any(event["event_type"] == "artifact_persisted_verified" for event in db.get_events(task["task_id"]))
+
+
+def test_executor_persists_repair_response_when_agent_does_not_call_save_artifact(settings, db):
+    from app.agents.registry import register_agent
+
+    role = "repair_response_probe_" + __import__("uuid").uuid4().hex[:8]
+    valid_report = (
+        "# Repaired report\n\n## 摘要\n\n"
+        + ("The repaired analysis is complete and supported by the available research evidence. " * 8)
+        + "\n\n## Sources\n- https://example.org/repaired"
+    )
+    class RepairAgent:
+        def __init__(self):
+            self.calls = 0
+        def get_state(self, config):
+            return None
+        def invoke(self, payload, config):
+            self.calls += 1
+            content = "Initial invalid draft." if self.calls == 1 else valid_report
+            return {"messages": [{"role": "assistant", "content": content}]}
+
+    agent = RepairAgent()
+    def validator(content, task, artifacts):
+        return "Repaired report" in content
+    def postprocessor(current_agent, result, config, task, artifacts, validation):
+        return current_agent.invoke({"messages": [{"role": "user", "content": "repair"}]}, config=config)
+
+    register_agent(
+        role, lambda *_args: agent,
+        output_artifact="reports/repaired.md",
+        validator=validator,
+        postprocessor=postprocessor,
+        max_revisions=1,
+    )
+    task = db.create_task("Exercise repair response persistence", agent_type=role)
+    task = db.claim_next_task("worker-repair")
+    runner = ResearchExecutor(settings, db, checkpointer_factory=fake_checkpointer)
+
+    output = runner.run(task)
+    persisted = Path(output).read_text(encoding="utf-8")
+    events = db.get_events(task["task_id"])
+    assert "Repaired report" in persisted
+    assert any(event["event_type"] == "report_delivered" for event in events)
+    assert sum(event["event_type"] == "delivery_validation_completed" for event in events) == 2
