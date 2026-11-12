@@ -25,7 +25,8 @@ def test_report_validator_checks_registered_source_ids_and_paragraph_coverage(tm
         "# Research report\n\n## 摘要\n\n"
         + ("The primary source documents the verified architecture and its implementation details. [" + source["source_id"] + "]\n\n")
         + ("This paragraph compares the implementation and discusses its implications for long-running tasks. [" + source["source_id"] + "]\n\n")
-        + "## 结论\n\nThe source supports the summary. [" + source["source_id"] + "]\n\n"
+        + ("The report also states the scope and limitations of the source evidence and separates documented facts from analytical interpretation. [" + source["source_id"] + "]\n\n")
+        + "## 结论\n\nThe source supports the summary and the comparison. [" + source["source_id"] + "]\n\n"
         + "## Sources\n- https://example.org/primary"
     )
     result = ReportValidator().validate(report, evidence_registry=registry.summary())
@@ -102,6 +103,17 @@ def test_validator_counts_citations_in_bullet_and_table_blocks(tmp_path):
 
     assert result.valid
     assert result.evidence_coverage == 1.0
+
+
+def test_long_sources_list_cannot_make_an_empty_report_body_pass():
+    report = (
+        "# Empty report\n\n## Sources\n"
+        + "\n".join(f"- https://example.org/source-{index}" for index in range(20))
+    )
+    result = ReportValidator().validate(report)
+
+    assert not result.valid
+    assert any("报告正文过短" in error for error in result.errors)
 
 
 def test_validator_rejects_a_cited_source_without_an_intact_snapshot(tmp_path):
