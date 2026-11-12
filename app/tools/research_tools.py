@@ -1058,12 +1058,42 @@ class ResearchToolService(TaskToolService):
             return self.update_plan_step_status(step_id, status, note)
 
         @tool("record_finding")
-        def record_finding_tool(claim: str, source_ids: list[str], rationale: str = "", confidence: str = "medium") -> str:
-            """Record an evidence-linked claim with source IDs such as S0001."""
+        def record_finding_tool(claim: str, source_ids: list[str], rationale: str = "",
+                                confidence: str = "medium", dimension_id: str | None = None) -> str:
+            """Record an evidence-linked claim. Always supply the matching research dimension_id when one exists."""
             self.check_control()
-            finding = EvidenceRegistry(self.artifacts).record_finding(claim=claim, source_ids=source_ids, rationale=rationale, confidence=confidence)
+            finding = EvidenceRegistry(self.artifacts).record_finding(
+                claim=claim, source_ids=source_ids, rationale=rationale,
+                confidence=confidence, dimension_id=dimension_id,
+            )
             self.db.add_event(self.task_id, "research_finding_recorded", finding)
             return json.dumps(finding, ensure_ascii=False)
+
+        @tool("define_research_requirements")
+        def define_research_requirements_tool(dimensions: list[dict[str, Any]]) -> str:
+            """Define the research coverage matrix after the initial plan. Each dimension needs id, title, questions, expected_evidence, priority and min_sources."""
+            self.check_control()
+            from app.runtime.research_controller import ResearchController
+            result = ResearchController(self.db, self.task_id, self.artifacts).define_requirements(
+                {"dimensions": dimensions}, source="agent"
+            )
+            return json.dumps(result, ensure_ascii=False, indent=2)
+
+        @tool("get_research_status")
+        def get_research_status_tool() -> str:
+            """Inspect current research-dimension coverage, critical evidence gaps, stagnation and the controller action recommendation."""
+            self.check_control()
+            from app.runtime.research_controller import ResearchController
+            controller = ResearchController(self.db, self.task_id, self.artifacts)
+            events = self.db.get_events(self.task_id, limit=5000)
+            plan_event = next((event for event in reversed(events)
+                               if event.get("event_type") == "research_plan_updated"), None)
+            plan = (plan_event or {}).get("payload", {}).get("plan") or {}
+            coverage = controller.assess_coverage(
+                EvidenceRegistry(self.artifacts).summary(), plan, trigger="agent_query"
+            )
+            decision = controller.decide(coverage, self.db.get_budget_status(self.task_id))
+            return json.dumps({"coverage": coverage, "decision": decision}, ensure_ascii=False, indent=2)
 
         @tool("get_evidence_registry")
         def get_evidence_registry_tool() -> str:
@@ -1137,6 +1167,8 @@ class ResearchToolService(TaskToolService):
         return [
             *self.as_common_tools(),
             record_finding_tool,
+            define_research_requirements_tool,
+            get_research_status_tool,
             get_evidence_registry_tool,
             update_research_plan_tool,
             update_plan_step_status_tool,
