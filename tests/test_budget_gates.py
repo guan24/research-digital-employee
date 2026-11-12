@@ -388,3 +388,32 @@ def test_stale_generation_cannot_settle_or_release_a_token_reservation(db):
     current = db.get_task(task["task_id"])
     assert current["total_tokens_used"] == 0
     assert current["reserved_tokens"] == 2500
+
+def test_token_budget_protects_a_convergence_reserve_before_exploration_stops(db, settings):
+    task = db.create_task("Exercise the protected report convergence pool", max_total_tokens=100_000)
+    db.claim_next_task("convergence-worker")
+
+    research_call = db.reserve_tokens(task["task_id"], "research-call", 69_000)
+    convergence_call = db.reserve_tokens(task["task_id"], "convergence-call", 2_000)
+    status = db.get_budget_status(task["task_id"])
+
+    assert research_call["allowed"] is True
+    assert research_call["phase"] == "research"
+    assert convergence_call["allowed"] is True
+    assert convergence_call["phase"] == "convergence"
+    assert status["phase"] == "convergence"
+    assert status["state"] == "restricted"
+    assert status["convergence"]["reserve_tokens"] == 30_000
+    assert status["dimensions"]["tokens"]["exploration_remaining"] == 0
+    assert status["dimensions"]["tokens"]["convergence_remaining"] == 29_000
+    assert any(
+        event["event_type"] == "budget_convergence_started"
+        for event in db.get_events(task["task_id"])
+    )
+
+    artifacts = ArtifactStore(settings.workspace_dir, task["task_id"])
+    service = ResearchToolService(settings, db, task["task_id"], artifacts, time.monotonic())
+    blocked = json.loads(service.web_search("exploration must stop"))
+    assert blocked["error_type"] == "budget_intercept"
+    assert blocked["phase"] == "convergence"
+    assert "report.md" in service.save_artifact("report.md", "# Converged report")
