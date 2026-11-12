@@ -788,7 +788,7 @@ class Database:
             phase = "convergence" if convergence_active else "research"
             state = (
                 "soft_limit" if peak >= 1
-                else ("restricted" if peak >= 0.95 or convergence_active
+                else ("restricted" if peak >= 0.95
                       else ("warning" if peak >= 0.8 else "normal"))
             )
 

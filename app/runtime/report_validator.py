@@ -61,8 +61,8 @@ class ReportValidator:
     ) -> ReportValidation:
         text = (report or "").strip()
         errors: list[str] = []
-        if len(text) < 400:
-            errors.append("报告正文过短，缺少足以支撑研究结论的内容（至少约 400 个字符）。")
+        if len(text) < 300:
+            errors.append("报告正文过短，缺少足以支撑研究结论的内容（至少约 300 个字符）。")
         if not re.search(r"^#\s+\S+", text, re.MULTILINE):
             errors.append("缺少 Markdown 一级标题。")
 

@@ -119,6 +119,10 @@ class TaskToolService:
             f"Read the next chunk with start_char={end}.]\n\n{excerpt}"
         )
 
+    def list_artifacts(self) -> str:
+        self.check_control()
+        return __import__("json").dumps(self.artifacts.list_files(), ensure_ascii=False)
+
     def save_research_memory(self, content: str) -> str:
         self.check_control()
         normalized = str(content or "").strip()
