@@ -34,7 +34,7 @@ pip install -r requirements.txt
 Copy-Item .env.example .env
 ```
 
-Edit `.env` and set `OPENAI_API_KEY` and `TAVILY_API_KEY`.
+Edit the project-root `.env` to configure `OPENAI_API_KEY` and `TAVILY_API_KEY`. To enable GitHub repository tools, also set `GITHUB_PERSONAL_ACCESS_TOKEN`; the transport, remote endpoint, timeout and restart limit are configured in the same file. `.env` is ignored by Git and must never be committed.
 
 Terminal 1 — start API:
 

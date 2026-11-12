@@ -36,7 +36,7 @@ pip install -r requirements.txt
 Copy-Item .env.example .env
 ```
 
-编辑 `.env`，配置 `OPENAI_API_KEY` 和 `TAVILY_API_KEY`。
+在项目根目录的 `.env` 中统一配置 `OPENAI_API_KEY` 和 `TAVILY_API_KEY`。如需启用 GitHub 仓库工具，再填写 `GITHUB_PERSONAL_ACCESS_TOKEN`；连接方式、远程地址、超时时间和重试次数也统一在该文件中设置。`.env` 已加入 Git 忽略规则，禁止提交真实凭据。
 
 终端 1：启动 API：
 

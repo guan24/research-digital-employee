@@ -7,6 +7,9 @@ from pathlib import Path
 from dotenv import load_dotenv
 
 
+PROJECT_ROOT = Path(__file__).resolve().parents[1]
+
+
 @dataclass(frozen=True)
 class Settings:
     app_home: Path
@@ -40,8 +43,11 @@ class Settings:
 
     @classmethod
     def from_env(cls) -> "Settings":
-        load_dotenv()
-        app_home = Path(os.getenv("APP_HOME", Path(__file__).resolve().parents[1])).expanduser().resolve()
+        # Always load the repository-root .env, independent of the process working directory.
+        # Existing process environment variables (e.g. Docker env_file / deployment secrets)
+        # keep precedence over values in .env.
+        load_dotenv(dotenv_path=PROJECT_ROOT / ".env", override=False)
+        app_home = Path(os.getenv("APP_HOME", PROJECT_ROOT)).expanduser().resolve()
         data_dir = Path(os.getenv("DATA_DIR", app_home / "data")).expanduser().resolve()
         workspace_dir = Path(os.getenv("WORKSPACE_DIR", app_home / "workspaces")).expanduser().resolve()
         return cls(
