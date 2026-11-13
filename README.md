@@ -2,7 +2,7 @@
 
 A long-running autonomous research system built with **Deep Agents, LangGraph, FastAPI and SQLite**. A user submits a research goal; the Research Agent creates and adapts its plan, searches and reads external sources, records evidence and findings, saves intermediate artifacts, and produces a source-backed Markdown report. A separate Worker executes tasks independently of the browser session, keeping long-running research active while users leave the console.
 
-The project addresses the central challenge in the development exercise: researching leading Coding Agent architectures and comparing planning, tool use and context management in a source-backed Markdown report. Such work may take tens of minutes or longer. New evidence can change the best next action, while persistent state and recovery preserve task progress across model/provider failures and process interruptions. Developers can inspect how a result was produced and distinguish role-specific capabilities from shared task runtime layer services.
+The project addresses the central challenge in the development exercise: researching leading Coding Agent architectures and comparing planning, tool use and context management in a source-backed Markdown report. Such work may take tens of minutes or longer. New evidence can change the best next action, while persistent state and recovery preserve task progress across model/provider failures and process interruptions. Developers can inspect how a result was produced and distinguish role-specific capabilities from the services provided by the shared task runtime layer.
 
 ## What the project demonstrates
 
@@ -12,7 +12,7 @@ The project addresses the central challenge in the development exercise: researc
 | External search, reading and intermediate artifacts | Tavily, web/PDF retrieval, GitHub MCP, arXiv, task-scoped artifacts, durable memory and an evidence registry |
 | Long-running execution and production failures | Independent Worker, SQLite task state, LangGraph checkpoints, lease/heartbeat, retries, budgets and conservative recovery |
 | Understand and diagnose task execution | Persistent event journal, model/tool call records, SSE replay, plan snapshots, evidence, budget, quality and recovery records |
-| Separate role capabilities from shared capabilities | Agent Registry defines role contracts; task lifecycle, Worker, persistence, budget and audit are shared task runtime layer services |
+| Separate role capabilities from shared capabilities | Agent Registry defines role contracts; task lifecycle, Worker, persistence, budget and audit are provided by the shared task runtime layer |
 | Technology choice is open | Uses Python, Deep Agents, LangGraph, FastAPI, SQLite and an OpenAI-compatible model endpoint; components can be replaced as role and deployment needs evolve |
 | Operator interface and engineering focus | The web console supports task control, execution inspection and human decisions; engineering effort is centered on Agent autonomy, persistence, evidence, recovery and verification |
 
