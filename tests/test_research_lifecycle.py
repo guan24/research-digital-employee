@@ -21,6 +21,32 @@ def _running_task(db, goal="验证研究闭环"):
     return db.get_task(task["task_id"])
 
 
+@pytest.mark.parametrize("action", ["continue_research", "change_research_direction", "add_research_requirements"])
+def test_explicit_human_continuation_resets_only_stagnation_window(settings, db, action):
+    task = _running_task(db)
+    controller = ResearchController(db, task["task_id"])
+    controller.define_requirements({"dimensions": [{"id": "critical", "title": "Evidence",
+        "questions": ["What supports the claim?"], "expected_evidence": ["Verified source"],
+        "priority": "critical", "min_sources": 1}]})
+    for _ in range(3):
+        coverage = controller.assess_coverage({"sources": [], "findings": []})
+    assert coverage["stagnated"]
+    before = db.get_research_control_state(task["task_id"])
+    intervention = db.set_waiting_for_human(task["task_id"], "research_control_requires_human", {"choices": [action]})
+    assert db.resolve_human_intervention(task["task_id"], intervention, action)["status"] == "queued"
+    after = db.get_research_control_state(task["task_id"])
+    assert after["stagnation_count"] == 0 and after["coverage"]["stagnated"] is False
+    for key in ("requirements", "requirements_version", "progress_vector", "cycle"):
+        assert after[key] == before[key]
+    assert after["coverage"]["critical_gaps"] == before["coverage"]["critical_gaps"]
+    first = controller.assess_coverage({"sources": [], "findings": []})
+    assert controller.decide(first, {})["recommended_action"] == "FILL_EVIDENCE_GAP"
+    second = controller.assess_coverage({"sources": [], "findings": []})
+    assert controller.decide(second, {})["recommended_action"] == "REQUEST_HUMAN"
+    resets = [e for e in db.get_events(task["task_id"]) if e["event_type"] == "research_stagnation_reset"]
+    assert len(resets) == 1 and resets[0]["payload"]["previous_count"] == 2
+
+
 def _registered_evidence(artifacts, dimension_id="architecture"):
     registry = EvidenceRegistry(artifacts)
     source = registry.register_source(

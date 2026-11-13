@@ -684,6 +684,18 @@ class Database:
                              "category": intervention["category"], "request": request,
                              "next_status": new_status}, ensure_ascii=False, default=str)),
             )
+            if intervention["category"] == "research_control_requires_human" and new_status == "queued":
+                control = conn.execute("SELECT coverage_json,stagnation_count FROM research_control_state WHERE task_id=?", (task_id,)).fetchone()
+                if control:
+                    coverage = json.loads(control["coverage_json"] or "{}")
+                    coverage.update(stagnation_count=0, stagnated=False)
+                    # An explicit operator continuation starts a fresh bounded progress window.
+                    conn.execute("UPDATE research_control_state SET stagnation_count=0,coverage_json=?,updated_at=? WHERE task_id=?",
+                                 (json.dumps(coverage, ensure_ascii=False), now, task_id))
+                    self._insert_event(conn, task_id, "research_stagnation_reset", {
+                        "intervention_id": intervention_id, "action": action,
+                        "previous_count": control["stagnation_count"], "reason": "explicit_human_continuation",
+                    })
         return self.get_task(task_id)
 
 

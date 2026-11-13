@@ -144,6 +144,22 @@ The arXiv adapter uses the official Atom API, a process-wide three-second reques
 
 ## Offline decision and recovery verification
 
+Research tools expose nested Pydantic contracts: requirements contain 3–12 typed dimensions,
+and plans contain 3–8 complete steps with unique IDs. Invalid arguments return structured
+field errors through LangChain's validation handler without changing requirements or plan versions.
+Each tool permits one correction per task; a second validation failure terminates explicitly.
+Plain-text plan extraction is no longer accepted.
+
+The production model middleware discards every `finish_reason=length` response before tool
+dispatch, including apparently valid tool calls. It permits one concise correction through
+the normal model callbacks and token reservation gate, without increasing the output limit.
+Repeated truncation fails explicitly; original responses, usage and anomalies remain in the trace.
+
+An explicit human continuation of a stagnated research task resets its stagnation window
+atomically with the decision. It preserves requirements, evidence gaps, quality thresholds
+and budgets. Two further cycles without progress can request human intervention again;
+continuation cannot make inaccessible sources or unsupported claims valid.
+
 `tests/test_autonomous_research_e2e.py` injects ConditionalResearchModel into the production Deep Agents builder, retaining the real profile, system prompt, tools, worker, executor and SQLite checkpoint. Decisions read actual tool messages: contradictory evidence causes an audited replan; supporting evidence retains V1. A counterfactual changes only HTTP evidence and verifies that the decision changes. Quality feedback drives report repair; invalid reviews and exhausted repairs prevent automatic delivery.
 
 Database uses BEGIN IMMEDIATE to validate task status, worker_id and worker_generation inside the write transaction. Tool start records/events and terminal status/events commit atomically. Task completion, failure, pause, cancellation and retry include reservation release and their outcome event in one transaction. Duplicate matching callbacks add no event; conflicting outcomes are rejected. The production replay guard returns persisted successful results without rerunning tools; uncertain writes require reconciliation. Artifact writes already matching their input are not rewritten.

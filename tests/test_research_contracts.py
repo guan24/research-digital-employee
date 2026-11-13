@@ -291,9 +291,16 @@ def test_callback_identifies_truncation_before_content_and_calls(settings, db, m
 
 
 @pytest.mark.parametrize("repeat", [False, True])
-def test_truncated_tool_calls_cannot_persist_before_bounded_retry(settings, db, repeat):
+@pytest.mark.parametrize("variant", ["partial_tool", "complete_tool", "body", "invalid_tool"])
+def test_truncated_tool_calls_cannot_persist_before_bounded_retry(settings, db, repeat, variant):
     task, svc = service(settings, db)
     first = call("update_research_plan", plan(2), 1, "length")
+    if variant == "complete_tool":
+        first = call("update_research_plan", plan(), 1, "length")
+    elif variant == "body":
+        first = AIMessage(content="Partial plan", response_metadata={"finish_reason": "length"})
+    elif variant == "invalid_tool":
+        first = AIMessage(content="", invalid_tool_calls=[{"name": "update_research_plan", "args": '{"steps":[', "id": "1", "error": "truncated JSON"}], response_metadata={"finish_reason": "length"})
     second = call("update_research_plan", plan(2) if repeat else plan(), 2, "length" if repeat else "tool_calls")
     model = ScriptedModel(responses=[first, second, AIMessage(content="Done")])
     agent = build_research_agent(settings, db, task, None, time.monotonic(), model=model)
@@ -308,6 +315,24 @@ def test_truncated_tool_calls_cannot_persist_before_bounded_retry(settings, db, 
     events = db.get_events(task["task_id"])
     assert len([e for e in events if e["event_type"] == "research_plan_updated"]) == (0 if repeat else 1)
     assert any(e["event_type"] == "model_output_truncated" for e in events)
+
+
+def test_truncation_correction_reserves_budget_before_second_model_call(settings, db, monkeypatch):
+    from app.runtime.errors import BudgetExhausted
+    task = db.create_task("Plan with a strict token budget", max_total_tokens=100)
+    assert db.acquire_worker_lease("budget-worker", 3600)
+    task = db.claim_next_task("budget-worker")
+    first = call("update_research_plan", plan(2), 1, "length")
+    first.usage_metadata = {"input_tokens": 20, "output_tokens": 30, "total_tokens": 50}
+    model = ScriptedModel(responses=[first, call("update_research_plan", plan(), 2)])
+    monkeypatch.setattr("app.runtime.executor.estimate_model_call_reservation", lambda *a, **kw: 80)
+    callback = TaskEventCallback(db, task["task_id"], time.monotonic(), 60)
+    agent = build_research_agent(settings, db, task, None, time.monotonic(), model=model)
+    with pytest.raises(BudgetExhausted):
+        agent.invoke({"messages": [{"role": "user", "content": "Plan"}]}, {"callbacks": [callback]})
+    assert len(model.seen) == 1
+    store = ArtifactStore(settings.workspace_dir, task["task_id"])
+    assert not store.exists("notes/research_plan.json")
 
 
 def test_async_truncation_uses_same_bounded_guard(settings, db):
