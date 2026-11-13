@@ -17,8 +17,9 @@ from pydantic import Field
 
 GOAL = "Compare Coding Agent context management architectures"
 PLAN = {"title": "Context architecture", "objective": GOAL, "steps": [
-    {"id": "search", "title": "Search architecture", "objective": "", "expected_output": "", "expected_output_path": "notes/search.md"},
-    {"id": "context", "title": "Compare checkpoint and memory", "objective": "", "expected_output": "", "expected_output_path": "notes/context.md"},
+    {"id": "search", "title": "Search architecture", "objective": "Compare architecture", "expected_output": "Evidence summary", "expected_output_path": "notes/search.md"},
+    {"id": "context", "title": "Compare checkpoint and memory", "objective": "Compare architecture", "expected_output": "Evidence summary", "expected_output_path": "notes/context.md"},
+    {"id": "scope", "title": "Define scope", "objective": "Set boundaries", "expected_output": "Scope", "expected_output_path": ""},
 ]}
 
 
@@ -57,7 +58,7 @@ class ConditionalResearchModel(BaseChatModel):
         if not plans:
             response = choose("update_research_plan", **PLAN)
         elif "define_research_requirements" not in by_name:
-            response = choose("define_research_requirements", dimensions=[{"id": "context", "title": "Context", "questions": ["What does checkpoint persist?"], "priority": "critical", "min_sources": 1}])
+            response = choose("define_research_requirements", dimensions=[{"id": dim, "title": title, "questions": ["What does checkpoint persist?"], "expected_evidence": ["Primary source"], "priority": "critical" if dim == "context" else "normal", "min_sources": 1} for dim, title in [("context", "Context"), ("scope", "Scope"), ("lifecycle", "Lifecycle")]])
         elif "web_search" not in by_name:
             response = choose("web_search", query="agent context architecture")
         elif "update_plan_step_status" not in by_name:
@@ -85,6 +86,10 @@ class ConditionalResearchModel(BaseChatModel):
             else:
                 response = choose("record_finding", claim="Checkpoint execution and durable memory have separate ownership", source_ids=[source],
                     dimension_id="context", confidence="high", rationale=pages[0]["text"][:300])
+                for dimension in ("scope", "lifecycle"):
+                    response.tool_calls.append({"name": "record_finding", "id": dimension + "-finding", "type": "tool_call",
+                                                "args": {"claim": "The source defines persistence ownership and lifecycle", "source_ids": [source],
+                                                         "dimension_id": dimension, "confidence": "high", "rationale": pages[0]["text"][:300]}})
         elif len(by_name.get("get_research_status", [])) < 2:
             response = choose("get_research_status")
         elif json.loads(by_name["get_research_status"][-1].content)["coverage"]["coverage_ratio"] < 1:
@@ -112,8 +117,8 @@ class ConditionalResearchModel(BaseChatModel):
 def run_research(settings, db, monkeypatch):
     from app.agents.research.agent import build_research_agent
     original_client = httpx.Client
-    def run(marker, review_mode="repair"):
-        model = ConditionalResearchModel()
+    def run(marker, review_mode="repair", model=None):
+        model = model or ConditionalResearchModel()
         def respond(request):
             if request.method == "POST":
                 return httpx.Response(200, json={"results": [{"url": "https://93.184.216.34/context", "content": "Primary context source"}]})
@@ -227,3 +232,40 @@ class ToolCallingModel(FakeMessagesListChatModel):
 
 def call(name, **args):
     return AIMessage(content="", tool_calls=[{"name": name, "args": args, "id": f"call-{name}-{len(str(args))}"}])
+
+
+@pytest.mark.parametrize("correct", [True, False])
+def test_worker_survives_first_schema_error_and_bounds_correction(run_research, correct):
+    class CorrectingModel(ConditionalResearchModel):
+        errors_sent: int = 0
+
+        def _generate(self, messages, **kwargs):
+            failures = [m for m in messages if isinstance(m, ToolMessage) and m.name == "define_research_requirements"
+                        and json.loads(m.content).get("success") is False]
+            if failures:
+                args = {"dimensions": [{"id": dim, "title": title, "questions": ["What persists?"],
+                         "expected_evidence": ["Primary evidence"], "priority": "critical" if dim == "context" else "normal",
+                         "min_sources": 1} for dim, title in [("context", "Context"), ("scope", "Scope"), ("lifecycle", "Lifecycle")]]}
+                if not correct:
+                    args["dimensions"][0]["expected_evidence"] = "wrong type"
+                if not any(json.loads(m.content).get("saved") for m in messages if isinstance(m, ToolMessage) and m.name == "define_research_requirements"):
+                    return ChatResult(generations=[ChatGeneration(message=call("define_research_requirements", **args))])
+            result = super()._generate(messages, **kwargs)
+            for tc in result.generations[0].message.tool_calls:
+                if tc["name"] == "define_research_requirements" and not self.errors_sent:
+                    tc["args"]["dimensions"][0]["expected_evidence"] = "wrong type"
+                    self.errors_sent += 1
+            return result
+
+    result = run_research(SUPPORT, model=CorrectingModel())
+    errors = [e for e in result["events"] if e["event_type"] == "research_tool_validation_failed"]
+    assert len(errors) == (1 if correct else 2)
+    if correct:
+        assert result["task"]["status"] == "completed", result["task"]["last_error"]
+        assert len([e for e in result["events"] if e["event_type"] == "tool_call_failed"]) == 1
+        state = result["db"].get_research_control_state(result["task"]["task_id"])
+        assert state["requirements_version"] == 1
+    else:
+        assert result["task"]["status"] == "failed"
+        assert "TOOL_ARGUMENT_CORRECTION_EXHAUSTED" in result["task"]["last_error"]
+        assert not any(e["event_type"] == "research_requirements_updated" for e in result["events"])

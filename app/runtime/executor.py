@@ -112,6 +112,8 @@ def _response_items(raw_response: dict[str, Any]) -> list[dict[str, Any]]:
 
 
 def _model_response_summary(raw_response: dict[str, Any]) -> str:
+    if _model_response_kind(raw_response) == "truncated":
+        return "Model output truncated (finish_reason=length); tool dispatch blocked, bounded correction required."
     items = _response_items(raw_response)
     for item in items:
         content = _content_as_text(item.get("content") or item.get("text"))
@@ -159,6 +161,8 @@ def _model_response_summary(raw_response: dict[str, Any]) -> str:
 
 def _model_response_kind(raw_response: dict[str, Any]) -> str:
     items = _response_items(raw_response)
+    if any((i.get("response_metadata") or {}).get("finish_reason") == "length" or (i.get("generation_info") or {}).get("finish_reason") == "length" for i in items):
+        return "truncated"
     if any(_content_as_text(item.get("content") or item.get("text")).strip() for item in items):
         return "text"
     if any(item.get("invalid_tool_calls") for item in items):
@@ -334,7 +338,7 @@ class TaskEventCallback(BaseCallbackHandler):
                 "run_id": str(run_id),
             },
         )
-        if response_kind in {"empty", "invalid_tool_calls"}:
+        if response_kind in {"empty", "invalid_tool_calls", "truncated"}:
             self.db.add_event(
                 self.task_id,
                 "model_response_anomaly",

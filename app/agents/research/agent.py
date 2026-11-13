@@ -69,6 +69,7 @@ def build_research_agent(
     from deepagents.profiles import GeneralPurposeSubagentProfile, HarnessProfile, register_harness_profile
     from langchain_openai import ChatOpenAI
     from app.runtime.tool_replay import tool_replay_guard
+    from app.runtime.research_safety import model_output_guard
 
     # Keep the MVP deliberately single-agent and do not expose shell execution.
     register_harness_profile(
@@ -113,7 +114,7 @@ def build_research_agent(
         model=model,
         tools=tool_service.as_langchain_tools(),
         system_prompt=profile.system_prompt + "\\n\\nTask memory: call read_research_memory at the start and after context compaction; save concise verified progress with save_research_memory before major phase transitions and before final synthesis. The task-scoped filesystem under /research_memory/ is durable across process restarts.",
-        middleware=[tool_replay_guard(db, task["task_id"]), summarization],
+        middleware=[model_output_guard(db, task["task_id"]), tool_replay_guard(db, task["task_id"]), summarization],
         checkpointer=checkpointer,
         subagents=[],
         backend=backend,

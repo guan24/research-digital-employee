@@ -80,7 +80,7 @@ def test_update_research_plan_tool_uses_structured_step_arguments(settings, db):
             "title": "Confirm scope",
             "objective": "Define the research boundary",
             "expected_output": "A saved scope definition",
-        }],
+        }] + [{"id": f"step-{i}", "title": "Verify", "objective": "Check output", "expected_output": "Verified output"} for i in range(2)],
     })
     assert "Saved initial research plan" in result
     assert artifacts.exists("notes/research_plan.json")

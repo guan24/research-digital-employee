@@ -20,7 +20,7 @@ except (
     ImportError
 ):  # Keeps non-agent tool service tests runnable without the model stack.
 
-    def tool(name=None):
+    def tool(name=None, **kwargs):
         def decorate(func):
             func.name = name or func.__name__
             return func
@@ -34,6 +34,8 @@ from app.infrastructure.database import Database
 from app.infrastructure.evidence_registry import EvidenceRegistry
 from app.runtime.control import TaskControlSignal, TaskPaused, TaskCancelled, TaskDeadlineExceeded, TaskStepLimitExceeded, WorkerLeaseLost
 from app.tools.common import TaskToolService
+from app.tools.research_schemas import ResearchPlan, ResearchPlanStep, ResearchPlanInput, ResearchRequirementsInput, ResearchDimension, ResearchQualityPolicy
+from app.runtime.research_safety import correction_failure
 
 
 class ResearchToolService(TaskToolService):
@@ -795,43 +797,9 @@ class ResearchToolService(TaskToolService):
     ) -> str:
         """Create the initial plan or record a material, evidence-driven replan."""
         self.check_control()
-        plan_text = str(plan_json or "")
-        try:
-            raw_plan = json.loads(plan_text)
-        except (TypeError, json.JSONDecodeError) as exc:
-            extracted = [
-                re.sub(r"^\s*(?:[-*+]\s+|\d+[.)、]\s*)", "", line.strip()).strip()
-                for line in plan_text.splitlines()
-                if line.strip() and not line.lstrip().startswith("#")
-            ]
-            if not extracted:
-                raise ValueError(
-                    "plan_json must be valid JSON or contain extractable plan steps"
-                ) from exc
-            raw_plan = {
-                "title": "执行计划（文本提取）",
-                "objective": "从 Agent 原始规划文本中提取",
-                "steps": [
-                    {"id": f"step-{index}", "title": title}
-                    for index, title in enumerate(extracted[:20], start=1)
-                ],
-            }
-
-        if not isinstance(raw_plan, dict) or not isinstance(raw_plan.get("steps"), list):
-            raise ValueError("plan_json must be an object containing a steps array")
-        if not 1 <= len(raw_plan["steps"]) <= 20:
-            raise ValueError("a research plan must contain between 1 and 20 steps")
-        if any(not isinstance(step, dict) for step in raw_plan["steps"]):
-            raise ValueError("every plan step must be an object")
-
+        plan_text = plan_json
+        raw_plan = ResearchPlan.model_validate_json(plan_json).model_dump(exclude_none=True)
         plan = self._normalize_plan_structure(raw_plan)
-        seen_ids = set()
-        for index, step in enumerate(plan["steps"], start=1):
-            if not step["id"] or not step["title"] or step["id"] in seen_ids:
-                raise ValueError(
-                    f"plan step {index} requires a unique id and non-empty title"
-                )
-            seen_ids.add(step["id"])
 
         history = self.db.get_events(self.task_id, limit=5000)
         plan_events = [
@@ -991,11 +959,16 @@ class ResearchToolService(TaskToolService):
         )
 
     def as_langchain_tools(self):
-        @tool("update_research_plan")
+        def feedback(name, error):
+            self.check_control()
+            return correction_failure(self.db, self.task_id, name, error,
+                                      self.worker_id, self.worker_generation)
+
+        @tool("update_research_plan", args_schema=ResearchPlanInput)
         def update_research_plan_tool(
             title: str,
             objective: str,
-            steps: list[dict[str, str]],
+            steps: list[ResearchPlanStep],
             change_reason: str = "",
             trigger: str = "",
             new_information: str = "",
@@ -1009,13 +982,16 @@ class ResearchToolService(TaskToolService):
             Do not call for routine progress updates; use update_plan_step_status for those.
             Every later strategic replan must explain trigger, new_information, problem_analysis, decision and changes."""
             plan_json = json.dumps(
-                {"title": title, "objective": objective, "steps": steps},
+                {"title": title, "objective": objective, "steps": [s.model_dump(exclude_none=True) for s in steps]},
                 ensure_ascii=False,
             )
-            return self.update_research_plan(
-                plan_json, change_reason, trigger, new_information,
-                problem_analysis, decision, changes,
-            )
+            try:
+                return self.update_research_plan(
+                    plan_json, change_reason, trigger, new_information,
+                    problem_analysis, decision, changes,
+                )
+            except ValueError as exc:
+                return feedback("update_research_plan", exc)
 
         @tool("update_plan_step_status")
         def update_plan_step_status_tool(
@@ -1044,17 +1020,21 @@ class ResearchToolService(TaskToolService):
             self.db.add_event(self.task_id, "research_finding_recorded", finding)
             return json.dumps(finding, ensure_ascii=False)
 
-        @tool("define_research_requirements")
+        @tool("define_research_requirements", args_schema=ResearchRequirementsInput)
         def define_research_requirements_tool(
-            dimensions: list[dict[str, Any]], quality_policy: dict[str, Any] | None = None
+            dimensions: list[ResearchDimension], quality_policy: ResearchQualityPolicy | None = None
         ) -> str:
             """Define the research coverage matrix. Optional quality_policy may only raise the role baseline min_total_score and min_dimension_score."""
             self.check_control()
             from app.runtime.research_controller import ResearchController
-            result = ResearchController(self.db, self.task_id, self.artifacts).define_requirements(
-                {"dimensions": dimensions, "quality_policy": quality_policy or {}}, source="agent"
-            )
-            return json.dumps(result, ensure_ascii=False, indent=2)
+            try:
+                result = ResearchController(self.db, self.task_id, self.artifacts).define_requirements(
+                    {"dimensions": [d.model_dump() for d in dimensions],
+                     "quality_policy": quality_policy.model_dump(exclude_none=True) if quality_policy else {}}, source="agent"
+                )
+                return json.dumps(result, ensure_ascii=False, indent=2)
+            except ValueError as exc:
+                return feedback("define_research_requirements", exc)
 
         @tool("get_human_decisions")
         def get_human_decisions_tool() -> str:
@@ -1140,6 +1120,8 @@ class ResearchToolService(TaskToolService):
             """List files saved in the current task workspace."""
             return self.list_artifacts()
 
+        update_research_plan_tool.handle_validation_error = lambda exc: feedback("update_research_plan", exc)
+        define_research_requirements_tool.handle_validation_error = lambda exc: feedback("define_research_requirements", exc)
         return [
             *self.as_common_tools(),
             record_finding_tool,

@@ -10,6 +10,17 @@ from app.runtime.executor import ResearchExecutor, TaskEventCallback, extract_fi
 from app.tools.research_tools import ResearchToolService
 
 
+def valid_plan(plan):
+    # Existing progress tests now supply the mandatory strategic plan contract.
+    for step in plan["steps"]:
+        step.setdefault("objective", step["title"])
+        step.setdefault("expected_output", step["title"] + " output")
+    for index in range(3 - len(plan["steps"])):
+        plan["steps"].append({"id": f"contract-{index}", "title": "Verify delivery",
+                              "objective": "Validate output", "expected_output": "Verified output"})
+    return plan
+
+
 def make_service(settings, db):
     task = db.create_task("Research a sufficiently detailed topic")
     db.claim_next_task("worker-test")
@@ -34,13 +45,13 @@ def test_plan_history_only_versions_material_replans(settings, db):
         {"id": "scope", "title": "明确范围", "objective": "确定范围", "expected_output": "范围说明"},
         {"id": "compare", "title": "开展比较", "objective": "比较架构", "expected_output": "比较表"},
     ]}
-    service.update_research_plan(json.dumps(initial, ensure_ascii=False))
+    service.update_research_plan(json.dumps(valid_plan(initial), ensure_ascii=False))
     db.add_event(task["task_id"], "research_plan_step_status", {
         "step_id": "scope", "status": "completed", "source": "system"
     })
     status_only = json.loads(json.dumps(initial, ensure_ascii=False))
     status_only["steps"][0]["status"] = "completed"
-    result = service.update_research_plan(json.dumps(status_only, ensure_ascii=False))
+    result = service.update_research_plan(json.dumps(valid_plan(status_only), ensure_ascii=False))
     assert "No material plan change" in result
     revised = {"title": "补充证据核验后的研究计划", "objective": "比较并验证", "steps": [
         {"id": "scope", "title": "明确范围"},
@@ -48,7 +59,7 @@ def test_plan_history_only_versions_material_replans(settings, db):
         {"id": "verify", "title": "交叉核验关键结论"},
     ]}
     service.update_research_plan(
-        json.dumps(revised, ensure_ascii=False),
+        json.dumps(valid_plan(revised), ensure_ascii=False),
         trigger="初步检索发现官方资料披露程度差异较大",
         new_information="部分项目只能从仓库和发布说明确认工具机制",
         problem_analysis="原计划无法充分区分已验证能力与推断",
@@ -73,12 +84,12 @@ def test_plan_history_only_versions_material_replans(settings, db):
 def test_material_replan_requires_audit_rationale(settings, db):
     _, service = make_service(settings, db)
     initial = {"title": "初始计划", "objective": "研究", "steps": [{"id": "one", "title": "收集资料"}]}
-    service.update_research_plan(json.dumps(initial, ensure_ascii=False))
+    service.update_research_plan(json.dumps(valid_plan(initial), ensure_ascii=False))
     revised = {"title": "调整计划", "objective": "研究并核验", "steps": [
         {"id": "one", "title": "收集资料"}, {"id": "two", "title": "核验结论"}
     ]}
     try:
-        service.update_research_plan(json.dumps(revised, ensure_ascii=False), trigger="发现新问题")
+        service.update_research_plan(json.dumps(valid_plan(revised), ensure_ascii=False), trigger="发现新问题")
     except ValueError as exc:
         assert "new_information" in str(exc)
         assert "problem_analysis" in str(exc)
@@ -93,14 +104,14 @@ def test_final_plan_archive_preserves_all_material_versions(settings, db):
     initial = {"title": "初始计划", "objective": "初始目标", "steps": [
         {"id": "scope", "title": "明确范围"}, {"id": "research", "title": "收集证据"}
     ]}
-    service.update_research_plan(json.dumps(initial, ensure_ascii=False))
+    service.update_research_plan(json.dumps(valid_plan(initial), ensure_ascii=False))
     revised = {"title": "修订计划", "objective": "补充核验", "steps": [
         {"id": "scope", "title": "明确范围"},
         {"id": "research", "title": "收集证据"},
         {"id": "verify", "title": "交叉核验"},
     ]}
     service.update_research_plan(
-        json.dumps(revised, ensure_ascii=False),
+        json.dumps(valid_plan(revised), ensure_ascii=False),
         trigger="新证据显示需要交叉核验",
         new_information="部分来源存在版本差异",
         problem_analysis="单一来源无法支持版本相关结论",
@@ -126,7 +137,7 @@ def test_tool_callbacks_automatically_advance_plan_steps_from_real_work(settings
     from app.runtime.plan_progress import PlanProgressTracker
 
     task, service = make_service(settings, db)
-    service.update_research_plan(json.dumps({
+    service.update_research_plan(json.dumps(valid_plan({
         "title": "研究计划",
         "objective": "完成有证据支持的研究报告",
         "steps": [
@@ -136,7 +147,7 @@ def test_tool_callbacks_automatically_advance_plan_steps_from_real_work(settings
             {"id": "report", "title": "撰写最终研究报告", "expected_output": "report.md"},
             {"id": "validate", "title": "核验报告结构与引用", "expected_output": "通过交付校验"},
         ],
-    }, ensure_ascii=False))
+    }), ensure_ascii=False))
     tracker = PlanProgressTracker(db, task["task_id"], service.artifacts)
     callback = TaskEventCallback(
         db, task["task_id"], __import__("time").monotonic(), 3600,
@@ -175,7 +186,7 @@ def test_report_phase_marks_analysis_as_awaiting_verification_without_an_artifac
     from app.runtime.plan_progress import PlanProgressTracker
 
     task, service = make_service(settings, db)
-    service.update_research_plan(json.dumps({
+    service.update_research_plan(json.dumps(valid_plan({
         "title": "研究计划",
         "objective": "完成研究报告",
         "steps": [
@@ -185,7 +196,7 @@ def test_report_phase_marks_analysis_as_awaiting_verification_without_an_artifac
             {"id": "report", "title": "撰写研究报告", "expected_output": "report.md"},
             {"id": "validate", "title": "核验报告引用"},
         ],
-    }, ensure_ascii=False))
+    }), ensure_ascii=False))
     tracker = PlanProgressTracker(db, task["task_id"], service.artifacts)
     callback = TaskEventCallback(
         db, task["task_id"], __import__("time").monotonic(), 3600,
@@ -209,10 +220,10 @@ def test_progress_tracker_does_not_override_explicit_agent_status(settings, db):
     from app.runtime.plan_progress import PlanProgressTracker
 
     task, service = make_service(settings, db)
-    service.update_research_plan(json.dumps({
+    service.update_research_plan(json.dumps(valid_plan({
         "title": "计划", "objective": "研究",
         "steps": [{"id": "research", "title": "检索并阅读资料"}],
-    }, ensure_ascii=False))
+    }), ensure_ascii=False))
     service.update_plan_step_status("research", "in_progress", "Agent 明确报告正在执行")
     tracker = PlanProgressTracker(db, task["task_id"], service.artifacts)
     callback = TaskEventCallback(
@@ -230,7 +241,7 @@ def test_plan_step_progress_is_separate_from_strategic_versions(settings, db):
     plan = {"title": "研究计划", "objective": "完成研究", "steps": [
         {"id": "scope", "title": "明确范围"}, {"id": "research", "title": "收集证据"}
     ]}
-    service.update_research_plan(json.dumps(plan, ensure_ascii=False))
+    service.update_research_plan(json.dumps(valid_plan(plan), ensure_ascii=False))
     service.update_plan_step_status("scope", "in_progress", "正在梳理研究边界")
     with pytest.raises(ValueError, match="requires an existing"):
         service.update_plan_step_status("scope", "completed", "范围和评价标准已确定")
@@ -250,7 +261,7 @@ def test_plan_progress_replan_preserves_unchanged_and_resets_modified_steps(sett
     initial = {"title": "初始计划", "objective": "研究", "steps": [
         {"id": "scope", "title": "明确范围"}, {"id": "research", "title": "收集证据"}
     ]}
-    service.update_research_plan(json.dumps(initial, ensure_ascii=False))
+    service.update_research_plan(json.dumps(valid_plan(initial), ensure_ascii=False))
     service.artifacts.write_text("notes/scope.md", "# Scope\\n\\n范围确认完成。")
     service.update_plan_step_status("scope", "completed", "范围确认完成", output_path="notes/scope.md")
     service.update_plan_step_status("research", "in_progress", "正在收集资料")
@@ -260,7 +271,7 @@ def test_plan_progress_replan_preserves_unchanged_and_resets_modified_steps(sett
         {"id": "verify", "title": "交叉核验关键结论"},
     ]}
     service.update_research_plan(
-        json.dumps(revised, ensure_ascii=False),
+        json.dumps(valid_plan(revised), ensure_ascii=False),
         trigger="发现部分资料版本不一致",
         new_information="同一功能在不同版本文档中的描述存在差异",
         problem_analysis="原证据收集步骤没有明确版本核验要求",
@@ -275,8 +286,8 @@ def test_plan_progress_replan_preserves_unchanged_and_resets_modified_steps(sett
 
 def test_final_plan_archive_contains_step_progress(settings, db):
     task, service = make_service(settings, db)
-    service.update_research_plan(json.dumps({"title":"计划","objective":"研究","steps":[
-        {"id":"one","title":"收集资料"},{"id":"two","title":"撰写报告"}]}, ensure_ascii=False))
+    service.update_research_plan(json.dumps(valid_plan({"title":"计划","objective":"研究","steps":[
+        {"id":"one","title":"收集资料"},{"id":"two","title":"撰写报告"}]}), ensure_ascii=False))
     service.artifacts.write_text("notes/source-list.md", "# Sources\\n\\n资料已收集。")
     service.update_plan_step_status(
         "one", "completed", "资料已收集", output_path="notes/source-list.md",
@@ -292,8 +303,8 @@ def test_final_plan_archive_contains_step_progress(settings, db):
 
 def test_failed_finalization_closes_in_progress_steps(settings, db):
     task, service = make_service(settings, db)
-    service.update_research_plan(json.dumps({"title":"计划","objective":"研究","steps":[
-        {"id":"one","title":"收集资料"}]}, ensure_ascii=False))
+    service.update_research_plan(json.dumps(valid_plan({"title":"计划","objective":"研究","steps":[
+        {"id":"one","title":"收集资料"}]}), ensure_ascii=False))
     service.update_plan_step_status("one", "in_progress", "正在检索")
     with db.transaction() as conn:
         conn.execute("UPDATE tasks SET status='failed', last_error=? WHERE task_id=?",
@@ -387,13 +398,13 @@ def test_events_endpoint_supports_incremental_after_id_polling(tmp_path, monkeyp
 
 
 
-def test_plan_text_fallback_extracts_markdown_steps(settings, db):
+def test_plan_text_fallback_is_rejected_without_persistence(settings, db):
     task, service = make_service(settings, db)
-    service.update_research_plan("# 研究计划\n\n1. 明确研究范围\n2. 搜索官方资料\n3. 对比并撰写报告")
-    event = [item for item in db.get_events(task["task_id"]) if item["event_type"] == "research_plan_updated"][-1]
-    plan = event["payload"]["plan"]
-    assert plan["title"] == "执行计划（文本提取）"
-    assert [step["title"] for step in plan["steps"]] == ["明确研究范围", "搜索官方资料", "对比并撰写报告"]
+    with pytest.raises(ValueError):
+        service.update_research_plan("# Plan\n1. Scope\n2. Search\n3. Report")
+    assert not service.artifacts.exists("notes/research_plan.json")
+    assert not any(e["event_type"] == "research_plan_updated" for e in db.get_events(task["task_id"]))
+
 
 def test_model_callback_surfaces_malformed_tool_arguments_and_anomaly_event(settings, db):
     task, _ = make_service(settings, db)
@@ -418,9 +429,9 @@ def test_model_callback_surfaces_malformed_tool_arguments_and_anomaly_event(sett
     completed = [event for event in events if event["event_type"] == "model_call_completed"][-1]
     anomaly = [event for event in events if event["event_type"] == "model_response_anomaly"][-1]
 
-    assert "无法解析的工具调用" in completed["payload"]["decision_summary"]
-    assert "malformed or truncated" in completed["payload"]["decision_summary"]
-    assert anomaly["payload"]["kind"] == "invalid_tool_calls"
+    assert "finish_reason=length" in completed["payload"]["decision_summary"]
+    assert completed["payload"]["raw_response"]["invalid_tool_calls"][0]["error"] == "arguments were malformed or truncated"
+    assert anomaly["payload"]["kind"] == "truncated"
 
 
 def test_model_callback_distinguishes_a_true_empty_response_from_tool_only_turn(settings, db):
@@ -461,13 +472,13 @@ def test_agent_progress_for_one_step_does_not_block_runtime_tracking_of_another(
     from app.runtime.plan_progress import PlanProgressTracker
 
     task, service = make_service(settings, db)
-    service.update_research_plan(json.dumps({
+    service.update_research_plan(json.dumps(valid_plan({
         "title": "分步骤跟踪", "objective": "验证 Agent 与 Runtime 分别维护步骤",
         "steps": [
             {"id": "reading", "title": "阅读官方文档", "phase": "reading"},
             {"id": "discovery", "title": "检索官方资料", "phase": "discovery"},
         ],
-    }, ensure_ascii=False))
+    }), ensure_ascii=False))
     service.update_plan_step_status("reading", "in_progress", "Agent 正在阅读官方文档")
     tracker = PlanProgressTracker(db, task["task_id"], service.artifacts)
 
@@ -485,10 +496,10 @@ def test_active_plan_step_is_attached_to_tool_call_events(settings, db):
     from app.runtime.plan_progress import PlanProgressTracker
 
     task, service = make_service(settings, db)
-    service.update_research_plan(json.dumps({
+    service.update_research_plan(json.dumps(valid_plan({
         "title": "步骤关联", "objective": "关联工具与步骤",
         "steps": [{"id": "read", "title": "阅读官方源码", "phase": "reading"}],
-    }, ensure_ascii=False))
+    }), ensure_ascii=False))
     tracker = PlanProgressTracker(db, task["task_id"], service.artifacts)
     tracker.activate_step("read", "开始阅读源码")
     callback = TaskEventCallback(
@@ -511,10 +522,10 @@ def test_tool_failure_transitions_associated_step_to_retrying_then_resumes(setti
     from app.runtime.plan_progress import PlanProgressTracker
 
     task, service = make_service(settings, db)
-    service.update_research_plan(json.dumps({
+    service.update_research_plan(json.dumps(valid_plan({
         "title": "失败恢复", "objective": "验证工具失败后的步骤状态",
         "steps": [{"id": "reading", "title": "阅读官方文档", "phase": "reading"}],
-    }, ensure_ascii=False))
+    }), ensure_ascii=False))
     tracker = PlanProgressTracker(db, task["task_id"], service.artifacts)
     tracker.activate_step("reading", "开始阅读")
     callback = TaskEventCallback(
@@ -535,10 +546,10 @@ def test_structured_tool_failure_updates_step_and_trace_as_failed(settings, db):
     from app.runtime.plan_progress import PlanProgressTracker
 
     task, service = make_service(settings, db)
-    service.update_research_plan(json.dumps({
+    service.update_research_plan(json.dumps(valid_plan({
         "title": "结构化失败", "objective": "验证工具返回失败结果",
         "steps": [{"id": "read", "title": "阅读官方网页", "phase": "reading"}],
-    }, ensure_ascii=False))
+    }), ensure_ascii=False))
     tracker = PlanProgressTracker(db, task["task_id"], service.artifacts)
     tracker.activate_step("read", "读取来源")
     callback = TaskEventCallback(
@@ -562,10 +573,10 @@ def test_plan_snapshot_tracker_persists_active_step_and_history(settings, db):
     from app.runtime.plan_progress import PlanProgressTracker
 
     task, service = make_service(settings, db)
-    service.update_research_plan(json.dumps({
+    service.update_research_plan(json.dumps(valid_plan({
         "title": "快照计划", "objective": "验证持久化计划快照",
         "steps": [{"id": "one", "title": "阅读资料", "phase": "reading"}],
-    }, ensure_ascii=False))
+    }), ensure_ascii=False))
     service.set_active_plan_step("one", "开始阅读")
     snapshot = PlanProgressTracker(db, task["task_id"], service.artifacts).snapshot()
     assert snapshot["current_version"] == 1
