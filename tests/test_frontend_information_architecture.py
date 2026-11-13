@@ -40,7 +40,10 @@ def test_evidence_ledger_has_source_id_verification_and_snapshot_preview():
     assert "source.source_id" in JS
     assert "sourceDomain(source.url)" in JS
     assert "data-snapshot" in JS
-    assert "openFile(button.dataset.snapshot)" in JS
+    assert "openEvidenceSnapshot(button.dataset.snapshotSource" in JS
+    assert "data-snapshot-source" in JS
+    assert "/evidence/sources/" in JS and "/snapshot" in JS
+    assert "SHA-256 已核验" in JS
     assert "原始来源" in JS
     assert "尚未登记证据" in JS
 

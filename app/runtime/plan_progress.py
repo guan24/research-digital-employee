@@ -80,7 +80,7 @@ class PlanProgressTracker:
         if phase in cls.PHASE_ORDER:
             return phase
         text = " ".join(str(step.get(k) or "") for k in ("title", "objective", "expected_output")).lower()
-        for phase in ("report", "reading", "analysis", "validation", "discovery", "scope"):
+        for phase in ("validation", "report", "reading", "analysis", "discovery", "scope"):
             if any(word in text for word in cls.KEYWORDS[phase]):
                 return phase
         return None
@@ -345,15 +345,26 @@ class PlanProgressTracker:
         version = int((pe.get("payload") or {}).get("version") or 1)
         plan = self._normalize_plan((pe.get("payload") or {}).get("plan") or {})
         ids = {s["id"]: s for s in plan["steps"]}
-        active = [p for p in self._latest_progress(events).values()
-                  if p.get("status") in {"in_progress", "awaiting_verification"}
-                  and int(p.get("plan_version") or 1) == version
-                  and p.get("step_id") in ids]
-        for p in sorted(active, key=lambda x: x.get("event_id", 0), reverse=True):
-            self.transition_step(p["step_id"], "completed", note, source="runtime",
-                phase=p.get("phase") or self._step_phase(ids[p["step_id"]]) or "validation",
-                output_path=output_path, expected_version=version)
-        return len(active)
+        eligible = []
+        for item in self._latest_progress(events).values():
+            if int(item.get("plan_version") or 1) != version or item.get("step_id") not in ids:
+                continue
+            if item.get("status") == "in_progress":
+                eligible.append(item)
+                continue
+            if item.get("status") != "awaiting_verification" or not output_path:
+                continue
+            step = ids[item["step_id"]]
+            expected = str(step.get("expected_output_path") or step.get("expected_output") or "").strip()
+            if expected and expected.replace("\\\\", "/") == str(output_path).replace("\\\\", "/"):
+                eligible.append(item)
+        for item in sorted(eligible, key=lambda x: x.get("event_id", 0), reverse=True):
+            self.transition_step(
+                item["step_id"], "completed", note, source="runtime",
+                phase=item.get("phase") or self._step_phase(ids[item["step_id"]]) or "validation",
+                output_path=output_path, expected_version=version,
+            )
+        return len(eligible)
 
     def pause_active_steps(self, note="任务已暂停，等待恢复执行"):
         events = self.db.get_events(self.task_id, limit=5000)
