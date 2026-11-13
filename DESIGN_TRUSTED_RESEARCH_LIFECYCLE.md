@@ -327,7 +327,7 @@ Worker 心跳过期后，RecoveryManager 先将未完成调用标记为 unknown�
 | 累计运行时间 | 3,600 秒 |
 | Token | 100,000 |
 
-模型调用前，共享任务运行层在模型调用前预留启发式输入 Token 估算、4,096 Token 输出上限和 256 Token 固定开销；模型响应后可用时使用 Provider usage 结算。Token 估算用于预算保护，不等同于 Provider 精确计量。
+模型调用前，共享任务运行层预留启发式输入 Token 估算、4,096 Token 输出上限和 256 Token 固定开销；模型响应后可用时使用 Provider usage 结算。Token 估算用于预算保护，不等同于 Provider 精确计量。
 
 收敛阶段保护：
 
