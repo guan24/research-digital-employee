@@ -381,9 +381,11 @@ class Database:
         return list(reversed(result))
 
     def begin_tool_call(self, task_id: str, call_id: str, idempotency_key: str, tool_name: str,
-                        input_json: str, input_hash: str, worker_generation: int = 0) -> dict[str, Any]:
+                        input_json: str, input_hash: str, worker_generation: int = 0,
+                        worker_id: str | None = None, event_payload: dict | None = None) -> dict[str, Any]:
         now = utc_now()
         with self.transaction() as conn:
+            self._require_owner(conn, task_id, worker_id, worker_generation if worker_id else None)
             existing = conn.execute(
                 "SELECT * FROM tool_calls WHERE task_id=? AND idempotency_key=?",
                 (task_id, idempotency_key),
@@ -396,6 +398,10 @@ class Database:
                            WHERE task_id=? AND call_id=?""",
                         (worker_generation, now, task_id, existing["call_id"]),
                     )
+                    self._insert_event(conn, task_id, "tool_call_started", {
+                        **(event_payload or {}), "call_id": existing["call_id"], "tool": tool_name,
+                        "attempt": existing["attempts"] + 1, "worker_generation": worker_generation,
+                    })
                 row = conn.execute(
                     "SELECT * FROM tool_calls WHERE task_id=? AND call_id=?",
                     (task_id, existing["call_id"]),
@@ -412,29 +418,61 @@ class Database:
                 "SELECT * FROM tool_calls WHERE task_id=? AND call_id=?",
                 (task_id, call_id),
             ).fetchone()
+            self._insert_event(conn, task_id, "tool_call_started", {**(event_payload or {}), "call_id": call_id, "tool": tool_name})
         return dict(row)
 
-    def finish_tool_call(self, task_id: str, call_id: str, result: str) -> bool:
-        from hashlib import sha256
-        value = str(result or "")
-        digest = sha256(value.encode("utf-8")).hexdigest()
-        with self.transaction() as conn:
-            cur = conn.execute(
-                """UPDATE tool_calls SET status='succeeded',result_json=?,result_hash=?,completed_at=?,error_json=NULL
-                   WHERE task_id=? AND call_id=? AND status IN ('running','unknown')""",
-                (json.dumps({"summary": value[:20000]}, ensure_ascii=False), digest, utc_now(), task_id, call_id),
-            )
-        return cur.rowcount == 1
+    @staticmethod
+    def _require_owner(conn, task_id, worker_id, generation, statuses=("running",)):
+        from app.runtime.control import WorkerLeaseLost
+        row = conn.execute("SELECT * FROM tasks WHERE task_id=?", (task_id,)).fetchone()
+        if not row or row["status"] not in statuses or (
+            worker_id is not None and row["worker_id"] != worker_id
+        ) or (generation is not None and row["worker_generation"] != generation):
+            raise WorkerLeaseLost("task owner, generation or execution status changed")
+        return row
 
-    def fail_tool_call(self, task_id: str, call_id: str, error: str, category: str = "unknown") -> bool:
+    @staticmethod
+    def _insert_event(conn, task_id, event_type, payload):
+        from app.infrastructure.redaction import redact_value
+        conn.execute("INSERT INTO events(task_id,timestamp,event_type,payload_json) VALUES(?,?,?,?)",
+                     (task_id, utc_now(), event_type, json.dumps(redact_value(payload), ensure_ascii=False, default=str)))
+
+    def finish_tool_call(self, task_id, call_id, result, worker_id=None, generation=None, event_payload=None):
+        return self._end_tool_call(task_id, call_id, "succeeded", str(result), worker_id, generation, event_payload)
+
+    def fail_tool_call(self, task_id, call_id, error, category="unknown", worker_id=None, generation=None, event_payload=None):
+        return self._end_tool_call(task_id, call_id, "failed", str(error), worker_id, generation, event_payload, category)
+
+    def _end_tool_call(self, task_id, call_id, status, value, worker_id, generation, payload, category="unknown"):
+        from hashlib import sha256
+        from app.runtime.control import WorkerLeaseLost
         with self.transaction() as conn:
-            cur = conn.execute(
-                """UPDATE tool_calls SET status='failed',error_json=?,completed_at=?
-                   WHERE task_id=? AND call_id=? AND status IN ('running','unknown')""",
-                (json.dumps({"category": category, "error": str(error)[:3000]}, ensure_ascii=False),
-                 utc_now(), task_id, call_id),
-            )
-        return cur.rowcount == 1
+            task = self._require_owner(conn, task_id, worker_id, generation)
+            row = conn.execute("SELECT * FROM tool_calls WHERE task_id=? AND call_id=?", (task_id, call_id)).fetchone()
+            if row is None:
+                raise ValueError("tool call was not registered")
+            if generation is not None and not (payload or {}).get("recovered") and row["worker_generation"] != generation:
+                raise WorkerLeaseLost("tool call belongs to another generation")
+            if row["status"] in {"succeeded", "failed"}:
+                if row["status"] != status:
+                    raise ValueError("conflicting duplicate tool terminal callback")
+                if status == "succeeded" and row["result_hash"] != sha256(value.encode("utf-8")).hexdigest():
+                    raise ValueError("conflicting duplicate tool result")
+                if status == "failed" and json.loads(row["error_json"])["error"] != value[:3000]:
+                    raise ValueError("conflicting duplicate tool error")
+                return False
+            if row["status"] not in {"running", "unknown"}:
+                raise ValueError("tool call is not executable")
+            conn.execute("""UPDATE tool_calls SET status=?,result_json=?,result_hash=?,error_json=?,completed_at=?
+                            WHERE task_id=? AND call_id=?""", (
+                status, json.dumps({"summary": value[:20000]}, ensure_ascii=False) if status == "succeeded" else None,
+                sha256(value.encode("utf-8")).hexdigest() if status == "succeeded" else None,
+                json.dumps({"category": category, "error": value[:3000]}, ensure_ascii=False) if status == "failed" else None,
+                utc_now(), task_id, call_id))
+            event = {**(payload or {}), "call_id": call_id, "tool": row["tool_name"],
+                     "attempt": row["attempts"], "worker_generation": task["worker_generation"]}
+            self._insert_event(conn, task_id, "tool_call_completed" if status == "succeeded" else "tool_call_failed", event)
+        return True
 
     def get_open_tool_calls(self, task_id: str) -> list[dict[str, Any]]:
         with closing(self.connect()) as conn:
@@ -444,8 +482,10 @@ class Database:
             ).fetchall()
         return [dict(row) for row in rows]
 
-    def mark_tool_call_unknown(self, task_id: str, call_id: str, reason: str) -> bool:
+    def mark_tool_call_unknown(self, task_id: str, call_id: str, reason: str, worker_id=None, generation=None) -> bool:
         with self.transaction() as conn:
+            if worker_id is not None or generation is not None:
+                self._require_owner(conn, task_id, worker_id, generation)
             cur = conn.execute(
                 """UPDATE tool_calls SET status='unknown',error_json=?
                    WHERE task_id=? AND call_id=? AND status IN ('prepared','running')""",
@@ -521,11 +561,13 @@ class Database:
             })
 
     def set_waiting_for_human(self, task_id: str, category: str, request: dict[str, Any],
-                              worker_id: str | None = None) -> str | None:
-        self.release_pending_token_reservations(task_id)
+                              worker_id: str | None = None, generation: int | None = None) -> str | None:
         intervention_id = str(uuid.uuid4())
         now_ts, now_iso = time.time(), utc_now()
         with self.transaction() as conn:
+            if worker_id is not None or generation is not None:
+                self._require_owner(conn, task_id, worker_id, generation)
+            self._release_reservations(conn, task_id)
             row = conn.execute("SELECT status,worker_id FROM tasks WHERE task_id=?", (task_id,)).fetchone()
             if not row:
                 return None
@@ -753,118 +795,57 @@ class Database:
             self.add_event(row["task_id"], "worker_recovery_scheduled", {"reason": "stale heartbeat"})
         return len(rows)
 
-    def mark_completed(self, task_id: str, result_path: str, worker_id: str | None = None) -> bool:
-        now_ts = time.time()
-        now_iso = utc_now()
-        with closing(self.connect()) as conn:
-            if worker_id is None:
-                cur = conn.execute(
-                    """UPDATE tasks SET status='completed', completed_at=?, updated_at=?,
-                       runtime_seconds_used=runtime_seconds_used+MAX(0.0, ?-COALESCE(runtime_last_accounted_at, heartbeat_at, ?)),
-                       runtime_last_accounted_at=NULL, worker_id=NULL, heartbeat_at=NULL,
-                       result_path=?, last_error=NULL, error_category=NULL, error_code=NULL WHERE task_id=?""",
-                    (now_iso, now_iso, now_ts, now_ts, result_path, task_id),
-                )
-            else:
-                cur = conn.execute(
-                    """UPDATE tasks SET status='completed', completed_at=?, updated_at=?,
-                       runtime_seconds_used=runtime_seconds_used+MAX(0.0, ?-COALESCE(runtime_last_accounted_at, heartbeat_at, ?)),
-                       runtime_last_accounted_at=NULL, worker_id=NULL, heartbeat_at=NULL,
-                       result_path=?, last_error=NULL WHERE task_id=? AND worker_id=? AND status='running'""",
-                    (now_iso, now_iso, now_ts, now_ts, result_path, task_id, worker_id),
-                )
-        if cur.rowcount:
-            self.add_event(task_id, "task_completed", {"result_path": result_path})
-        else:
-            self.add_event(task_id, "stale_worker_update_ignored", {"attempted_status": "completed"})
-        return cur.rowcount == 1
-
-    def mark_paused(self, task_id: str, worker_id: str | None = None) -> bool:
-        self.release_pending_token_reservations(task_id)
-        now_ts = time.time()
-        now_iso = utc_now()
-        with closing(self.connect()) as conn:
-            if worker_id is None:
-                cur = conn.execute(
-                    """UPDATE tasks SET status='paused', pause_requested=0,
-                       runtime_seconds_used=runtime_seconds_used+MAX(0.0, ?-COALESCE(runtime_last_accounted_at, heartbeat_at, ?)),
-                       runtime_last_accounted_at=NULL, worker_id=NULL, heartbeat_at=NULL, updated_at=? WHERE task_id=?""",
-                    (now_ts, now_ts, now_iso, task_id),
-                )
-            else:
-                cur = conn.execute(
-                    """UPDATE tasks SET status='paused', pause_requested=0,
-                       runtime_seconds_used=runtime_seconds_used+MAX(0.0, ?-COALESCE(runtime_last_accounted_at, heartbeat_at, ?)),
-                       runtime_last_accounted_at=NULL, worker_id=NULL, heartbeat_at=NULL, updated_at=? WHERE task_id=? AND worker_id=? AND status='running'""",
-                    (now_ts, now_ts, now_iso, task_id, worker_id),
-                )
-        if cur.rowcount:
-            self.add_event(task_id, "task_paused", {})
-        return cur.rowcount == 1
-
-    def mark_cancelled(self, task_id: str, worker_id: str | None = None) -> bool:
-        self.release_pending_token_reservations(task_id)
-        now_ts = time.time()
-        now_iso = utc_now()
+    def _transition_task(self, task_id, status, worker_id=None, generation=None, *, result_path=None, error=None, delay=0, attempt=None):
         with self.transaction() as conn:
-            if worker_id is None:
-                cur = conn.execute(
-                    """UPDATE tasks SET status=CASE WHEN status='deleting' THEN 'deleting' ELSE 'cancelled' END,
-                       cancel_requested=0, runtime_seconds_used=runtime_seconds_used+MAX(0.0, ?-COALESCE(runtime_last_accounted_at, heartbeat_at, ?)),
-                       runtime_last_accounted_at=NULL, worker_id=NULL, heartbeat_at=NULL, updated_at=? WHERE task_id=?""",
-                    (now_ts, now_ts, now_iso, task_id),
-                )
+            if worker_id is not None or generation is not None:
+                row = self._require_owner(conn, task_id, worker_id, generation, ("running", "deleting") if status == "cancelled" else ("running",))
             else:
-                cur = conn.execute(
-                    """UPDATE tasks SET status=CASE WHEN status='deleting' THEN 'deleting' ELSE 'cancelled' END,
-                       cancel_requested=0, runtime_seconds_used=runtime_seconds_used+MAX(0.0, ?-COALESCE(runtime_last_accounted_at, heartbeat_at, ?)),
-                       runtime_last_accounted_at=NULL, worker_id=NULL, heartbeat_at=NULL, updated_at=? WHERE task_id=? AND worker_id=? AND status IN ('running','deleting')""",
-                    (now_ts, now_ts, now_iso, task_id, worker_id),
-                )
-            if cur.rowcount:
-                conn.execute(
-                    "INSERT INTO events(task_id,timestamp,event_type,payload_json) VALUES(?,?,?,?)",
-                    (task_id, now_iso, "task_cancelled", "{}"),
-                )
-        return cur.rowcount == 1
+                row = conn.execute("SELECT * FROM tasks WHERE task_id=?", (task_id,)).fetchone()
+                if not row:
+                    return False
+                if status == "failed" and row["status"] in {"completed", "cancelled", "deleting"}:
+                    return False
+            self._release_reservations(conn, task_id)
+            target = "deleting" if row["status"] == "deleting" and status == "cancelled" else status
+            now = time.time()
+            conn.execute("""UPDATE tasks SET status=?,worker_id=NULL,heartbeat_at=NULL,
+                runtime_seconds_used=runtime_seconds_used+MAX(0.0,?-COALESCE(runtime_last_accounted_at,heartbeat_at,?)),
+                runtime_last_accounted_at=NULL,updated_at=?,completed_at=?,next_run_at=?,
+                pause_requested=CASE WHEN ?='paused' THEN 0 ELSE pause_requested END,
+                cancel_requested=CASE WHEN ?='cancelled' THEN 0 ELSE cancel_requested END,
+                result_path=COALESCE(?,result_path),last_error=? WHERE task_id=?""",
+                (target, now, now, utc_now(), utc_now() if status in {"completed","failed","cancelled"} else None,
+                 now+delay if status == "retry_wait" else 0, status, status, result_path, error, task_id))
+            if status == "completed" and worker_id is None:
+                conn.execute("UPDATE tasks SET error_category=NULL,error_code=NULL WHERE task_id=?", (task_id,))
+            event = "retry_scheduled" if status == "retry_wait" else "task_" + status
+            payload = {"result_path": result_path} if status == "completed" else {}
+            if error is not None:
+                payload.update(error=error[:2000], next_status=status, delay_seconds=delay, attempt=attempt, max_attempts=row["max_attempts"],
+                               category=row["error_category"] or "unknown", error_code=row["error_code"] or "UNKNOWN_EXCEPTION", terminal=status == "failed")
+            self._insert_event(conn, task_id, event, payload)
+        return True
 
-    def schedule_retry(self, task: dict[str, Any], error: str, delay_seconds: int, worker_id: str | None = None) -> str:
-        self.release_pending_token_reservations(task["task_id"])
-        terminal = int(task["attempts"]) >= int(task["max_attempts"])
-        status = "failed" if terminal else "retry_wait"
-        now_ts = time.time()
-        now_iso = utc_now()
-        with closing(self.connect()) as conn:
-            runtime_sql = "runtime_seconds_used=runtime_seconds_used+MAX(0.0, ?-COALESCE(runtime_last_accounted_at, heartbeat_at, ?)), runtime_last_accounted_at=NULL"
-            if worker_id is None:
-                cur = conn.execute(
-                    f"""UPDATE tasks SET status=?, next_run_at=?, worker_id=NULL, heartbeat_at=NULL,
-                       {runtime_sql}, updated_at=?, last_error=? WHERE task_id=?""",
-                    (status, now_ts + delay_seconds, now_ts, now_ts, now_iso, error[:4000], task["task_id"]),
-                )
-            else:
-                cur = conn.execute(
-                    f"""UPDATE tasks SET status=?, next_run_at=?, worker_id=NULL, heartbeat_at=NULL,
-                       {runtime_sql}, updated_at=?, last_error=? WHERE task_id=? AND worker_id=? AND status='running'""",
-                    (status, now_ts + delay_seconds, now_ts, now_ts, now_iso, error[:4000], task["task_id"], worker_id),
-                )
-        if not cur.rowcount:
-            self.add_event(task["task_id"], "stale_worker_update_ignored", {"attempted_status": status})
-            return "lease_lost"
-        current = self.get_task(task["task_id"]) or {}
-        self.add_event(
-            task["task_id"],
-            "task_failed" if terminal else "retry_scheduled",
-            {"error": error[:2000], "next_status": status, "delay_seconds": delay_seconds,
-             "attempt": task["attempts"], "max_attempts": task["max_attempts"],
-             "category": current.get("error_category") or "unknown",
-             "error_code": current.get("error_code") or "UNKNOWN_EXCEPTION"},
-        )
+    def mark_completed(self, task_id, result_path, worker_id=None, generation=None):
+        return self._transition_task(task_id, "completed", worker_id, generation, result_path=result_path)
+
+    def mark_paused(self, task_id, worker_id=None, generation=None):
+        return self._transition_task(task_id, "paused", worker_id, generation)
+
+    def mark_cancelled(self, task_id, worker_id=None, generation=None):
+        return self._transition_task(task_id, "cancelled", worker_id, generation)
+
+    def schedule_retry(self, task, error, delay_seconds, worker_id=None):
+        status = "failed" if int(task["attempts"]) >= int(task["max_attempts"]) else "retry_wait"
+        self._transition_task(task["task_id"], status, worker_id, task.get("worker_generation") if worker_id else None,
+                              error=error[:4000], delay=delay_seconds, attempt=task["attempts"])
         return status
 
-    def consume_execution_step(self, task_id: str, worker_id: str | None = None) -> int | None:
+    def consume_execution_step(self, task_id: str, worker_id: str | None = None, generation: int | None = None) -> int | None:
         """Consume hard tool-call quota atomically before invoking the tool."""
         with self.transaction() as conn:
+            if worker_id is not None or generation is not None:
+                self._require_owner(conn, task_id, worker_id, generation)
             sql = "UPDATE tasks SET execution_steps=execution_steps+1 WHERE task_id=? AND status='running' AND (budget_enabled=0 OR execution_steps < max_steps)"
             args = [task_id]
             if worker_id:
@@ -902,13 +883,16 @@ class Database:
             cur = conn.execute(sql, tuple(args))
         return total if cur.rowcount == 1 else 0
 
-    def record_classified_error(self, task_id: str, error: str, category: str, code: str, retryable: bool, attempt: int) -> dict[str, Any]:
+    def record_classified_error(self, task_id: str, error: str, category: str, code: str, retryable: bool, attempt: int, worker_id=None, generation=None) -> dict[str, Any]:
         entry={"category":category,"error_code":code,"retryable":bool(retryable),"attempt":attempt,"timestamp":utc_now(),"summary":str(error)[:2000]}
         with self.transaction() as conn:
+            if worker_id is not None:
+                self._require_owner(conn, task_id, worker_id, generation)
             row=conn.execute("SELECT first_error_json,error_history_json FROM tasks WHERE task_id=?",(task_id,)).fetchone()
             history=json.loads(row["error_history_json"] or "[]"); history.append(entry)
             first=row["first_error_json"] or json.dumps(entry,ensure_ascii=False)
             conn.execute("UPDATE tasks SET error_category=?,error_code=?,first_error_json=?,error_history_json=?,last_error=? WHERE task_id=?",(category,code,first,json.dumps(history,ensure_ascii=False),str(error)[:4000],task_id))
+            self._insert_event(conn, task_id, "task_error_classified", entry)
         return {"first_error":json.loads(first),"error_history":history}
 
     def reserve_tokens(
@@ -1027,29 +1011,32 @@ class Database:
     def release_pending_token_reservations(self, task_id: str) -> int:
         """Release reservations left by an interrupted attempt; settled calls are untouched."""
         with self.transaction() as conn:
-            rows = conn.execute(
-                "SELECT reservation_id,reserved_tokens FROM token_reservations WHERE task_id=? AND settled=0",
-                (task_id,),
-            ).fetchall()
-            amount = sum(int(item["reserved_tokens"]) for item in rows)
-            if not rows:
-                return 0
-            conn.execute(
-                "UPDATE token_reservations SET settled=1 WHERE task_id=? AND settled=0",
-                (task_id,),
-            )
-            conn.execute(
-                "UPDATE tasks SET reserved_tokens=MAX(0,reserved_tokens-?) WHERE task_id=?",
-                (amount, task_id),
-            )
-            conn.execute(
-                "INSERT INTO events(task_id,timestamp,event_type,payload_json) VALUES(?,?,?,?)",
-                (task_id, utc_now(), "token_reservations_released", json.dumps({
-                    "released_tokens": amount, "reservation_count": len(rows),
-                    "reason": "attempt_ended_or_worker_recovered",
-                }, ensure_ascii=False)),
-            )
-            return amount
+            return self._release_reservations(conn, task_id)
+
+    def _release_reservations(self, conn, task_id):
+        rows = conn.execute(
+            "SELECT reservation_id,reserved_tokens FROM token_reservations WHERE task_id=? AND settled=0",
+            (task_id,),
+        ).fetchall()
+        amount = sum(int(item["reserved_tokens"]) for item in rows)
+        if not rows:
+            return 0
+        conn.execute(
+            "UPDATE token_reservations SET settled=1 WHERE task_id=? AND settled=0",
+            (task_id,),
+        )
+        conn.execute(
+            "UPDATE tasks SET reserved_tokens=MAX(0,reserved_tokens-?) WHERE task_id=?",
+            (amount, task_id),
+        )
+        conn.execute(
+            "INSERT INTO events(task_id,timestamp,event_type,payload_json) VALUES(?,?,?,?)",
+            (task_id, utc_now(), "token_reservations_released", json.dumps({
+                "released_tokens": amount, "reservation_count": len(rows),
+                "reason": "attempt_ended_or_worker_recovered",
+            }, ensure_ascii=False)),
+        )
+        return amount
 
     def check_runtime_budget(self, task_id: str, worker_id: str | None = None,
                              generation: int | None = None) -> dict[str, Any]:
@@ -1335,32 +1322,8 @@ class Database:
                     conn.execute("INSERT INTO events(task_id,timestamp,event_type,payload_json) VALUES(?,?,?,?)",
                         (task_id, utc_now(), event_type, payload))
 
-    def mark_failed(self, task_id: str, error: str, worker_id: str | None = None) -> bool:
-        self.release_pending_token_reservations(task_id)
-        now_ts = time.time()
-        now_iso = utc_now()
-        with self.transaction() as conn:
-            if worker_id is None:
-                cur = conn.execute(
-                    """UPDATE tasks SET status='failed', completed_at=?, updated_at=?,
-                       runtime_seconds_used=runtime_seconds_used+MAX(0.0, ?-COALESCE(runtime_last_accounted_at, heartbeat_at, ?)),
-                       runtime_last_accounted_at=NULL, worker_id=NULL, heartbeat_at=NULL,
-                       last_error=? WHERE task_id=? AND status NOT IN ('completed','cancelled','deleting')""",
-                    (now_iso, now_iso, now_ts, now_ts, error[:4000], task_id),
-                )
-            else:
-                cur = conn.execute(
-                    """UPDATE tasks SET status='failed', completed_at=?, updated_at=?,
-                       runtime_seconds_used=runtime_seconds_used+MAX(0.0, ?-COALESCE(runtime_last_accounted_at, heartbeat_at, ?)),
-                       runtime_last_accounted_at=NULL, worker_id=NULL, heartbeat_at=NULL,
-                       last_error=? WHERE task_id=? AND worker_id=? AND status='running'""",
-                    (now_iso, now_iso, now_ts, now_ts, error[:4000], task_id, worker_id),
-                )
-            if cur.rowcount:
-                detail = conn.execute("SELECT error_category,error_code FROM tasks WHERE task_id=?", (task_id,)).fetchone()
-                payload = {"error": error[:2000], "terminal": True, "category": detail["error_category"] if detail else "unknown", "error_code": detail["error_code"] if detail else "UNKNOWN_EXCEPTION"}
-                conn.execute("INSERT INTO events(task_id,timestamp,event_type,payload_json) VALUES(?,?,?,?)",(task_id,now_iso,"task_failed",json.dumps(payload,ensure_ascii=False)))
-        return cur.rowcount == 1
+    def mark_failed(self, task_id, error, worker_id=None, generation=None):
+        return self._transition_task(task_id, "failed", worker_id, generation, error=error[:4000])
 
     def request_pause(self, task_id: str) -> bool:
         with closing(self.connect()) as conn:

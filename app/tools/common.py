@@ -94,6 +94,8 @@ class TaskToolService:
     def save_artifact(self, path: str, content: str) -> str:
         self.check_control()
         normalized = str(content if content is not None else "")
+        if self.artifacts.exists(path) and self.artifacts.read_text(path) == normalized:
+            return f"Artifact already read-back verified: {path}"
         saved = self.artifacts.write_text(path, normalized)
         persisted = self.artifacts.read_text(path)
         if persisted != normalized:

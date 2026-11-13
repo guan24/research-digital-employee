@@ -56,22 +56,25 @@ class RecoveryManager:
 
     def begin_tool_call(self, task_id: str, call_id: str, tool_name: str,
                         input_value: str, worker_generation: int = 0,
-                        metadata: dict[str, Any] | None = None) -> str:
+                        metadata: dict[str, Any] | None = None, worker_id=None, event_payload=None) -> str:
         arguments, canonical = self._json_input(input_value)
         input_hash = hashlib.sha256(canonical.encode("utf-8")).hexdigest()
         metadata = metadata or {}
-        scope = ":".join(str(metadata.get(key) or "") for key in ("langgraph_node", "langgraph_step"))
-        # A graph node + step + normalized arguments is stable across a resumed
-        # checkpoint. When graph metadata is absent, run_id prevents false dedupe.
-        stable_scope = scope if scope.strip(":") else str(call_id)
-        key_material = "|".join((task_id, stable_scope, tool_name, input_hash))
-        idempotency_key = hashlib.sha256(key_material.encode("utf-8")).hexdigest()
+        idempotency_key = self.call_key(task_id, tool_name, input_value, metadata, call_id)
         record = self.db.begin_tool_call(
             task_id, str(call_id), idempotency_key, str(tool_name or "unknown"),
             json.dumps(arguments, ensure_ascii=False, default=str) if arguments else canonical,
-            input_hash, worker_generation,
+            input_hash, worker_generation, worker_id, event_payload,
         )
         return str(record.get("call_id") or call_id)
+
+    @classmethod
+    def call_key(cls, task_id, tool_name, input_value, metadata, call_id):
+        _, canonical = cls._json_input(input_value)
+        input_hash = hashlib.sha256(canonical.encode("utf-8")).hexdigest()
+        scope = ":".join(str(metadata.get(key) or "") for key in ("langgraph_node", "langgraph_step"))
+        stable_scope = scope if scope.strip(":") else str(call_id)
+        return hashlib.sha256("|".join((task_id, stable_scope, tool_name, input_hash)).encode("utf-8")).hexdigest()
 
     def finish_tool_call(self, task_id: str, call_id: str, output: Any) -> None:
         self.db.finish_tool_call(task_id, call_id, str(output))
@@ -102,7 +105,11 @@ class RecoveryManager:
                     "reason": f"{type(exc).__name__}: {exc}"}
 
     def _verify_unknown_call(self, task_id: str, record: dict[str, Any],
-                             artifacts: ArtifactStore, registry: Any = None) -> dict[str, Any]:
+                             artifacts: ArtifactStore, registry: Any = None, expected_task=None) -> dict[str, Any]:
+        expected_task = expected_task or self.db.get_task(task_id)
+        def confirm(value):
+            return self.db.finish_tool_call(task_id, record["call_id"], value,
+                expected_task.get("worker_id"), expected_task["worker_generation"], {"recovered": True})
         tool_name = str(record.get("tool_name") or "")
         arguments, _ = self._json_input(str(record.get("input_json") or ""))
         call_id = str(record.get("call_id") or "")
@@ -116,7 +123,7 @@ class RecoveryManager:
                 try:
                     persisted = artifacts.read_text(path)
                     if persisted == content:
-                        self.db.finish_tool_call(task_id, call_id, "recovered by exact artifact read-back")
+                        confirm("recovered by exact artifact read-back")
                         return {"action": "mark_succeeded", "confidence": "high",
                                 "reason": "目标 Artifact 与原始写入内容完全一致。",
                                 "path": path,
@@ -132,7 +139,7 @@ class RecoveryManager:
             path = "notes/research_memory.md"
             content = str(arguments.get("content") or "").strip() + "\n"
             if artifacts.exists(path) and artifacts.read_text(path) == content:
-                self.db.finish_tool_call(task_id, call_id, "recovered by memory read-back")
+                confirm("recovered by memory read-back")
                 return {"action": "mark_succeeded", "confidence": "high", "reason": "Exact memory read-back."}
             return {"action": "manual_review", "confidence": "low", "reason": "Memory write cannot be verified."}
         if tool_name == "record_finding":
@@ -144,7 +151,7 @@ class RecoveryManager:
                 if (finding.get("claim") == arguments.get("claim")
                         and finding.get("source_ids") == arguments.get("source_ids")
                         and finding.get("dimension_id") == arguments.get("dimension_id")):
-                    self.db.finish_tool_call(task_id, call_id, "recovered by finding registry lookup")
+                    confirm("recovered by finding registry lookup")
                     return {"action": "mark_succeeded", "confidence": "high",
                             "reason": "Evidence Registry 中已存在完全匹配的 Finding。",
                             "finding_id": finding.get("finding_id")}
@@ -183,7 +190,7 @@ class RecoveryManager:
                 if any(not any(p.get("step_id") == step["id"] and p.get("plan_version") == latest["payload"].get("version")
                                for p in progress) for step in persisted["steps"]):
                     return {"action": "manual_review", "confidence": "low", "reason": "Plan progress synchronization is incomplete."}
-                self.db.finish_tool_call(task_id, call_id, "recovered by exact plan comparison")
+                confirm("recovered by exact plan comparison")
                 return {"action": "mark_succeeded", "confidence": "high",
                         "reason": "数据库中存在与本次工具输入完全一致的研究计划。",
                         "plan_version": latest.get("payload", {}).get("version")}
@@ -235,7 +242,7 @@ class RecoveryManager:
                 if not exists:
                     return {"action": "manual_review", "confidence": "low", "reason": "Completed step artifact no longer matches its verified hash."}
             if exists:
-                self.db.finish_tool_call(task_id, call_id, "recovered by exact plan progress comparison")
+                confirm("recovered by exact plan progress comparison")
                 return {"action": "mark_succeeded", "confidence": "high",
                         "reason": "数据库已有与本次参数、计划版本和产物校验完全匹配的步骤状态事件。"}
             return {"action": "retry_allowed", "confidence": "medium",
@@ -252,7 +259,7 @@ class RecoveryManager:
                 if current.get("dimensions") else {}
             )
             if candidate == current_normalized:
-                self.db.finish_tool_call(task_id, call_id, "recovered by exact requirements comparison")
+                confirm("recovered by exact requirements comparison")
                 return {"action": "mark_succeeded", "confidence": "high",
                         "reason": "Research Controller 中已持久化完全匹配的研究要求。"}
             return {"action": "retry_allowed", "confidence": "medium",
@@ -266,13 +273,8 @@ class RecoveryManager:
         decisions = []
         ambiguous = []
         for record in self.db.get_open_tool_calls(task_id):
-            self.db.mark_tool_call_unknown(task_id, record["call_id"], "worker heartbeat expired")
-            result = self._verify_unknown_call(task_id, record, artifacts)
-            if result["action"] == "mark_succeeded":
-                self.db.add_event(task_id, "tool_call_completed", {
-                    "call_id": record["call_id"], "tool": record["tool_name"],
-                    "recovered": True, "verification": result,
-                })
+            self.db.mark_tool_call_unknown(task_id, record["call_id"], "worker heartbeat expired", task.get("worker_id"), task["worker_generation"])
+            result = self._verify_unknown_call(task_id, record, artifacts, expected_task=task)
             decisions.append({"call_id": record["call_id"], "tool": record["tool_name"], **result})
             self.db.record_recovery_decision(
                 task_id, "tool_call_reconciliation", result["action"], result["confidence"],
@@ -296,6 +298,7 @@ class RecoveryManager:
                 {"summary": "自动恢复无法证明状态唯一正确。", "conflicts": ambiguous,
                  "checkpoint": checkpoint, "tool_calls": decisions,
                  "choices": ["terminate"]},
+                worker_id=task.get("worker_id"), generation=task["worker_generation"],
             )
         else:
             self.db.add_event(task_id, "recovery_reconciliation_completed", outcome)

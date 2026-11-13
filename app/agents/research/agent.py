@@ -55,9 +55,10 @@ def build_research_agent(
     task: dict[str, Any],
     checkpointer: Any,
     started_monotonic: float,
+    *, model: Any = None,
 ):
     """Build one task-scoped Deep Agent. Imports are lazy so API/tests need not load model SDKs."""
-    if not settings.openai_api_key:
+    if model is None and not settings.openai_api_key:
         raise RuntimeError("OPENAI_API_KEY is not configured; copy .env.example to .env and set the key")
 
     os.environ.setdefault("LANGGRAPH_STRICT_MSGPACK", "true")
@@ -67,6 +68,7 @@ def build_research_agent(
     from deepagents.middleware.summarization import SummarizationMiddleware
     from deepagents.profiles import GeneralPurposeSubagentProfile, HarnessProfile, register_harness_profile
     from langchain_openai import ChatOpenAI
+    from app.runtime.tool_replay import tool_replay_guard
 
     # Keep the MVP deliberately single-agent and do not expose shell execution.
     register_harness_profile(
@@ -81,15 +83,16 @@ def build_research_agent(
     artifacts = ArtifactStore(settings.workspace_dir, task["task_id"])
     tool_service = ResearchToolService(settings, db, task["task_id"], artifacts, started_monotonic,
         task.get("worker_id"), task.get("worker_generation"))
-    model = ChatOpenAI(
-        model=settings.openai_model,
-        api_key=settings.openai_api_key,
-        base_url=settings.openai_base_url,
-        temperature=0.1,
-        timeout=settings.model_timeout_seconds,
-        max_retries=1,
-        max_tokens=MODEL_MAX_OUTPUT_TOKENS,
-    )
+    if model is None:
+        model = ChatOpenAI(
+            model=settings.openai_model,
+            api_key=settings.openai_api_key,
+            base_url=settings.openai_base_url,
+            temperature=0.1,
+            timeout=settings.model_timeout_seconds,
+            max_retries=1,
+            max_tokens=MODEL_MAX_OUTPUT_TOKENS,
+        )
     backend = CompositeBackend(
         default=StateBackend(),
         routes={"/research_memory/": FilesystemBackend(root_dir=str(artifacts.workspace), virtual_mode=True)},
@@ -110,7 +113,7 @@ def build_research_agent(
         model=model,
         tools=tool_service.as_langchain_tools(),
         system_prompt=profile.system_prompt + "\\n\\nTask memory: call read_research_memory at the start and after context compaction; save concise verified progress with save_research_memory before major phase transitions and before final synthesis. The task-scoped filesystem under /research_memory/ is durable across process restarts.",
-        middleware=[summarization],
+        middleware=[tool_replay_guard(db, task["task_id"]), summarization],
         checkpointer=checkpointer,
         subagents=[],
         backend=backend,

@@ -1,134 +1,86 @@
-# Design — Research Digital Employee
+# 研究数字员工设计说明
 
-This document describes the implementation currently present in the repository, not a target architecture. The MVP optimizes for durable, inspectable research execution on one machine.
+本文描述仓库中已经实现的系统，目标是单机环境中的持久化、可恢复、可审计研究任务，不是未来架构承诺。
 
-## 1. Runtime model
+## 1. 运行模型与职责
 
-The browser is an operator console. FastAPI creates and controls durable tasks. A separate Worker claims tasks and executes a task-scoped Deep Agent. The Agent runs an open-ended tool-use loop: it proposes and revises a research plan, selects tools based on the information gathered, records evidence and writes artifacts. The runtime does not prescribe a fixed search/read/write sequence.
+浏览器是操作控制台，FastAPI 负责创建和控制持久化任务；独立 Worker 获取全局 SQLite 租约后领取任务，Executor 打开任务工作区和 LangGraph Checkpoint，构建岗位 Agent。Agent 自行调用工具、收集证据、修改计划和生成报告，运行时没有固定的搜索、阅读、写作流水线。
 
-The MVP intentionally uses one active Worker and SQLite. A task is not a single HTTP request: it has a durable task ID, lifecycle state, graph checkpoint, event history, resource limits and task-scoped workspace.
-
-~~~mermaid
-flowchart TD
-  UI[Browser console] --> API[FastAPI]
-  API --> DB[(Task SQLite)]
-  DB --> W[Single Worker]
-  W --> EX[Research Executor]
-  EX --> AG[Deep Agent + LangGraph]
-  AG --> T[Research tools]
-  AG --> A[Task artifacts and memory]
-  T --> E[Evidence registry and source snapshots]
-  EX --> CP[(LangGraph SQLite checkpoint)]
-  EX --> DB
-  DB --> SSE[SSE event stream]
-  SSE --> UI
-~~~
-
-## 2. Responsibility boundaries
-
-| Component | Current responsibility |
+| 组件 | 当前职责 |
 |---|---|
-| FastAPI | Task creation and controls, role discovery, events, artifacts, research state, budget and human-intervention APIs |
-| Agent registry | Role builder, optional profile loader, output path, validator, postprocessor, repair limit, finalizer and budget defaults |
-| Research Agent | Research prompt, dynamic plan, tool selection, evidence collection, memory and report writing |
-| TaskToolService | Shared task-scoped artifact read/write, durable memory, budget inspection and extension requests |
-| ResearchToolService | Research-specific search/read tools, evidence/Finding operations, plan and research-status tools, GitHub and arXiv adapters |
-| Research Controller | Deterministic requirements normalization, Finding-to-source coverage, weighted progress and bounded action recommendations |
-| Research Evaluator | Rule-based quality metrics plus an isolated LLM review; persists scores, hard blocks and defects |
-| Recovery Manager | Tool-call lifecycle, unknown-call verification, checkpoint inspection and stale-task reconciliation |
-| Worker / Executor | Claiming, callbacks, checkpoints, model/tool budgets, retries, delivery validation, human parking and role finalization |
-| SQLite / workspace | Task state, events, budgets, quality/recovery records, graph checkpoints and durable files |
+| FastAPI | 任务、岗位、事件、产物、预算、研究状态和人工干预接口 |
+| Agent Registry | Builder、Profile Loader、产物路径、Validator、Postprocessor、修复上限、Finalizer 和默认预算 |
+| Research Agent | 岗位 Prompt、计划、工具选择、研究记忆和报告 |
+| TaskToolService | 公共产物读写、持久化记忆、预算查询和扩额申请 |
+| ResearchToolService | 搜索、网页/PDF、GitHub/arXiv、证据、Finding、计划和研究状态工具 |
+| Research Controller | 研究要求、证据覆盖率、停滞检测和受限行动建议 |
+| Research Evaluator | 规则评分、独立上下文评审、质量缺陷和硬阻断 |
+| RecoveryManager | 工具生命周期、实际副作用核验、Checkpoint 检查和过期任务协调 |
+| Worker / Executor | 任务领取、回调、预算、重试、交付校验、人工停车和岗位收尾 |
 
-The registry is an extension seam, not proof of a complete multi-role scheduler. Only `research` is registered by default. The Executor still attaches research-specific plan-progress and lifecycle components when the selected role is `research`; it is therefore not fully role-agnostic yet.
+默认只注册 `research`。第二岗位只存在于 `tests/test_role_extensibility.py`，用来验证公共运行时、独立预算、JSON 产物校验和 Finalizer。Executor 仍有研究专属生命周期接线，系统不是多岗位并行调度器。
 
-## 3. Task execution lifecycle
+## 2. 生命周期
 
-1. FastAPI validates the requested role and creates a generation-2 task using role budget defaults unless the request overrides them.
-2. The Worker obtains the global SQLite lease, starts its heartbeat loop and claims one queued/retry-wait task. The task receives a new worker generation.
-3. The Executor loads the role registration, creates a task-scoped ArtifactStore, opens the LangGraph SQLite checkpointer and builds the Agent.
-4. The Agent invokes tools through callbacks. Callbacks check task controls and runtime budget, atomically consume a tool-call step, record model/tool events, reserve model tokens and journal tool-call lifecycle.
-5. For the research role, tool activity is mapped to coarse phases (scope, discovery, reading, analysis, report, validation). PlanProgressTracker infers progress from tool/phase transitions unless the Agent has supplied explicit progress. Inferred completion still requires a non-empty readable artifact; otherwise the step becomes `awaiting_verification`.
-6. The research Controller assesses coverage at observed phase boundaries and when the Agent requests research status. It returns allowed/recommended actions. A `REQUEST_HUMAN` decision parks the task at a phase boundary; the Agent performs most other recommended actions.
-7. The Executor ensures the final role artifact exists, reads it back, runs the role validator and, for research, the quality lifecycle. Failed delivery can be repaired within the registration's revision limit. Unresolved quality/reviewer conditions may park for a human decision.
-8. The Worker marks the task terminal and invokes the role finalizer. The research finalizer archives the plan and its material revisions.
+1. API 校验岗位，按岗位默认预算创建运行版本为 2 的任务。
+2. Worker 获取全局租约并启动心跳，领取任务时增加 `worker_generation`。
+3. Executor 使用任务 ID 作为 `thread_id`，复用或创建 SQLite Checkpoint，调用生产 Deep Agents Builder。
+4. 模型调用前预留 Token；工具调用前消耗工具预算，登记开始记录。任务控制信号在执行边界检查。
+5. 研究工具活动映射为范围、检索、阅读、分析、报告、校验阶段。PlanProgressTracker 根据显式步骤或阶段推断进度；完成步骤必须有非空、可读回的产物，否则进入 `awaiting_verification`。
+6. Controller 在阶段边界或状态查询时评估覆盖与停滞；阶段边界的 `REQUEST_HUMAN` 会停车，其余大部分建议由 Agent 执行。
+7. Executor 读回成果、执行岗位校验；研究岗位额外运行质量评估，允许有限修复，必要时转人工。
+8. Worker 原子提交任务终态及其事件，然后调用岗位 Finalizer。研究岗位归档计划和实质性修订。
 
-A checkpoint uses the task ID as its LangGraph thread ID. On resume, the Executor reuses the existing checkpoint. Human decisions are injected as messages with stable IDs so the same decision is not injected twice after an interruption.
+人工决策注入使用稳定消息 ID，恢复时避免重复注入。暂停和重试保留同一 `thread_id`；取消是协作式控制，不能终止已经发送的外部请求。
 
-## 4. Persistence and state ownership
+## 3. 数据所有权与数据库事务
 
-| Store | Owns |
+| 存储 | 权威数据 |
 |---|---|
-| `tasks.sqlite` | Task status, worker ID/generation, lease, budgets, retry metadata, event journal, research requirements/coverage, quality assessments, tool calls, recovery decisions and human interventions |
-| `checkpoints.sqlite` | LangGraph graph state and pending nodes |
-| `workspaces/{task_id}/` | Research plan, plan archive, memory, source snapshots, evidence registry, intermediate artifacts and final deliverable |
+| `tasks.sqlite` | 任务状态、Worker owner/generation、租约、预算、重试、事件、工具台账、研究要求、质量评估、人工干预和恢复决策 |
+| `checkpoints.sqlite` | LangGraph 消息、节点状态和待执行节点 |
+| `workspaces/{task_id}/` | 计划及归档、记忆、来源快照、证据登记簿、中间成果和最终产物 |
 
-Important tables include `tasks`, `events`, `token_reservations`, `worker_lease`, `schema_migrations`, `research_control_state`, `quality_assessments`, `tool_calls`, `recovery_decisions` and `human_interventions`.
+主要表为 `tasks`、`events`、`token_reservations`、`worker_lease`、`schema_migrations`、`research_control_state`、`quality_assessments`、`tool_calls`、`recovery_decisions`、`human_interventions`。
 
-The current additive migration adds runtime-generation and lifecycle fields. On first application of migration version 1, legacy generation-1 tasks still in active states (queued, running, retry_wait, paused or waiting_for_human) are marked `archived` and retain their former state in `archived_from_status`. New tasks are generation 2; the current Worker only claims generation-2 tasks. This migration does not automatically resume legacy active tasks.
+Database 使用 `BEGIN IMMEDIATE` 串行化写事务。Worker 发起的关键更新在实际写入所属事务中重新核对任务状态、`worker_id` 和 `worker_generation`，不依赖回调开始前的 Python 检查。所有权失效抛出 `WorkerLeaseLost`。任务完成、失败、暂停、取消、重试，以及预算预留释放与对应任务事件在同一事务内执行。
 
-## 5. Evidence-driven research control
+`begin_tool_call` 原子登记工具调用及开始事件；`finish_tool_call` / `fail_tool_call` 原子更新工具终态并插入 `tool_call_completed` / `tool_call_failed`。事件插入失败时工具更新回滚。相同终态的重复回调不再插入事件，相互矛盾的终态被拒绝。幂等键保留任务、图节点/步骤和规范化输入信息；恢复沿用原 call ID。生产 Builder 的工具重放保护复用已成功调用的持久化结果，不确定写操作必须先核验，不能当作成功重放。
 
-Research requirements are stored separately from the plan. Each dimension has an ID, title, questions, expected evidence, priority and minimum source count. If the Agent does not define requirements, the Controller derives them from plan steps; if there is no usable plan, it creates a fallback research-scope dimension.
+本次不增加数据库字段。原有增量迁移首次执行时，将仍活跃的运行版本 1 任务归档并保留 `archived_from_status`；新 Worker 只领取运行版本 2 任务。不能通过删除数据库代替升级，也不宣称原有迁移整体是单一事务。
 
-A Finding links a claim to one or more registered source IDs and one primary dimension. Coverage counts only source IDs linked through Findings and whose snapshots pass the current presence/marker checks. Dimension status is covered, partial or uncovered. Weighted coverage uses priority weights: critical 3, high 2, normal 1.
+## 4. 证据驱动的研究控制
 
-The progress vector contains coverage ratio, valid source count, Finding count, critical-gap count and latest quality score. A cycle counts as stagnated after two consecutive eligible assessment cycles without material improvement while critical gaps remain.
+研究要求与执行计划分别持久化。每个研究维度包含 ID、标题、问题、期望证据、优先级和最少来源数量；Agent 未定义时，Controller 从计划推导，必要时建立兜底研究维度。
 
-The Controller returns `FILL_EVIDENCE_GAP`, `REPLAN`, `CONTINUE_RESEARCH`, `ENTER_CONVERGENCE` or `REQUEST_HUMAN` as recommendations/allowed actions. It does not search, rewrite the plan or independently execute all actions. The Agent receives the decision through the research-status tool and the system prompt. The runtime directly parks a task when a phase-boundary callback observes `REQUEST_HUMAN`.
+Finding 将结论、来源 ID 和主要研究维度关联。覆盖率只计入 Finding 实际链接且通过快照检查的来源；优先级权重为关键 3、高 2、普通 1。进度向量包含覆盖率、有效来源数、Finding 数、关键缺口和最新质量分；存在关键缺口且连续两个符合条件的评估周期没有改善时判为停滞。
 
-## 6. Delivery validation and quality evaluation
+Controller 返回 `FILL_EVIDENCE_GAP`、`REPLAN`、`CONTINUE_RESEARCH`、`ENTER_CONVERGENCE`、`REQUEST_HUMAN`，不会自行搜索或重写计划。Agent 通过状态工具与系统 Prompt 接收建议。
 
-ReportValidator performs deterministic structure/provenance checks: a Markdown H1, a separate Sources/References section, minimum body length, direct URLs, known registered source IDs, corresponding source URLs in the Sources section and paragraph-level citation coverage. When an evidence registry is supplied, at least 40% of eligible body paragraphs (paragraphs of at least 80 characters) must contain a valid registered source citation. It also rejects unknown Finding IDs when the report cites them. This is a provenance/format gate, not proof that a source semantically supports a claim.
+`ConditionalResearchModel` 在离线测试中读取实际 HumanMessage、AIMessage 和 ToolMessage：矛盾证据触发 V2 计划和完整审计，支持性证据保持 V1。反事实测试只改变 HTTP 返回证据，保持模型实现、任务目标和初始计划相同。报告修订根据实际质量反馈决定，不以第 N 次调用对应固定响应。测试复用生产 Builder、Profile、System Prompt、工具注册、Executor、Worker 和真实 SQLite Checkpoint，仅注入模拟模型。
 
-ResearchEvaluator has five dimensions with default weights: goal coverage 20%, evidence sufficiency 25%, source reliability 20%, conclusion consistency 20% and report completeness 15%. Rule scores are combined with LLM scores at 60%/40%. The default weighted total threshold is 80 and the per-dimension threshold is 60. Empty reports, no registered sources and invalid source snapshots are non-waivable hard blocks. The independent review is a separate call with no Agent conversation history, but it uses the same configured model and endpoint. It receives the report (bounded to 16,000 characters), up to eight source excerpts (each taken from the end of the snapshot, up to 1,000 characters) and up to 30 Findings.
+## 5. 交付和质量评估
 
-The current research registration sets `max_revisions=3`, so the Executor can run up to three delivery repair rounds after the initial validation. The TOML profile also contains `quality_max_revisions=2`, which is loaded into evaluator profile data but does not currently control the Executor's repair loop; the registration value is the effective delivery limit. This duplicate setting should be consolidated in a future code change.
+ReportValidator 检查 Markdown 一级标题、独立来源章节、正文长度、直接 URL、有效来源 ID、来源对应 URL 和段落引用。提供登记簿时，至少 40% 的合格正文段落需引用有效来源；合格段落至少 80 字符。引用 Finding 时也检查 ID。这是结构与溯源门禁，不证明来源在语义上支持结论。
 
-## 7. Long-running execution, budgets and recovery
+ResearchEvaluator 五维权重为目标覆盖 20%、证据充分 25%、来源可靠 20%、结论一致 20%、报告完整 15%。规则和独立评审按 60%/40% 混合，总分默认门槛 80、单维门槛 60。空报告、无来源和无效快照是不可豁免硬阻断。评审隔离 Agent 会话，但使用相同模型配置；材料限制为报告 16000 字符、最多 8 个来源的各 1000 字符快照尾部，以及最多 30 条 Finding。
 
-The Worker uses a single global SQLite lease and task heartbeats. Retryable failures use bounded exponential backoff; terminal errors fail immediately; pause, cancel, lease loss and human waiting are handled as control signals rather than ordinary retries.
+岗位注册的 `max_revisions=3` 决定实际修复上限。Profile 中另有 `quality_max_revisions=2`，目前不控制 Executor 修复循环，仍是需要未来整合的重复配置。无效评审结构阻止交付，连续低分耗尽修复后转人工。降级交付必须由用户明确批准并通过成果读回。
 
-The hard tool-call budget is consumed atomically before each tool starts. Cumulative runtime is checked at model/tool/callback boundaries and is retained across retries. The main Agent model is configured for a 4,096-token output cap. Before a model call, the runtime reserves a heuristic input estimate plus that output cap and 256 tokens of framing overhead; provider-reported usage is used for settlement when available.
+## 6. 预算与恢复
 
-The budget policy protects 30% of tokens, 25% of tool calls and 20% of runtime for convergence (subject to minimum/maximum reserve rules). When an exploration limit is reached, the task enters convergence and exploration tools such as search and source reads are blocked; artifact, memory, evidence and selected progress tools remain available. Approved extensions add limits and preserve the task workspace/checkpoint.
+工具次数、累计时间和 Token 具有硬闸门。主模型每次预留启发式输入估算、4096 输出 Token 和 256 固定开销；可用时按 Provider usage 结算。Evaluator 输出上限为 1400 Token。
 
-RecoveryManager records tool calls with an input hash, idempotency key, worker generation, status and result/error metadata. On stale-task reconciliation:
-- Read-only web, PDF, GitHub and arXiv calls are eligible for retry because their external response cannot be proven from local state.
-- Artifact writes are confirmed only by exact read-back comparison with the original input.
-- Finding, plan, step-progress and requirement writes are checked against their corresponding persisted record/event.
-- Unknown tool types require manual review.
-- Checkpoint inspection checks the SQLite database/table shape and whether the task thread has checkpoint rows. A detected corruption or ambiguous tool call parks the task for human handling; otherwise the Worker can requeue the task to resume the same checkpoint.
+预算保护 Token 30%、工具次数 25%、运行时间 20% 用于收敛，并应用最小/最大预留规则。探索额度耗尽后阻止新搜索和读取，保留有限的产物、记忆、证据和进度操作；批准扩额可复用已有任务和 Checkpoint。
 
-This is conservative at the application boundary, not an exactly-once guarantee for external services. A retried read request may be sent more than once.
+恢复以实际副作用为依据：只读请求允许有限重试；Artifact 必须与原输入精确读回匹配；Finding 检查登记簿；计划核对最新事件、版本、文件和步骤进度；已完成步骤核对当前产物哈希；记忆检查持久化正文。冲突保留现场并转人工。`TOOL_RECOVERY_POLICIES` 中未知工具默认人工处理，具有控制状态副作用的查询和申请也采用保守策略。
 
-## 8. Observability and operator intervention
+真实子进程测试覆盖 Artifact 已写但工具终态未提交、工具开始后副作用尚未执行、Checkpoint 已保存首节点但下一节点中断。父进程通过 Pipe 屏障确认时点后强制终止子进程，再以递增 generation 恢复。损坏 Checkpoint 保留原文件并转人工。
 
-Events are persisted in SQLite before SSE delivery. Event IDs are durable cursors; clients can reconnect using `Last-Event-ID` or `after_id`. Model/tool callbacks record lifecycle, bounded inputs/outputs, duration, token usage and errors. Credentials are redacted before event persistence. Hidden chain-of-thought is not collected.
+## 7. 可观测性与实现边界
 
-The operator APIs expose task events, budget, evidence, memory, research control state, quality assessments, recovery decisions and pending human interventions. Human decisions are validated against the choices attached to the pending intervention. Supported actions include continue research, change direction, add requirements, continue repair, approve degraded delivery and terminate, subject to the specific intervention's allowed choices. Degraded delivery requires explicit confirmation and a report read-back verification.
+SQLite 事件先持久化再通过 SSE 传输；事件 ID 支持 `Last-Event-ID` / `after_id` 续传。模型和工具事件包含有界输入输出、耗时、Token 和错误，持久化前脱敏，不记录隐藏思维链。操作接口提供预算、证据、记忆、质量、恢复决策和人工干预查询。
 
-## 9. Role boundary and current limitations
+测试文件包括 `tests/test_autonomous_research_e2e.py`、`tests/test_worker_fencing_races.py`、`tests/test_process_crash_recovery.py`、`tests/test_recovery_consistency.py`、`tests/test_role_extensibility.py`、`tests/test_documentation.py`。所有自动化模型、Reviewer 和 HTTP 数据均为模拟，Provider 真实请求被测试保护阻断。
 
-Shared task capabilities live in TaskToolService. Research-specific capabilities live in ResearchToolService and its GitHub/arXiv adapters. A role registration can supply its own builder, profile loader, artifact path, validator, postprocessor, repair count, finalizer and budget defaults.
-
-The current system is still a single-machine, single-Worker MVP:
-- Only the research role is registered by default; multi-role parallel execution is not implemented.
-- The Executor still contains research-specific lifecycle wiring.
-- Controller recommendations other than human parking and budget gates are primarily Agent-directed, not all hard-enforced by the runtime.
-- Source snapshot validation checks file presence and embedded hash/URL markers; it does not recompute the content hash from the extracted source body, and the task workspace is not a tamper-proof immutable store.
-- The LLM reviewer shares the Agent's model configuration and reviews bounded excerpts; the rule-based contradiction check is lexical/heuristic.
-- SQLite and the global Worker lease are not a multi-host scheduler. Cancellation is cooperative.
-- Automated tests are offline and use fakes for external/model behavior. A real end-to-end research task and live crash/restart test remain necessary acceptance evidence.
-
-
-## Offline runtime verification
-
-The offline integration suite drives a real LangChain agent graph with structured fake model tool calls through ResearchToolService, the public executor/worker, SQLite checkpoints and task workspaces. It verifies evidence-driven plan changes, preserved unchanged-step progress, reset changed steps, controller coverage growth, registered citations and a failed review followed by targeted repair. Invalid reviewer structure fails delivery; repeated low scores exhaust the repair allowance and park for human review.
-
-`tests/test_role_extensibility.py` registers a test-only analysis role, never a production default. It exercises FastAPI creation, common tools, JSON artifact validation, its own finalizer and budget defaults, checkpoint recovery after pause, cancellation and bounded transient retry. Research-specific quality assessment is not invoked.
-
-Recovery checks cover structured tool failures (including ToolMessage output), ordinary exceptions, late callbacks after generation takeover, corrupt checkpoints, exact Artifact/Finding read-back and incomplete plan publication. Existing conflicting artifacts, inconsistent plan files/progress and changed completed-step artifacts are preserved for human review. Explicit tool policies live in `TOOL_RECOVERY_POLICIES`; unrecognized tools remain manual. `get_research_status`, `set_active_plan_step` and budget-extension requests are conservatively manual during uncertain recovery because they mutate control/audit state. Memory writes require exact persisted read-back. Recovery confirmations emit a completion event.
-
-All automated model responses, reviewer responses and external HTTP data are fake. The test fixture prevents external socket connections and supplies deterministic DNS; Windows asyncio loopback wakeup sockets remain allowed. No real model API or paid token usage participates. CI runs the full pytest suite on Python 3.12 plus the JavaScript syntax check.
-
-Boundary: this establishes runtime orchestration under simulated model decisions, not real-model research judgment. External-provider behavior, multi-host concurrent filesystem writes and exactly-once execution of external services remain outside this verification. Callback ownership checks reject a worker already superseded before its callback starts; they do not provide a distributed transaction spanning SQLite, graph checkpoints and workspace files. The production Deep Agents builder and real model quality still need a separate manual smoke test.
+数据库事务只覆盖任务库，不构成横跨 Checkpoint 与文件系统的分布式事务；跨存储冲突通过核验保留并人工处理。全局租约仍服务于单机单 Worker，不代表多主机调度。快照存在性和 hash/URL 标记检查不是防篡改存储。真实模型判断质量、外部服务长期故障和外部副作用恰好执行一次仍需真实环境验证。

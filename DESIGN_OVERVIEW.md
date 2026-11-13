@@ -40,17 +40,19 @@
 
 ---
 
-**当前实现边界：** 项目目前是单机单 Worker MVP，默认只注册 Research Agent；Controller 的多数行动建议仍由 Agent 执行；来源快照检查尚未达到防篡改级别；CI 主要验证离线工程机制，真实模型端到端研究和真实进程中断恢复仍需运行验收。上述三项改进是基于未来半年任务记录的演进方向，不应误认为当前已经实现。
+**当前实现边界：** 项目目前是单机单 Worker MVP，默认只注册 Research Agent；Controller 的多数行动建议仍由 Agent 执行；来源快照检查尚未达到防篡改级别。离线测试覆盖条件决策和真实子进程中断恢复；真实模型端到端研究及外部服务联合故障仍需运行验收。上述三项改进是基于未来半年任务记录的演进方向，不应误认为当前已经实现。
 
 
-## Offline runtime verification
+## 条件决策、原子恢复与离线验证
 
-The offline integration suite drives a real LangChain agent graph with structured fake model tool calls through ResearchToolService, the public executor/worker, SQLite checkpoints and task workspaces. It verifies evidence-driven plan changes, preserved unchanged-step progress, reset changed steps, controller coverage growth, registered citations and a failed review followed by targeted repair. Invalid reviewer structure fails delivery; repeated low scores exhaust the repair allowance and park for human review.
+`tests/test_autonomous_research_e2e.py` 使用 `ConditionalResearchModel` 读取实际对话和工具结果，保留生产 Deep Agents Builder、Profile、System Prompt、工具注册、Worker、Executor 和真实 SQLite Checkpoint。矛盾证据触发战略重规划及完整审计；支持性证据保持 V1 计划；反事实测试仅替换证据内容，验证后续行动变化。质量反馈触发定向修订，无效评审和修复耗尽均阻止自动交付。自动化结果证明模拟决策下的工程链路，不证明真实模型研究判断。
 
-`tests/test_role_extensibility.py` registers a test-only analysis role, never a production default. It exercises FastAPI creation, common tools, JSON artifact validation, its own finalizer and budget defaults, checkpoint recovery after pause, cancellation and bounded transient retry. Research-specific quality assessment is not invoked.
+Database 通过 `BEGIN IMMEDIATE` 在同一事务中检查任务状态、`worker_id`、`worker_generation`，再更新工具终态和对应事件。开始记录与开始事件也原子提交。任务完成、失败、暂停、取消、重试的状态、预留预算释放和对应事件在同一事务中执行。相同终态的重复回调不增加事件，矛盾终态被拒绝；生产工具重放保护复用已成功调用的持久化结果，不确定写操作先核验或转人工。已确认的 Artifact 写入通过精确读回避免重复改写。
 
-Recovery checks cover structured tool failures (including ToolMessage output), ordinary exceptions, late callbacks after generation takeover, corrupt checkpoints, exact Artifact/Finding read-back and incomplete plan publication. Existing conflicting artifacts, inconsistent plan files/progress and changed completed-step artifacts are preserved for human review. Explicit tool policies live in `TOOL_RECOVERY_POLICIES`; unrecognized tools remain manual. `get_research_status`, `set_active_plan_step` and budget-extension requests are conservatively manual during uncertain recovery because they mutate control/audit state. Memory writes require exact persisted read-back. Recovery confirmations emit a completion event.
+`tests/test_worker_fencing_races.py` 使用独立线程和真实 SQLite 连接验证接管竞态、终态竞争和事件插入失败回滚。`tests/test_process_crash_recovery.py` 使用跨平台 spawn 子进程和 Pipe 屏障，在 Artifact 写入后、工具开始后、Checkpoint 首节点保存后强制终止进程，再验证恢复、generation 增加、消息保留和副作用不重复。损坏 Checkpoint 保留现场并转人工。`tests/test_recovery_consistency.py` 保留原有跨存储和副作用核验测试。
 
-All automated model responses, reviewer responses and external HTTP data are fake. The test fixture prevents external socket connections and supplies deterministic DNS; Windows asyncio loopback wakeup sockets remain allowed. No real model API or paid token usage participates. CI runs the full pytest suite on Python 3.12 plus the JavaScript syntax check.
+`tests/test_role_extensibility.py` 的分析岗位只用于测试，不是生产默认岗位。它复用 API、公共 Worker/Executor、预算和 Checkpoint，拥有自己的 JSON 产物校验和 Finalizer，覆盖暂停后恢复、取消和暂时错误重试，不触发研究专属质量评估。系统仍是单机单 Worker，不承诺多岗位并行。
 
-Boundary: this establishes runtime orchestration under simulated model decisions, not real-model research judgment. External-provider behavior, multi-host concurrent filesystem writes and exactly-once execution of external services remain outside this verification. Callback ownership checks reject a worker already superseded before its callback starts; they do not provide a distributed transaction spanning SQLite, graph checkpoints and workspace files. The production Deep Agents builder and real model quality still need a separate manual smoke test.
+`tests/test_documentation.py` 检查 UTF-8、非空文档、连续问号/替换字符、中文段落和文档引用路径。所有自动化模型、Reviewer、HTTP 数据均为模拟响应，不调用真实模型 API、不产生真实 Token 费用。测试阻断外网连接，DNS 使用确定性替身；Windows asyncio 所需本地唤醒套接字仍允许。CI 运行全量 pytest 和前端 JavaScript 语法检查。
+
+数据库事务只覆盖任务库。Checkpoint、工作区文件与任务库之间通过核验协调，不是分布式原子事务。真实 Provider 行为、真实模型质量、多主机文件并发和外部服务恰好执行一次仍需真实环境验证；冲突不得以覆盖文件或台账消除。

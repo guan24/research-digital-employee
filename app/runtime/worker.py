@@ -44,6 +44,12 @@ class Worker:
                 self.db.heartbeat(self._current_task_id, self.worker_id)
 
     def _execute_claimed(self, task: dict) -> None:
+        try:
+            self._execute_owned_task(task)
+        except WorkerLeaseLost:
+            logger.info("ignored result from superseded worker generation")
+
+    def _execute_owned_task(self, task: dict) -> None:
         self._current_task_id = task["task_id"]
         try:
             result_path = self.executor.run(task, worker_id=self.worker_id)
@@ -52,20 +58,20 @@ class Worker:
                 return
             current = self.db.get_task(task["task_id"])
             if current and current["cancel_requested"]:
-                self.db.mark_cancelled(task["task_id"], self.worker_id)
+                self.db.mark_cancelled(task["task_id"], self.worker_id, task["worker_generation"])
                 self._finalize_role_if_terminal(task["task_id"])
             elif current and current["pause_requested"]:
-                self.db.mark_paused(task["task_id"], self.worker_id)
+                self.db.mark_paused(task["task_id"], self.worker_id, task["worker_generation"])
             else:
                 relative = str(Path(result_path).resolve().relative_to(self.settings.app_home)) if Path(result_path).resolve().is_relative_to(self.settings.app_home) else result_path
-                if self.db.mark_completed(task["task_id"], relative, self.worker_id):
+                if self.db.mark_completed(task["task_id"], relative, self.worker_id, task["worker_generation"]):
                     self._finalize_role_if_terminal(task["task_id"])
         except TaskWaitingForHuman:
             # The executor has already atomically parked the task and recorded
             # the intervention request. Do not retry or mark it completed.
             logger.info("task %s is waiting for a human decision", task["task_id"])
         except TaskPaused:
-            self.db.mark_paused(task["task_id"], self.worker_id)
+            self.db.mark_paused(task["task_id"], self.worker_id, task["worker_generation"])
             pause_steps = getattr(self.executor, "pause_plan_steps", None)
             if callable(pause_steps):
                 try:
@@ -75,20 +81,16 @@ class Worker:
                         "phase": "pause", "error_type": type(exc).__name__, "error": str(exc)[:1000],
                     })
         except TaskCancelled:
-            self.db.mark_cancelled(task["task_id"], self.worker_id)
+            self.db.mark_cancelled(task["task_id"], self.worker_id, task["worker_generation"])
             self._finalize_role_if_terminal(task["task_id"])
         except WorkerLeaseLost as exc:
             self.db.add_event(task["task_id"], "worker_lease_lost", {"error": str(exc)})
         except Exception as exc:
             category, code, retryable = classify_exception(exc)
-            self.db.record_classified_error(task["task_id"], str(exc), category, code, retryable, int(task.get("attempts", 0)))
-            self.db.add_event(task["task_id"], "task_error_classified", {
-                "category": category, "error_code": code, "retryable": retryable,
-                "error": str(exc)[:2000], "attempt": task.get("attempts", 0),
-            })
+            self.db.record_classified_error(task["task_id"], str(exc), category, code, retryable, int(task.get("attempts", 0)), self.worker_id, task["worker_generation"])
             logger.exception("task %s failed (%s/%s)", task["task_id"], category, code)
             if not retryable:
-                self.db.mark_failed(task["task_id"], f"{code}: {exc}", self.worker_id)
+                self.db.mark_failed(task["task_id"], f"{code}: {exc}", self.worker_id, task["worker_generation"])
                 self._finalize_role_if_terminal(task["task_id"])
             else:
                 outcome = self.db.schedule_retry(task, f"{code}: {exc}", self._retry_delay(task), self.worker_id)

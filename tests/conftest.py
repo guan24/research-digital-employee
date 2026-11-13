@@ -33,6 +33,13 @@ def offline_network_guard(monkeypatch):
     monkeypatch.setattr(socket.socket, "connect", guarded_connect)
     monkeypatch.setattr(socket.socket, "connect_ex", lambda sock, addr: guarded_connect(sock, addr, original=original_connect_ex))
     monkeypatch.setattr(socket, "getaddrinfo", offline_dns)
+    import openai
+    def blocked_provider(*args, **kwargs):
+        raise AssertionError("Offline test attempted a real model Provider request")
+    async def blocked_async_provider(*args, **kwargs):
+        raise AssertionError("Offline test attempted a real model Provider request")
+    monkeypatch.setattr(openai.OpenAI, "request", blocked_provider)
+    monkeypatch.setattr(openai.AsyncOpenAI, "request", blocked_async_provider)
 
 
 @pytest.fixture

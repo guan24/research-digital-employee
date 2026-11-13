@@ -357,13 +357,15 @@ class TaskEventCallback(BaseCallbackHandler):
 
     def on_tool_start(self, serialized, input_str, *, run_id, **kwargs):
         self._check_control()
-        step = self.db.consume_execution_step(self.task_id, self.worker_id)
+        inputs = kwargs.get("inputs")
+        input_value = json.dumps(inputs, ensure_ascii=False, sort_keys=True) if isinstance(inputs, dict) else str(input_str)
+        step = self.db.consume_execution_step(self.task_id, self.worker_id, self.worker_generation)
         if step is None:
             raise TaskStepLimitExceeded("task exceeded max_steps tool-call budget")
         tool_name = (serialized or {}).get("name", "unknown")
         self._tool_started[str(run_id)] = time.monotonic()
         self._tool_names[str(run_id)] = tool_name
-        self._tool_inputs[str(run_id)] = str(input_str)
+        self._tool_inputs[str(run_id)] = input_value
         call_id = str(run_id)
         supplied_metadata = kwargs.get("metadata") or {}
         tool_metadata = dict(supplied_metadata) if isinstance(supplied_metadata, dict) else {}
@@ -371,7 +373,7 @@ class TaskEventCallback(BaseCallbackHandler):
         if self.plan_progress_service is not None:
             try:
                 step_context = self.plan_progress_service.sync_plan_progress_for_tool(
-                    tool_name, str(input_str), tool_metadata,
+                    tool_name, input_value, tool_metadata,
                 )
             except (TaskPaused, TaskCancelled, TaskDeadlineExceeded, WorkerLeaseLost):
                 raise
@@ -387,14 +389,8 @@ class TaskEventCallback(BaseCallbackHandler):
                 "plan_step_phase": step_context.get("phase"),
                 "plan_step_source": step_context.get("source"),
             })
-        if self.recovery_manager is not None:
-            call_id = self.recovery_manager.begin_tool_call(
-                self.task_id, call_id, tool_name, str(input_str),
-                int(self.worker_generation or 0), tool_metadata,
-            )
-        self._tool_call_ids[str(run_id)] = call_id
         event_payload = {
-            "tool": tool_name, "input": str(input_str)[:2500], "run_id": str(run_id),
+            "tool": tool_name, "input": input_value[:2500], "run_id": str(run_id),
             "call_id": call_id, "recovery_tracking": self.recovery_manager is not None,
         }
         if step_context:
@@ -404,7 +400,13 @@ class TaskEventCallback(BaseCallbackHandler):
                 "plan_step_phase": step_context.get("phase"),
                 "plan_step_source": step_context.get("source"),
             })
-        self.db.add_event(self.task_id, "tool_call_started", event_payload)
+        if self.recovery_manager is not None:
+            call_id = self.recovery_manager.begin_tool_call(
+                self.task_id, call_id, tool_name, input_value, int(self.worker_generation or 0),
+                tool_metadata, self.worker_id, event_payload)
+        else:
+            self.db.add_event(self.task_id, "tool_call_started", event_payload)
+        self._tool_call_ids[str(run_id)] = call_id
 
     def sync_plan_progress_for_phase(self, phase: str, note: str = "") -> None:
         if self.plan_progress_service is None:
@@ -457,7 +459,7 @@ class TaskEventCallback(BaseCallbackHandler):
                             "add_research_requirements", "terminate",
                         ],
                     },
-                    worker_id=self.worker_id,
+                    worker_id=self.worker_id, generation=self.worker_generation,
                 )
                 if not intervention_id:
                     raise RuntimeError("research controller requested human review but task could not be parked")
@@ -491,62 +493,53 @@ class TaskEventCallback(BaseCallbackHandler):
         return {"plan_step_id": context.get("step_id"), "plan_version": context.get("plan_version"),
                 "plan_step_phase": context.get("phase"), "plan_step_source": context.get("source")}
 
+    def _record_tool_terminal(self, call_id, failed, output, payload):
+        if self.recovery_manager is None:
+            self.db.add_event(self.task_id, "tool_call_failed" if failed else "tool_call_completed", payload)
+            return True
+        output = getattr(output, "content", output)
+        if failed:
+            return self.db.fail_tool_call(self.task_id, call_id, output,
+                worker_id=self.worker_id, generation=self.worker_generation, event_payload=payload)
+        return self.db.finish_tool_call(self.task_id, call_id, output,
+            self.worker_id, self.worker_generation, payload)
+
     def on_tool_end(self, output, *, run_id, **kwargs):
         self._check_tool_ownership()
         key = str(run_id)
-        call_id = self._tool_call_ids.pop(key, key)
+        call_id = self._tool_call_ids.get(key, key)
         started = self._tool_started.pop(key, time.monotonic())
         tool_name = self._tool_names.pop(key, "unknown")
         input_value = self._tool_inputs.pop(key, "")
-        step_context = self._tool_plan_context.pop(key, None)
+        context = self._tool_plan_context.pop(key, None)
         failure = self._structured_tool_failure(output)
+        payload = {"output": str(output)[:20000], "duration_ms": int((time.monotonic()-started)*1000),
+                   "run_id": key, "call_id": call_id, "tool": tool_name, **self._step_event_context(context)}
         if failure:
-            if self.recovery_manager is not None:
-                self.recovery_manager.fail_tool_call(self.task_id, call_id, output)
-            if self.plan_progress_service is not None:
-                self.plan_progress_service.record_tool_failure(
-                    step_context, tool_call_id=call_id, tool_name=tool_name,
-                    error=str(failure.get("error") or failure.get("message") or failure.get("error_type") or "structured tool failure"),
-                    retryable=bool(failure.get("retryable", False)),
-                )
-            self.db.add_event(self.task_id, "tool_call_failed", {
-                "output": str(output)[:20000], "failure_mode": "structured_result",
-                "retryable": bool(failure.get("retryable", False)),
-                "duration_ms": int((time.monotonic() - started) * 1000),
-                "run_id": key, "call_id": call_id, "tool": tool_name,
-                **self._step_event_context(step_context),
-            })
-        else:
-            if self.recovery_manager is not None:
-                self.recovery_manager.finish_tool_call(self.task_id, call_id, output)
-            self.db.add_event(self.task_id, "tool_call_completed", {
-                "output": str(output)[:20000], "duration_ms": int((time.monotonic() - started) * 1000),
-                "run_id": key, "call_id": call_id, "tool": tool_name,
-                **self._step_event_context(step_context),
-            })
+            payload.update(failure_mode="structured_result", retryable=bool(failure.get("retryable", False)))
+        if not self._record_tool_terminal(call_id, bool(failure), output, payload):
+            return
+        if failure and self.plan_progress_service is not None:
+            self.plan_progress_service.record_tool_failure(context, tool_call_id=call_id, tool_name=tool_name,
+                error=str(failure.get("error") or failure.get("message") or "structured tool failure"),
+                retryable=bool(failure.get("retryable", False)))
         self._observe_research_phase(tool_name, input_value)
         self._check_control()
 
     def on_tool_error(self, error, *, run_id, **kwargs):
         self._check_tool_ownership()
         key = str(run_id)
-        call_id = self._tool_call_ids.pop(key, key)
+        call_id = self._tool_call_ids.get(key, key)
         started = self._tool_started.pop(key, time.monotonic())
         tool_name = self._tool_names.pop(key, "unknown")
-        self._tool_inputs.pop(key, None)
-        step_context = self._tool_plan_context.pop(key, None)
-        if self.recovery_manager is not None:
-            self.recovery_manager.fail_tool_call(self.task_id, call_id, error)
+        context = self._tool_plan_context.pop(key, None)
+        payload = {"error": str(error)[:4000], "duration_ms": int((time.monotonic()-started)*1000),
+                   "run_id": key, "call_id": call_id, "tool": tool_name, **self._step_event_context(context)}
+        if not self._record_tool_terminal(call_id, True, error, payload):
+            return
         if self.plan_progress_service is not None:
-            self.plan_progress_service.record_tool_failure(
-                step_context, tool_call_id=call_id, tool_name=tool_name,
-                error=str(error), retryable=True,
-            )
-        self.db.add_event(self.task_id, "tool_call_failed", {
-            "error": str(error)[:4000], "duration_ms": int((time.monotonic() - started) * 1000),
-            "run_id": key, "call_id": call_id, "tool": tool_name,
-            **self._step_event_context(step_context),
-        })
+            self.plan_progress_service.record_tool_failure(context, tool_call_id=call_id, tool_name=tool_name,
+                error=str(error), retryable=True)
         self._check_control()
 
     def _check_tool_ownership(self) -> None:
@@ -682,9 +675,9 @@ class ResearchExecutor:
         return self._verify_artifact(task_id, artifacts, path, source)
 
     def _park_for_human(self, task_id: str, worker_id: str | None,
-                        category: str, request: dict[str, Any]) -> None:
+                        category: str, request: dict[str, Any], generation=None) -> None:
         intervention_id = self.db.set_waiting_for_human(
-            task_id, category, request, worker_id=worker_id
+            task_id, category, request, worker_id=worker_id, generation=generation
         )
         if not intervention_id:
             raise RuntimeError("could not atomically park task for human intervention")
@@ -862,7 +855,7 @@ class ResearchExecutor:
                                 "artifact_path": artifact_path,
                                 "assessment": quality_assessment,
                                 "choices": ["continue_research", "continue_repair", "approve_degraded_delivery", "terminate"],
-                            })
+                            }, generation=task["worker_generation"])
                         if not quality_assessment.get("passed"):
                             quality_messages = [
                                 str(item.get("message") or item.get("code") or "质量硬门槛未通过")
@@ -951,7 +944,7 @@ class ResearchExecutor:
                                 "artifact_path": artifact_path,
                                 "assessment": quality_assessment,
                                 "choices": ["continue_repair", "approve_degraded_delivery", "terminate"],
-                            })
+                            }, generation=task["worker_generation"])
                         raise DeliveryValidationExhausted(
                             f"delivery validation failed after {registration.max_revisions} revisions: {errors}"
                         )
