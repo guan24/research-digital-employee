@@ -434,7 +434,11 @@ class PlanProgressTracker:
                     continue
                 p = event.get("payload") or {}
                 event_timestamp = event.get("timestamp")
-                if previous_timestamp and event_timestamp and str(event_timestamp) <= str(previous_timestamp):
+                previous_event_id = history[-1].get("event_id") if history else None
+                if previous_event_id is not None and event.get("event_id") is not None:
+                    if int(event.get("event_id")) <= int(previous_event_id):
+                        continue
+                elif previous_timestamp and event_timestamp and str(event_timestamp) < str(previous_timestamp):
                     continue
                 archived_plan = self._normalize_plan(p.get("plan") or {})
                 signature = json.dumps(archived_plan, ensure_ascii=False, sort_keys=True)
