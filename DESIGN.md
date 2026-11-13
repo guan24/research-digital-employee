@@ -1,110 +1,121 @@
 # Design — Research Digital Employee
 
-## Runtime model
+This document describes the implementation currently present in the repository, not a target architecture. The MVP optimizes for durable, inspectable research execution on one machine.
 
-The browser is the operator console. FastAPI creates and controls durable tasks. A separate single Worker claims tasks and runs a task-scoped Deep Agent. LangGraph SQLite checkpoints preserve graph state; the task database preserves lifecycle and an append-only observable event journal.
+## 1. Runtime model
 
-## Responsibilities
+The browser is an operator console. FastAPI creates and controls durable tasks. A separate Worker claims tasks and executes a task-scoped Deep Agent. The Agent runs an open-ended tool-use loop: it proposes and revises a research plan, selects tools based on the information gathered, records evidence and writes artifacts. The runtime does not prescribe a fixed search/read/write sequence.
 
-- Role-specific: `app/agents/research/` owns the research role prompt and research conventions.
-- Shared runtime: FastAPI, task database, Worker lease/heartbeat, retry, cancellation, checkpoint lifecycle, SSE, event redaction and artifact storage.
-- Tools: web search, public-page fetch and task-scoped artifact operations.
+The MVP intentionally uses one active Worker and SQLite. A task is not a single HTTP request: it has a durable task ID, lifecycle state, graph checkpoint, event history, resource limits and task-scoped workspace.
 
-## Event journal and SSE
+~~~mermaid
+flowchart TD
+  UI[Browser console] --> API[FastAPI]
+  API --> DB[(Task SQLite)]
+  DB --> W[Single Worker]
+  W --> EX[Research Executor]
+  EX --> AG[Deep Agent + LangGraph]
+  AG --> T[Research tools]
+  AG --> A[Task artifacts and memory]
+  T --> E[Evidence registry and source snapshots]
+  EX --> CP[(LangGraph SQLite checkpoint)]
+  EX --> DB
+  DB --> SSE[SSE event stream]
+  SSE --> UI
+~~~
 
-Every event is committed to SQLite before it is streamed. `event_id` is the durable cursor. SSE accepts `Last-Event-ID` and `after_id`, queries events with a greater ID, and emits keep-alive comments when idle. Browser reconnection therefore replays persisted events without losing the event journal. The UI deduplicates by event ID.
+## 2. Responsibility boundaries
 
-Event categories include task lifecycle, generated plan/plan updates, model-call start/completion/failure, tool-call start/completion/failure, research search/fetch, checkpoint resume, artifact save, retries and execution exceptions. Callback instrumentation records model identity/purpose, bounded input summary, observable generated output/decision summary, token usage and duration. Tool callbacks record tool name, parameters, output and duration. Hidden chain-of-thought is not captured.
+| Component | Current responsibility |
+|---|---|
+| FastAPI | Task creation and controls, role discovery, events, artifacts, research state, budget and human-intervention APIs |
+| Agent registry | Role builder, optional profile loader, output path, validator, postprocessor, repair limit, finalizer and budget defaults |
+| Research Agent | Research prompt, dynamic plan, tool selection, evidence collection, memory and report writing |
+| TaskToolService | Shared task-scoped artifact read/write, durable memory, budget inspection and extension requests |
+| ResearchToolService | Research-specific search/read tools, evidence/Finding operations, plan and research-status tools, GitHub and arXiv adapters |
+| Research Controller | Deterministic requirements normalization, Finding-to-source coverage, weighted progress and bounded action recommendations |
+| Research Evaluator | Rule-based quality metrics plus an isolated LLM review; persists scores, hard blocks and defects |
+| Recovery Manager | Tool-call lifecycle, unknown-call verification, checkpoint inspection and stale-task reconciliation |
+| Worker / Executor | Claiming, callbacks, checkpoints, model/tool budgets, retries, delivery validation, human parking and role finalization |
+| SQLite / workspace | Task state, events, budgets, quality/recovery records, graph checkpoints and durable files |
 
-## Credential redaction
+The registry is an extension seam, not proof of a complete multi-role scheduler. Only `research` is registered by default. The Executor still attaches research-specific plan-progress and lifecycle components when the selected role is `research`; it is therefore not fully role-agnostic yet.
 
-All event payloads pass through recursive key-based and common token-pattern redaction before JSON serialization and persistence. API key/token/password/authorization/credential-like keys are replaced with `[REDACTED]`; bearer tokens and common provider key prefixes in text are masked. Research text is retained. Redaction is defense-in-depth, not a substitute for secret-free prompts and tool outputs.
+## 3. Task execution lifecycle
 
-## Safe task deletion
+1. FastAPI validates the requested role and creates a generation-2 task using role budget defaults unless the request overrides them.
+2. The Worker obtains the global SQLite lease, starts its heartbeat loop and claims one queued/retry-wait task. The task receives a new worker generation.
+3. The Executor loads the role registration, creates a task-scoped ArtifactStore, opens the LangGraph SQLite checkpointer and builds the Agent.
+4. The Agent invokes tools through callbacks. Callbacks check task controls and runtime budget, atomically consume a tool-call step, record model/tool events, reserve model tokens and journal tool-call lifecycle.
+5. For the research role, tool activity is mapped to coarse phases (scope, discovery, reading, analysis, report, validation). PlanProgressTracker infers progress from tool/phase transitions unless the Agent has supplied explicit progress. Inferred completion still requires a non-empty readable artifact; otherwise the step becomes `awaiting_verification`.
+6. The research Controller assesses coverage at observed phase boundaries and when the Agent requests research status. It returns allowed/recommended actions. A `REQUEST_HUMAN` decision parks the task at a phase boundary; the Agent performs most other recommended actions.
+7. The Executor ensures the final role artifact exists, reads it back, runs the role validator and, for research, the quality lifecycle. Failed delivery can be repaired within the registration's revision limit. Unresolved quality/reviewer conditions may park for a human decision.
+8. The Worker marks the task terminal and invokes the role finalizer. The research finalizer archives the plan and its material revisions.
 
-Deletion is a two-phase operation:
+A checkpoint uses the task ID as its LangGraph thread ID. On resume, the Executor reuses the existing checkpoint. Human decisions are injected as messages with stable IDs so the same decision is not injected twice after an interruption.
 
-1. In a `BEGIN IMMEDIATE` transaction, change the task to `deleting`. This state is excluded from Worker claim queries. For a running task, set `cancel_requested=1` while retaining its worker ID; for non-running tasks, clear the worker owner immediately.
-2. For a running task, wait up to 60 seconds for the Worker to handle cooperative cancellation. The Worker exits the executor (thereby closing the LangGraph SQLite checkpointer) and clears its worker ID while leaving status `deleting`.
-3. Only after worker ownership is cleared, remove all checkpoint rows with matching `thread_id`, remove the task workspace, and delete the task row. The events table uses foreign-key cascade.
-4. If the Worker does not stop within 60 seconds, restore a non-deleting status and preserve the task row, events, checkpoint and workspace. A cleanup error leaves the task row available for diagnosis/retry.
+## 4. Persistence and state ownership
 
-This is designed for the single-worker MVP. It does not provide cross-process filesystem locking against external processes writing directly into a task workspace.
+| Store | Owns |
+|---|---|
+| `tasks.sqlite` | Task status, worker ID/generation, lease, budgets, retry metadata, event journal, research requirements/coverage, quality assessments, tool calls, recovery decisions and human interventions |
+| `checkpoints.sqlite` | LangGraph graph state and pending nodes |
+| `workspaces/{task_id}/` | Research plan, plan archive, memory, source snapshots, evidence registry, intermediate artifacts and final deliverable |
 
-## Unicode
+Important tables include `tasks`, `events`, `token_reservations`, `worker_lease`, `schema_migrations`, `research_control_state`, `quality_assessments`, `tool_calls`, `recovery_decisions` and `human_interventions`.
 
-Task goals are JSON strings encoded as UTF-8 by browsers and stored in SQLite TEXT. API round-trip tests verify Chinese, English and punctuation survive POST, persistence and GET unchanged. The console sends `application/json; charset=utf-8`.
+The current additive migration adds runtime-generation and lifecycle fields. On first application of migration version 1, legacy generation-1 tasks still in active states (queued, running, retry_wait, paused or waiting_for_human) are marked `archived` and retain their former state in `archived_from_status`. New tasks are generation 2; the current Worker only claims generation-2 tasks. This migration does not automatically resume legacy active tasks.
 
-## Persistence
+## 5. Evidence-driven research control
 
-- `tasks.sqlite`: task state and event journal.
-- `checkpoints.sqlite`: LangGraph checkpoint state.
-- `workspaces/<task_id>/`: durable research artifacts.
+Research requirements are stored separately from the plan. Each dimension has an ID, title, questions, expected evidence, priority and minimum source count. If the Agent does not define requirements, the Controller derives them from plan steps; if there is no usable plan, it creates a fallback research-scope dimension.
 
-Task data is retained indefinitely until explicit deletion. Back up all three storage locations together.
+A Finding links a claim to one or more registered source IDs and one primary dimension. Coverage counts only source IDs linked through Findings and whose snapshots pass the current presence/marker checks. Dimension status is covered, partial or uncovered. Weighted coverage uses priority weights: critical 3, high 2, normal 1.
 
-## Current limits
+The progress vector contains coverage ratio, valid source count, Finding count, critical-gap count and latest quality score. A cycle counts as stagnated after two consecutive eligible assessment cycles without material improvement while critical gaps remain.
 
-Single machine, one active Worker, SQLite, Tavily search and HTTP/BeautifulSoup extraction. Cancellation is cooperative and cannot interrupt a blocking provider call mid-request. The UI reports observable model output and decisions, not hidden chain-of-thought.
+The Controller returns `FILL_EVIDENCE_GAP`, `REPLAN`, `CONTINUE_RESEARCH`, `ENTER_CONVERGENCE` or `REQUEST_HUMAN` as recommendations/allowed actions. It does not search, rewrite the plan or independently execute all actions. The Agent receives the decision through the research-status tool and the system prompt. The runtime directly parks a task when a phase-boundary callback observes `REQUEST_HUMAN`.
 
-## Strategic plan versioning and final archive
+## 6. Delivery validation and quality evaluation
 
-The plan is the Agent's overall research strategy, not a step-progress tracker.
+ReportValidator performs deterministic structure/provenance checks: a Markdown H1, a separate Sources/References section, minimum body length, direct URLs, known registered source IDs, corresponding source URLs in the Sources section and paragraph-level citation coverage. When an evidence registry is supplied, at least 40% of eligible body paragraphs (paragraphs of at least 80 characters) must contain a valid registered source citation. It also rejects unknown Finding IDs when the report cites them. This is a provenance/format gate, not proof that a source semantically supports a claim.
 
-- The first update_research_plan call records version 1.
-- A later call creates a version only when the normalized plan structure materially changes. Per-step status fields are stripped and never create plan versions.
-- A material replan must record five audit fields: trigger, new_information, problem_analysis, decision, and changes. The complete revised plan and a structural diff (added/removed/modified/reordered workstreams) are stored with the event.
-- Routine tool calls, reads, searches, and step completion remain in the execution event journal and do not mutate the plan history.
-- Legacy step-status-only plan events are collapsed when building the archive and rendering the history.
-- On terminal outcomes (completed, failed, cancelled), the Worker freezes the current plan and all material revisions in notes/agent_execution_plan.json, then emits research_plan_finalized.
-- The rationale is a concise evidence-based decision record, not hidden chain-of-thought. Model outputs and tool inputs/results remain in the separate execution trace.
+ResearchEvaluator has five dimensions with default weights: goal coverage 20%, evidence sufficiency 25%, source reliability 20%, conclusion consistency 20% and report completeness 15%. Rule scores are combined with LLM scores at 60%/40%. The default weighted total threshold is 80 and the per-dimension threshold is 60. Empty reports, no registered sources and invalid source snapshots are non-waivable hard blocks. The independent review is a separate call with no Agent conversation history, but it uses the same configured model and endpoint. It receives the report (bounded to 16,000 characters), up to eight source excerpts (each taken from the end of the snapshot, up to 1,000 characters) and up to 30 Findings.
 
-## Artifact preview layout
+The current research registration sets `max_revisions=3`, so the Executor can run up to three delivery repair rounds after the initial validation. The TOML profile also contains `quality_max_revisions=2`, which is loaded into evaluator profile data but does not currently control the Executor's repair loop; the registration value is the effective delivery limit. This duplicate setting should be consolidated in a future code change.
 
-Markdown has rendered and raw-source modes. JSON is intentionally shown as original source text only: no JSON parsing, pretty-printing, tree rendering, or syntax highlighting. The preview panel and grid item use min-width: 0, fixed width: 100% constraints, and internal horizontal scrolling for long source lines/tables so switching between Markdown and JSON does not resize the outer preview frame.
+## 7. Long-running execution, budgets and recovery
 
+The Worker uses a single global SQLite lease and task heartbeats. Retryable failures use bounded exponential backoff; terminal errors fail immediately; pause, cancel, lease loss and human waiting are handled as control signals rather than ordinary retries.
 
-## Step progress and task-instance diagnostics
+The hard tool-call budget is consumed atomically before each tool starts. Cumulative runtime is checked at model/tool/callback boundaries and is retained across retries. The main Agent model is configured for a 4,096-token output cap. Before a model call, the runtime reserves a heuristic input estimate plus that output cap and 256 tokens of framing overhead; provider-reported usage is used for settlement when available.
 
-Strategic plan versions and step execution progress are separate event streams. \`research_plan_updated\` stores strategy; \`research_plan_step_status\` stores per-step transitions (\`pending\`, \`in_progress\`, \`completed\`, \`skipped\`, \`failed\`). Unchanged step IDs retain progress after a replan; added or materially modified steps reset to pending. On terminal task failure, still-in-progress steps are marked failed with the task error. The final archive stores both the strategy-only plan and a final plan snapshot with progress.
+The budget policy protects 30% of tokens, 25% of tool calls and 20% of runtime for convergence (subject to minimum/maximum reserve rules). When an exploration limit is reached, the task enters convergence and exploration tools such as search and source reads are blocked; artifact, memory, evidence and selected progress tools remain available. Approved extensions add limits and preserve the task workspace/checkpoint.
 
-Task details expose Worker ID, heartbeat, next retry time, checkpoint-resume mode and pause/cancel flags. The console derives model/tool counts, attempt history, recovery events and recent diagnostics from the event journal. The task-detail loader independently loads task metadata, events and artifacts so one failed endpoint does not blank the other panels; a load-generation token prevents stale requests from overwriting the current selection.
+RecoveryManager records tool calls with an input hash, idempotency key, worker generation, status and result/error metadata. On stale-task reconciliation:
+- Read-only web, PDF, GitHub and arXiv calls are eligible for retry because their external response cannot be proven from local state.
+- Artifact writes are confirmed only by exact read-back comparison with the original input.
+- Finding, plan, step-progress and requirement writes are checked against their corresponding persisted record/event.
+- Unknown tool types require manual review.
+- Checkpoint inspection checks the SQLite database/table shape and whether the task thread has checkpoint rows. A detected corruption or ambiguous tool call parks the task for human handling; otherwise the Worker can requeue the task to resume the same checkpoint.
 
+This is conservative at the application boundary, not an exactly-once guarantee for external services. A retried read request may be sent more than once.
 
-## Runtime budgets, report validation and role registry
+## 8. Observability and operator intervention
 
-Task runtime is cumulative across retries. SQLite stores `runtime_seconds_used` and `runtime_last_accounted_at`; worker heartbeats and stale-worker recovery settle elapsed wall time. Claiming a retry does not reset the accumulated value. `max_steps` is the strict task-wide tool-call budget enforced by an atomic SQL update before each tool starts. LangGraph recursion_limit remains a separate graph-loop guard.
+Events are persisted in SQLite before SSE delivery. Event IDs are durable cursors; clients can reconnect using `Last-Event-ID` or `after_id`. Model/tool callbacks record lifecycle, bounded inputs/outputs, duration, token usage and errors. Credentials are redacted before event persistence. Hidden chain-of-thought is not collected.
 
-The report validator is a deterministic structural/evidence gate, not a factuality oracle. It checks minimum body length, a Markdown title, a source section and at least one URL. Failed validation is recorded and fed back to the Agent for at most two bounded revisions; exhaustion fails the task and preserves the report and validation events for review.
+The operator APIs expose task events, budget, evidence, memory, research control state, quality assessments, recovery decisions and pending human interventions. Human decisions are validated against the choices attached to the pending intervention. Supported actions include continue research, change direction, add requirements, continue repair, approve degraded delivery and terminate, subject to the specific intervention's allowed choices. Degraded delivery requires explicit confirmation and a report read-back verification.
 
-Roles register a builder plus optional artifact path, validator, bounded postprocessor, finalizer and default budgets. Missing optional hooks have safe defaults. The executor is role-agnostic and never imports research modules. The research registration preserves report.md, the original evidence-coverage validator, two targeted revisions and plan archival.
+## 9. Role boundary and current limitations
 
+Shared task capabilities live in TaskToolService. Research-specific capabilities live in ResearchToolService and its GitHub/arXiv adapters. A role registration can supply its own builder, profile loader, artifact path, validator, postprocessor, repair count, finalizer and budget defaults.
 
-## Long-running execution enhancements
-
-The runtime separates role registration, shared task tools, evidence registration, durable memory and deterministic report validation. Deep Agents summarization compacts long conversations using absolute token thresholds derived from the model profile or MODEL_MAX_INPUT_TOKENS; known OpenAI-compatible models such as qwen3.8-flash have explicit context-window fallbacks. This avoids requiring LangChain profile metadata for fractional thresholds while the SQLite checkpointer preserves graph execution state. Research memory and source snapshots are stored in each task workspace.
-
-Task budgets are enforced, not merely observed. Tool-call count is atomically consumed before each tool. Cumulative runtime is checked at model-call start, tool-call start and callback control boundaries; exceeding the limit raises a terminal runtime-budget signal, records the root cause and does not schedule a retry. Model calls reserve a conservative UTF-8-byte input estimate plus a 2,048-token output cap and 128-token fixed overhead before provider invocation; ChatOpenAI is configured with the same output cap. Successful calls settle provider usage, failed calls release reservations, and repeated callback settlement is idempotent. Insufficient reservation rejects the model call before it reaches the provider and fails the task with TOKEN_BUDGET_EXHAUSTED. At 80% the runtime warns; at 95% exploration tools are denied while artifact/evidence/memory tools remain available. Approved extensions add quota and preserve checkpoint/workspace for recovery. The estimate is deliberately heuristic; dollar-cost UI is not implemented. API endpoints expose budget, evidence and memory state.
-
-Evidence IDs map to immutable content snapshots and source URLs. Findings link claims to known source IDs. The final report gate validates structure, source URLs, registered IDs and paragraph-level citation coverage; this is a deterministic provenance check, not a semantic truth proof.
-
-
-## Error classification
-
-Worker routes retryable provider/network failures through backoff, fails terminal authentication/permission/invalid-request/delivery-validation errors immediately, and handles control signals without retry. Unknown exceptions default to retryable but use the explicit UNKNOWN_EXCEPTION class. SQLite preserves latest error, first root cause and append-only per-attempt history.
-
-## Enforced task budgets
-
-Tool calls are consumed atomically before tool execution and cannot exceed max_steps. Model requests reserve a conservative UTF-8-byte input estimate plus a 2,048-token output cap and 128-token fixed overhead before invocation; ChatOpenAI uses the same output cap. Completion settles provider-reported usage, failures release reservations, and repeated settlement is idempotent. Stale worker generations cannot settle reservations. Runtime is cumulative across attempts and pauses are excluded. At 80% the system warns; at 95% exploration tools are blocked. If the next model-call reservation cannot fit, the provider is not called and the task fails with TOKEN_BUDGET_EXHAUSTED; runtime exhaustion also fails terminally without retry. Approved quota extensions add limits and resume the existing checkpoint. Token estimates are heuristic; dollar-cost UI is not implemented.
-
-
-The research role's default step/runtime/token limits have one source of truth in `app/agents/research/profile.toml`; the role registration derives the effective defaults from those fields. Explicit task-level values override them.
-
-
-## Research data sources: GitHub MCP and arXiv
-
-GitHub and arXiv adapters are registered only by the research role's ResearchToolService; the shared runtime has no imports of either provider adapter or the MCP client. GitHubMCPClient uses GitHub's official hosted remote MCP endpoint in read-only mode by default, lazily initializes and reuses a Streamable HTTP session per Worker, serializes requests, enforces a timeout, and performs a bounded reinitialization after transport failure. Requests use the /readonly endpoint plus X-MCP-Readonly and X-MCP-Tools headers. The application client independently restricts calls to its seven-tool allow-list because the remote server may advertise additional read-only tools from its default toolsets. Local stdio remains an opt-in transport using --read-only and --tools. A generic infrastructure shutdown registry lets Worker close local provider processes without importing provider modules in app/runtime.
-
-The GitHub adapter offers repository overview, filtered directory listing, batch file reading (maximum five paths per Agent tool step) and release history. It requires a prior directory index for each parent path, pins the batch to the indexed commit SHA, and rejects uncached, unsafe, secret, binary or over-limit paths before any file-read MCP request. It writes commit-addressed task snapshots under sources/github/, and registers immutable github_file / github_repo evidence using the shared Sxxxx ledger. It normalizes not-found, permission, rate-limit, timeout, upstream and policy errors into structured tool results, task error-history entries and operation events. Tool-level source errors do not automatically fail the task.
-
-The arXiv adapter uses only urllib, urllib.parse and xml.etree.ElementTree. It supports field-qualified and Boolean Atom API queries, clamps results to 20, enforces a process-wide three-second request interval and caches equivalent searches for five minutes. Search results and metadata are registered as arxiv evidence. arxiv_paper delegates PDF retrieval to the existing ResearchToolService.fetch_pdf pipeline with the arXiv abstract URL as the evidence URL, retaining SSRF checks, download-size limits and PDF extraction behavior. No third-party dependency is added.
+The current system is still a single-machine, single-Worker MVP:
+- Only the research role is registered by default; multi-role parallel execution is not implemented.
+- The Executor still contains research-specific lifecycle wiring.
+- Controller recommendations other than human parking and budget gates are primarily Agent-directed, not all hard-enforced by the runtime.
+- Source snapshot validation checks file presence and embedded hash/URL markers; it does not recompute the content hash from the extracted source body, and the task workspace is not a tamper-proof immutable store.
+- The LLM reviewer shares the Agent's model configuration and reviews bounded excerpts; the rule-based contradiction check is lexical/heuristic.
+- SQLite and the global Worker lease are not a multi-host scheduler. Cancellation is cooperative.
+- Automated tests are offline and use fakes for external/model behavior. A real end-to-end research task and live crash/restart test remain necessary acceptance evidence.

@@ -1,143 +1,144 @@
 # 长时运行的研究数字员工
 
-基于 **Deep Agents + LangGraph + FastAPI + SQLite** 的本地长时自主研究系统。浏览器控制台是任务提交入口；独立 Worker 在后台执行任务，关闭浏览器不会中断研究。
+基于 **Deep Agents + LangGraph + FastAPI + SQLite** 的本地长时自主研究系统。用户提交研究目标后，研究 Agent 自主规划任务、选择工具、检索和阅读资料、登记证据、保存中间成果，并生成有来源依据的 Markdown 报告。独立 Worker 在后台执行任务，关闭浏览器不会中断正在运行的研究。
 
-## 功能
+当前版本是聚焦可靠执行与研究可追溯性的 MVP：默认只注册 `research` 一个岗位，同一时刻只允许一个 Worker 执行任务。
 
-- Agent 自主生成整体研究计划，并根据新证据进行策略性重规划；每个步骤独立展示待执行、进行中、已完成、已跳过、失败等状态，进度变化不产生新的策略版本。规划历史记录触发原因、新信息、原方案问题分析、调整决策和具体变化。
-- 任务进入完成、失败或取消等终态时，自动归档最终计划及全部有效版本到 `notes/agent_execution_plan.json`。
-- 支持 Tavily 搜索、公开网页读取，以及任务级 Markdown/JSON 中间成果。
-- SQLite 持久化任务状态和执行事件；LangGraph SQLite Checkpoint 以 task_id 为 thread_id。
-- SSE 实时执行轨迹：事件先持久化，再推送；支持 Last-Event-ID 断线续传和历史回放。前端对新增事件执行局部 DOM 更新，不重建整个时间线，保留展开状态与详情滚动位置。
-- 可观测模型/工具过程：模型名称、调用目的、输入摘要、模型完整响应（含工具调用结构）、决策摘要、Token、耗时、工具参数、返回结果、异常和检查点恢复。
-- Agent 执行计划：Agent 通过结构化计划工具提交步骤、目标、预期成果和状态；计划更新按版本持久化，工具活动可补充步骤进行中状态，控制台展示最新计划及历史变更。计划内容是可观察的任务步骤，不包含隐藏思维链。
-- 成果预览：支持 Markdown 渲染和 JSON 格式化，默认展示渲染视图，可切换原始源码；保存新成果后文件列表和当前预览自动刷新。
-- 凭据脱敏：事件写入前自动遮蔽 API Key、Bearer Token、密码、Authorization 和凭据字段；研究正文保留。
-- 彻底删除任务：排队、暂停、等待重试及终态任务先阻止 Worker 领取再删除。运行中任务先请求协作式取消，等待 Worker 最多 60 秒；确认停止后删除任务事件、Checkpoint 和工作区。超时则中止删除并保留任务数据。
-- 中文任务目标通过 UTF-8 JSON 保存，并有 HTTP 往返测试。
+## 已实现能力
+
+- **自主研究与动态规划**：Agent 自主生成整体研究计划，并根据新证据进行实质性重规划；策略版本与步骤进度分别持久化，不把普通进度更新误记为新计划版本。
+- **研究工具**：Tavily 网络搜索、公开网页和 PDF 读取、只读 GitHub MCP 仓库检索、arXiv Atom API 检索及论文读取。
+- **中间成果与证据**：任务级 Markdown、文本、JSON、CSV、YAML 文件；版本化研究记忆；来源快照；来源与 Finding 登记簿。
+- **证据驱动研究控制**：Research Controller 管理研究维度、Finding—来源关联、证据覆盖率和停滞状态，并返回受限的下一步行动建议。
+- **报告质量门禁**：ReportValidator 检查报告结构与来源引用；ResearchEvaluator 将规则评分与独立上下文的 LLM 评审结合，从五个维度评价报告。报告不合格时进行有限修复；无法自动解决的问题可转交人工处理。
+- **长任务可靠性**：SQLite 任务状态和事件日志、LangGraph SQLite Checkpoint、Worker 租约与心跳、错误分类重试、累计资源预算和过期任务核验恢复。
+- **保守恢复**：工具调用具有持久化生命周期记录。Worker 中断后，只读请求允许重新执行；已知写操作通过产物、Finding、计划或进度事件核验。无法判断的恢复冲突及损坏的 Checkpoint 会进入人工处理。
+- **执行过程可观测**：模型/工具/系统事件时间线、SSE 实时推送与断线回放、计划历史、研究状态、预算、证据、记忆和成果查看。
+
+## 系统架构
+
+| 层次 | 职责 |
+|---|---|
+| FastAPI 操作接口 | 任务创建与控制、岗位发现、事件/成果/研究状态查询、人工决策和预算扩展 |
+| Research Agent | 自主计划与工具调用、证据收集、分析、研究记忆和报告撰写 |
+| 公共任务工具 | 任务级成果读写、持久化记忆、预算查询与扩展申请 |
+| 研究专属工具 | 网络搜索、网页/PDF、GitHub MCP 和 arXiv |
+| 运行时 | 单 Worker、租约/心跳、重试、LangGraph Checkpoint、回调、预算闸门和恢复 |
+| 持久化 | SQLite 任务/事件/控制记录、SQLite 图状态、任务工作区 |
+
+任务数据库、LangGraph Checkpoint 和任务工作区职责不同：任务数据库负责任务状态、所有权、预算和审计事件；Checkpoint 保存 Agent 图状态；工作区保存计划、记忆、来源快照和成果。恢复时会核对这些数据源，而不是简单用其中一个覆盖其他状态。
 
 ## 环境要求
 
-- 推荐 Python 3.12。
-- OpenAI API Key 和 Tavily API Key。
-- 支持 Windows、macOS、Linux；Docker 可选。
+- Python 3.12。
+- OpenAI 或 OpenAI 兼容的 Chat Completions 模型接口。
+- Tavily API Key（网络搜索需要）。
+- GitHub 为可选能力，需要只读权限的 Fine-grained PAT；arXiv 不需要 API Key。
+- 支持 Windows、macOS 和 Linux。
 
-## Windows 本地启动
+## 本地启动
 
-在项目目录打开两个 PowerShell 窗口。
+在项目目录打开两个终端，创建环境、安装依赖并复制配置文件：
 
-终端 1：创建环境并安装依赖：
-
-```powershell
+~~~powershell
 py -3.12 -m venv .venv
 .\.venv\Scripts\Activate.ps1
 python -m pip install --upgrade pip
 pip install -r requirements.txt
 Copy-Item .env.example .env
-```
+~~~
 
-在项目根目录的 `.env` 中统一配置 `OPENAI_API_KEY` 和 `TAVILY_API_KEY`。如需启用 GitHub 仓库工具，再填写 `GITHUB_PERSONAL_ACCESS_TOKEN`；连接方式、远程地址、超时时间和重试次数也统一在该文件中设置。`.env` 已加入 Git 忽略规则，禁止提交真实凭据。
+macOS/Linux 可使用 `python3.12 -m venv .venv`、`source .venv/bin/activate` 和 `cp .env.example .env`。
+
+在项目根目录的 `.env` 中配置：
+
+- **OPENAI_API_KEY**、**OPENAI_MODEL**。
+- **TAVILY_API_KEY**（网络搜索需要）。
+- 使用兼容网关时配置 **OPENAI_BASE_URL**。
+
+如需启用 GitHub 工具，再配置 **GITHUB_PERSONAL_ACCESS_TOKEN**。默认使用 GitHub 官方托管的只读 MCP 远程端点；连接方式、远程地址、超时、重启次数和最大文件大小均在同一个 `.env` 中配置，也可选择本地 stdio MCP 服务。真实凭据不得提交到 Git。
 
 终端 1：启动 API：
 
-```powershell
+~~~powershell
 uvicorn app.api.main:app --reload --host 127.0.0.1 --port 8000
-```
+~~~
 
-终端 2：启动单 Worker：
+终端 2：启动 Worker：
 
-```powershell
+~~~powershell
 .\.venv\Scripts\Activate.ps1
 python -m app.runtime.worker
-```
+~~~
 
-浏览器访问 <http://127.0.0.1:8000/>。**通过网页表单创建任务**，中文内容由浏览器以 UTF-8 JSON 发送；无需通过终端编码提交任务目标。
+浏览器访问 <http://127.0.0.1:8000/>，通过控制台创建研究任务。Worker 与浏览器会话相互独立。
 
-## 控制台使用
+## 研究执行流程
 
-1. 在网页创建任务，填写研究目标、步数、运行时限和重试次数。
-2. 选择任务查看状态及按时间排序的执行轨迹。
-3. 执行事件通过 SSE 推送并持久化。断线重连使用最后事件 ID；历史事件也可通过 API 查询。
-4. 执行轨迹按模型调用、工具调用和系统事件分层展示，并将同一次模型/工具调用的开始、完成或失败合并为一张卡片。默认只显示关键摘要、状态、耗时和 Token；模型原始 Prompt/响应默认收起，点击“查看完整请求 / 响应”后查看。工具参数和返回结果也可单独展开。SSE 新事件采用局部更新，不会重置已展开的卡片或详情滚动位置。系统展示模型实际生成的可观察输出，不采集隐藏思维链；凭据在持久化前脱敏。
-5. 在执行轨迹上方查看 Agent 的整体执行计划、每个步骤的执行进度及规划演进历史。步骤状态通过独立事件持久化，不会产生策略版本。点击任务后，执行实例详情展示 Worker、心跳、Checkpoint 恢复状态、重试次数、模型/工具调用统计及最近异常。任务进入终态后，最终计划、步骤进度和全部有效版本归档至 `notes/agent_execution_plan.json`。
-6. 成果预览支持 Markdown 渲染/源码切换；JSON 仅显示原始文本，不做对象渲染、格式化或语法高亮。Markdown 与 JSON 共用固定宽度的预览容器，长代码或表格只在内容区域内部滚动。
-7. 可重试失败任务、暂停、恢复或取消任务。
-8. 永久删除任务。运行中任务会显示“正在停止并清理”，API 最多等待 60 秒；Worker 未确认停止则取消删除并保留任务数据。
+1. Agent 理解研究目标并生成结构化研究计划。
+2. 建立研究覆盖矩阵，明确研究维度、问题、预期证据、优先级和最低来源数量。
+3. Agent 自主搜索、阅读资料，将来源快照登记到证据库，使用来源 ID 记录 Finding，并保存长期研究记忆。
+4. Research Controller 在观测到的研究阶段边界，以及 Agent 主动查询研究状态时，评估维度覆盖率和停滞情况，返回 `FILL_EVIDENCE_GAP`、`REPLAN`、`ENTER_CONVERGENCE`、`REQUEST_HUMAN` 等建议。大部分研究动作仍由 Agent 执行；阶段边界要求人工决策时，运行时会自动暂停任务并创建待办。
+5. Agent 撰写报告。ReportValidator 检查 Markdown 结构、URL、已登记来源 ID 和段落级引用覆盖率。
+6. ResearchEvaluator 先执行规则评估；没有硬阻断时，再调用独立上下文的 LLM 评审。默认评价目标覆盖度、证据充分性、来源可靠性、结论一致性和报告完整性五个维度。默认加权总分门槛为 80 分，单维度门槛为 60 分。
+7. Executor 对最终成果进行持久化和读回核验。研究岗位最多允许三轮交付修订；仍无法解决的质量问题会保留现场，并可能转人工决策。
+
+## 任务资源预算
+
+研究岗位默认预算为 30 次工具调用、3600 秒和 100000 Token。创建任务时可显式覆盖岗位默认值。
+
+- 工具调用次数在工具开始前通过 SQLite 原子计数。
+- 累计运行时间在模型/工具/回调控制边界检查，跨重试累计；暂停期间不计入已用运行时间。
+- 主 Agent 每次模型调用前，系统预留启发式输入 Token 估算值、4096 Token 输出上限和 256 Token 固定开销；模型也配置为最多输出 4096 Token。结算优先使用 Provider 返回的实际 usage。
+- 收敛阶段预留 Token 总额的 30%、工具调用次数的 25% 和运行时间的 20%（同时受最小/最大预留规则约束）。任一探索额度触及收敛边界后，系统禁止继续搜索和读取新来源，将剩余额度用于综合、持久化、校验和修复。
+- Agent 可申请预算扩展，必须由操作人员批准。批准后增加对应额度；因硬预算闸门失败的任务可复用原 Checkpoint 和工作区重新入队。
+
+Token 估算属于启发式估算，并非 Provider 精确计量；当前控制台尚未提供美元成本展示。
 
 ## API
 
-- `POST /tasks`、`GET /tasks`、`GET /tasks/{task_id}`
-- `GET /tasks/{task_id}/events`、`GET /tasks/{task_id}/events/stream`
-- `POST /tasks/{task_id}/pause`、`POST /tasks/{task_id}/resume`
-- `POST /tasks/{task_id}/retry`、`POST /tasks/{task_id}/cancel`
-- `DELETE /tasks/{task_id}`
-- `GET /tasks/{task_id}/artifacts`、`GET /tasks/{task_id}/artifacts/{path}`
-- `GET /system/overview`
+- 任务与岗位：`POST /tasks`、`GET /tasks`、`GET /tasks/{task_id}`、`GET /agents`
+- 事件：`GET /tasks/{task_id}/events`、`GET /tasks/{task_id}/events/stream`
+- 任务控制：`POST /tasks/{task_id}/pause`、`resume`、`retry`、`cancel`；`DELETE /tasks/{task_id}`
+- 成果：`GET /tasks/{task_id}/artifacts`、`GET /tasks/{task_id}/artifacts/{path}`
+- 研究状态：`GET /tasks/{task_id}/research`、`GET /tasks/{task_id}/evidence`、`GET /tasks/{task_id}/memory`
+- 预算：`GET /tasks/{task_id}/budget`、`POST /tasks/{task_id}/budget/approve`
+- 人工干预：`POST /tasks/{task_id}/human-intervention/resolve`
+- 运行状态：`GET /health`、`GET /system/overview`
 
-SSE 客户端可使用 `Last-Event-ID` 请求头或 `after_id` 参数。事件 ID 单调递增。
+SSE 支持 `Last-Event-ID` 或 `after_id`。事件先写入 SQLite，再按单调递增的 event_id 推送；断线后可从指定事件 ID 继续回放。
 
 ## 数据存储
 
-- `data/tasks.sqlite`：任务及持久化事件；删除任务时事件级联删除。
-- `data/checkpoints.sqlite`：LangGraph 检查点；删除时清理 thread_id 对应记录。
-- `workspaces/<task_id>/`：搜索结果、网页资料、笔记和最终报告。
+- `data/tasks.sqlite`：任务状态、Worker 所有权、预算、事件日志、研究控制状态、质量评估、工具调用记录、恢复决策和人工干预。
+- `data/checkpoints.sqlite`：以 task_id 为 thread_id 的 LangGraph Checkpoint。
+- `workspaces/{task_id}/`：研究计划、记忆、来源快照、证据登记簿、中间成果和最终报告。
 
-执行数据会一直保留到用户主动删除任务。备份时应同时备份两个 SQLite 数据库和 `workspaces/`。
+任务数据保留到用户主动删除。备份时应同时备份两个 SQLite 数据库和工作区目录。首次增量迁移会将旧版 runtime generation 1 的活动任务归档；旧活动任务不会被当前 Worker 自动恢复。
 
 ## 测试
 
-```powershell
+运行离线测试：
+
+~~~powershell
 python -m pytest -v
-```
+node --check app/static/app.js
+~~~
 
-测试不需要真实 OpenAI/Tavily 密钥，覆盖任务持久化、中文 UTF-8 往返、事件回放、凭据脱敏、删除状态隔离与级联清理、Worker 生命周期。真实研究任务冒烟测试需要有效 API Key。
+GitHub Actions 使用 Python 3.12 执行 pytest，并使用 Node 22 检查前端 JavaScript。测试依赖本地 SQLite 和测试替身，不证明真实模型、Tavily、GitHub 服务的端到端研究效果。真实冒烟测试需要配置相应凭据。
 
-## 计划历史与成果预览
+## 当前边界与已知限制
 
-Agent 执行计划描述整体研究策略。只有初始规划和基于证据的实质性重规划才产生新版本；普通步骤进度保留在执行轨迹中。每次重规划记录触发原因、新信息、原方案问题分析、调整决策和具体变化。任务进入完成、失败或取消等终态后，最终计划及全部有效版本归档至 `notes/agent_execution_plan.json`。归档保存简明决策依据，不保存隐藏思维链。
+- 单机单 Worker。全局 Worker 租约阻止多个 Worker 同时运行；多主机调度和多岗位并行执行尚未实现。
+- 默认只注册 Research Agent。注册表支持岗位独立 builder、产物路径、校验器、后处理器、终态收尾函数和预算默认值，但 Executor 仍有研究岗位专属生命周期分支。
+- 取消为协作式机制，正在执行的模型或网络请求可能需要运行到下一个控制点。
+- Controller 负责计算证据覆盖并给出行动建议，大部分研究动作仍由 Agent 选择和执行；运行时直接强制执行的是预算闸门和人工停车，而不是所有 Controller 建议。
+- 来源快照保存 SHA-256 元数据。当前完整性检查验证快照存在性以及快照中的哈希/URL 标记，但不会重新计算来源正文的 SHA-256，也没有实现防篡改的只读存储。
+- LLM 评审使用与 Agent 相同的模型配置，但通过独立调用和上下文执行；评审只读取有限的报告和来源摘录，不会完整重读全部来源。
+- CI 为离线测试。真实模型研究质量、外部服务稳定性以及真实外部调用期间的崩溃恢复，仍需部署后进行冒烟和故障注入验证。
 
-Markdown 支持渲染和源码两种模式。JSON 仅展示原始文本，不做 JSON 渲染、重新格式化或语法高亮。两种格式共用固定宽度预览框，长行在预览框内部滚动。
+## GitHub 与 arXiv 数据源
 
-## MVP 边界
+GitHub 工具仅注册给研究岗位。默认使用 GitHub 官方托管只读 MCP 端点 <https://api.githubcopilot.com/mcp/readonly>。适配器采用只读工具白名单，要求先建立目录索引，再将文件读取固定到索引对应的 commit SHA，并保存任务级快照。PAT 应使用仅覆盖目标仓库必要读取权限的 Fine-grained PAT。
 
-当前是单机单 Worker MVP。SQLite 不适用于多主机高并发场景。取消采用协作式机制，正在进行的模型或网络请求可能需要运行到下一个控制点。系统不采集或展示隐藏的模型思维链，只记录模型生成的可观察输出和决策。
-
-
-## 可靠性与质量控制
-
-- `max_runtime_seconds` 是跨 Worker 重试累计的任务运行预算；Worker 心跳将已运行时间结算到 SQLite，暂停和重试不会重置预算。
-- `max_steps` 定义为任务生命周期内允许的工具调用次数，由 SQLite 原子计数保证；LangGraph recursion limit 仅作为图循环的第二道保护。
-- Agent 最终报告由独立 ReportValidator 检查 Markdown 标题、最低内容长度、来源章节和可核验 URL；失败时最多反馈 Agent 修订两轮，仍不合格则任务失败并保留诊断事件。
-- 支持公开 PDF 文本提取，扫描版 PDF 需要 OCR 时会明确报告无法提取，不会伪造正文。
-- Worker 在已有租约时等待租约释放或过期，再尝试接管。
-- Agent 通过 `agent_type` 注册表构建；当前默认并内置 `research`，新岗位提供独立 builder、提示词与工具集后可注册。
-
-
-## 长任务能力增强
-
-- **岗位注册表**：通过 `app/agents/registry.py` 注册岗位 Agent，定义岗位提示词、产物路径和质量门禁；API `GET /agents` 返回可用岗位。
-- **上下文压缩与长期记忆**：Deep Agents 的 `SummarizationMiddleware` 按模型最大输入 Token 数计算绝对阈值，在约 78% 时触发摘要并保留约 18% 的近期上下文；优先读取模型 profile，支持 `MODEL_MAX_INPUT_TOKENS` 覆盖，兼容没有 LangChain profile 的 OpenAI 兼容模型。Qwen3.8-Flash 自动采用 991,808 输入 Token 上限；未知模型默认按 128,000 Token 保守处理。LangGraph SQLite Checkpoint 负责运行状态恢复，任务工作区的 `notes/research_memory.md` 保存跨重启研究摘要。
-- **证据溯源**：成功读取的网页/PDF 自动写入 `evidence/registry.json` 和不可变内容快照，来源分配 `[S0001]` ID；Agent 可用 `record_finding` 将发现关联来源。报告质量门禁检查 URL、章节、来源 ID、快照和段落级引用覆盖率。
-- **任务预算强制执行**：工具调用步数与累计运行时长是硬闸门，分别在工具调用前及模型/工具/控制回调边界检查；超时终止为终态失败，不进入自动重试。每次模型调用前预留 UTF-8 输入字节数启发式估算 + 2048 Token 输出上限 + 128 Token 固定开销，ChatOpenAI 同时设置 2048 Token 输出上限；成功后按 Provider usage 结算，异常时释放预留，重复回调幂等。预留不足时不发起模型请求，任务以 `TOKEN_BUDGET_EXHAUSTED` 终态失败。达到 80% 告警、95% 禁止搜索/抓取，但产物/证据/记忆工具仍可用。人工扩额叠加额度并从 Checkpoint 恢复。API：`GET /tasks/{task_id}/budget`、`POST /tasks/{task_id}/budget/approve`。
-- **可观测性**：`GET /tasks/{task_id}/evidence` 与 `GET /tasks/{task_id}/memory` 提供证据和记忆查看，控制台展示预算、证据数量和最新记忆。
-- **兼容性**：SQLite 使用增量迁移；既有任务、事件、Checkpoint 和工作区无需重建。
-
-Token 预留采用保守的 UTF-8 字节数启发式估算，包含 2048 Token 输出上限和 128 Token 固定开销；结算以 Provider 返回的 usage metadata 为准，Provider 未提供 usage 时按 0 结算并释放剩余预留。研究岗位默认步数/运行时长/Token 配额唯一声明于 `app/agents/research/profile.toml`，API 创建任务直接使用该配置，显式任务参数优先。当前尚未接入金额成本界面。
-
-
-## 岗位契约与错误策略
-
-岗位注册可选声明产物路径（默认 `result.md`）、校验器、受控后处理/修订次数、终态收尾函数和默认预算。公共 Executor 不再固定研究报告文件名或研究校验器；研究岗位保留 `report.md`、原证据覆盖率判据、最多两次定向修订及终态计划归档。
-
-错误分为可重试、终态、控制信号和未知类。鉴权/权限/非法请求/交付校验耗尽直接失败，不消耗自动重试；网络与上游临时错误按退避策略重试；未知错误标记为 `UNKNOWN_EXCEPTION` 并默认可重试。任务保存最新错误、首个根因及完整错误历史。
-
-
-## 研究数据源：GitHub MCP 与 arXiv
-
-研究岗位新增六个专属工具：github_repo、github_tree、github_read、github_releases、arxiv_search 和 arxiv_paper。GitHub MCP 默认连接 GitHub 官方托管的远程只读服务（https://api.githubcopilot.com/mcp/readonly），无需在部署环境安装或维护 github-mcp-server。Worker 首次调用时懒初始化并复用 MCP 会话；请求使用 Authorization: Bearer PAT、X-MCP-Readonly: true 和精确的 X-MCP-Tools 白名单。远程服务可能公布默认工具集中的其他只读工具，但应用层只允许调用代码白名单中的七个工具。未配置 PAT 或 MCP 服务不可用时，工具返回结构化配置错误，研究任务仍可继续使用网页和 PDF 工具。
-
-默认配置为 GITHUB_MCP_TRANSPORT=remote，并设置 GITHUB_PERSONAL_ACCESS_TOKEN；PAT 建议使用仅对目标仓库具有必要读取权限的 Fine-grained PAT。PAT 不得提交到仓库。需要本地部署时，可安装官方 github/github-mcp-server 并设置 GITHUB_MCP_TRANSPORT=stdio。一次 github_read 最多读取 5 个文件，只计一个 Agent 工具步数；适配器要求先通过 github_tree 为每个文件父目录建立大小索引，并使用索引返回的 commit SHA 固定读取版本；在任何文件读取请求前完成路径与文件大小检查。文本快照保存至 sources/github/{commit_sha}/，登记 github_file 类型证据并沿用 [Sxxxx] 编号。未建立索引的路径和超限文件会在发起 MCP 请求前被拒绝。二进制、密钥、危险路径和超过硬大小限制的文件会被拒绝；超过快照阈值但未超过硬限制的文本会截断并明确标记。
-
-arxiv_search 和 arxiv_paper 使用 Python 标准库调用 arXiv 官方 Atom API，全局请求间隔至少 3 秒，相同检索式缓存 5 分钟。检索结果和论文元数据登记为 arxiv 类型证据；全文读取复用现有 SSRF 校验、大小限制和 PDF 文本提取流程。不新增 Python 解析依赖。
-
-新增事件包括 github_repo_lookup_started、github_repo_lookup_completed、github_tree_index_started、github_tree_indexed、github_files_read_started、github_file_read_completed、github_files_read_completed、github_releases_listed、github_repo_failed、github_tree_failed、github_files_read_failed、github_releases_failed、arxiv_search_completed、arxiv_search_failed、arxiv_paper_read_completed 和 arxiv_paper_failed。失败事件包含 error_type、error_code、retryable；限流时还包含 retry_after_seconds。工具层错误同步写入任务错误历史，但不会自动终止整个研究任务。
+arXiv 适配器调用官方 Atom API，设置进程级 3 秒请求间隔和 5 分钟检索缓存。论文 PDF 读取复用公开 PDF 提取链路，并沿用 SSRF 与下载大小检查。
