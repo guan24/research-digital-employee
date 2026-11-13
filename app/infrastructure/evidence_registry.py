@@ -71,10 +71,10 @@ class EvidenceRegistry:
             snapshot_path = f"evidence/sources/{source_id}.md"
             retrieved_at = self._now()
             snapshot = (
-                f"# {str(title or normalized_url).strip()}\\n\\n"
-                f"- Source ID: {source_id}\\n- URL: {normalized_url}\\n"
-                f"- Retrieved at: {retrieved_at}\\n- Source type: {source_type}\\n"
-                f"- Content SHA-256: {digest}\\n\\n{body}\\n"
+                f"# {str(title or normalized_url).strip()}\n\n"
+                f"- Source ID: {source_id}\n- URL: {normalized_url}\n"
+                f"- Retrieved at: {retrieved_at}\n- Source type: {source_type}\n"
+                f"- Content SHA-256: {digest}\n\n{body}\n"
             )
             self.artifacts.write_text(snapshot_path, snapshot)
             source = {
