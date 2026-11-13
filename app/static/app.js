@@ -17,6 +17,8 @@ let workerOverview = { status: 'offline' };
 let eventStreamMode = 'connecting';
 let lastBudget = null;
 let researchState = null;
+let planSnapshotData = null;
+let planSnapshotTaskId = '';
 
 const names = {
   deleting: '正在删除', queued: '排队中', running: '运行中',
@@ -221,6 +223,7 @@ async function load(taskId) {
   if (eventPollTimer) clearInterval(eventPollTimer);
   eventSource = null; eventPollTimer = null;
   detail = null; events = []; artifacts = []; activeFile = ''; fileText = ''; lastBudget = null;
+  planSnapshotData = null; planSnapshotTaskId = '';
   $('taskStatus').textContent = '加载中';
   setStreamStatus('');
   researchState = null;
@@ -232,9 +235,9 @@ async function load(taskId) {
   $('eventCount').textContent = '加载中';
   $('planPanel').innerHTML = '<div class="empty">正在读取 Agent 执行计划…</div>';
   $('artifacts').innerHTML = '<div class="empty">正在读取工作区文件…</div>';
-  const [taskResult, historyResult, artifactResult] = await Promise.allSettled([
+  const [taskResult, historyResult, artifactResult, planResult] = await Promise.allSettled([
     req('/tasks/' + taskId), req('/tasks/' + taskId + '/events?limit=2000'),
-    req('/tasks/' + taskId + '/artifacts')
+    req('/tasks/' + taskId + '/artifacts'), req('/tasks/' + taskId + '/plan')
   ]);
   if (generation !== loadGeneration || selected !== taskId) return;
   if (taskResult.status === 'fulfilled') { detail = taskResult.value; renderTaskSummary(); }
@@ -256,9 +259,31 @@ async function load(taskId) {
   if (artifactResult.status === 'fulfilled') { artifacts = artifactResult.value.artifacts || []; renderArtifacts(); }
   else $('artifacts').innerHTML = '<div class="load-error">工作区文件读取失败：' +
     esc(artifactResult.reason?.message || '未知 API 错误') + '</div>';
+  if (planResult.status === 'fulfilled') {
+    planSnapshotData = planResult.value;
+    planSnapshotTaskId = taskId;
+    renderPlan();
+  } else {
+    planSnapshotData = null;
+    planSnapshotTaskId = '';
+  }
   await loadResearchState(taskId);
   if (taskResult.status === 'fulfilled' || historyResult.status === 'fulfilled') connectEvents(taskId);
   renderTasks();
+}
+
+async function refreshPlanSnapshot(taskId) {
+  try {
+    const snapshot = await req('/tasks/' + taskId + '/plan');
+    if (selected !== taskId) return;
+    planSnapshotData = snapshot;
+    planSnapshotTaskId = taskId;
+    renderPlan();
+  } catch (error) {
+    if (selected === taskId && planSnapshotTaskId !== taskId) {
+      $('planPanel').innerHTML = '<div class="load-error">执行计划快照读取失败：' + esc(error.message) + '</div>';
+    }
+  }
 }
 
 function setStreamStatus(message,degraded=false) {
@@ -279,7 +304,7 @@ function connectEvents(taskId) {
     let item;try{item=JSON.parse(message.data);}catch(error){console.error('Invalid task event payload',error);return;}
     if(events.some(event=>event.event_id===item.event_id))return;
     events.push(item);upsertTraceEvent(item);
-    if(item.event_type.startsWith('research_plan_'))renderPlan();
+    if(item.event_type.startsWith('research_plan_'))refreshPlanSnapshot(taskId);
     if(['research_control_decision','research_quality_assessed','recovery_decision_recorded',
         'human_intervention_requested','human_intervention_resolved','research_controller_parked_for_human'].includes(item.event_type))loadResearchState(taskId);
     if(['budget_warning','budget_restricted','budget_soft_limit_reached','budget_extension_approved','research_memory_saved','research_finding_recorded'].includes(item.event_type))renderBudgetAndEvidence();
@@ -304,7 +329,7 @@ async function pollNewEvents(taskId) {
     for(const item of incoming){
       if(events.some(event=>event.event_id===item.event_id))continue;
       events.push(item);upsertTraceEvent(item);
-      if(item.event_type.startsWith('research_plan_'))renderPlan();
+      if(item.event_type.startsWith('research_plan_'))refreshPlanSnapshot(taskId);
       if(['research_control_decision','research_quality_assessed','recovery_decision_recorded',
           'human_intervention_requested','human_intervention_resolved','research_controller_parked_for_human'].includes(item.event_type))loadResearchState(taskId);
       if(['budget_warning','budget_restricted','budget_soft_limit_reached','budget_extension_approved','research_memory_saved','research_finding_recorded'].includes(item.event_type))renderBudgetAndEvidence();
@@ -428,14 +453,60 @@ function renderEvidence(evidence) {
       sources.map(source=>'<tr><td><code>'+esc(source.source_id||'—')+'</code></td><td><b>'+esc(compact(source.title||source.url,90))+
         '</b><small>'+esc(sourceDomain(source.url))+'</small><a href="'+esc(safeHttpUrl(source.url))+'" target="_blank" rel="noopener noreferrer">原始来源 ↗</a></td><td>'+
         (/pdf/i.test(source.source_type||'')||/\.pdf(?:$|\?)/i.test(source.url||'')?'PDF':'网页')+'</td><td><span class="verify-state '+
-        (source.verified?'verified':'unverified')+'">'+(source.verified?'已核验':'未核验')+'</span></td><td><button type="button" class="snapshot-open" data-snapshot="'+
-        esc(source.snapshot_path||'')+'" '+(source.snapshot_path?'':'disabled')+'>查看快照</button></td></tr>').join('')+
+        (source.verified?'verified':'unverified')+'">'+(source.verified?'已核验':'未核验')+'</span></td><td><button type="button" class="snapshot-open" data-snapshot-source="'+
+        esc(source.source_id||'')+'" '+(source.source_id?'':'disabled')+'>查看快照</button></td></tr>').join('')+
       '</tbody></table></div>'+(findings.length?'<div class="finding-list"><b>研究发现</b>'+findings.map(finding=>
         '<article><p>'+esc(compact(finding.claim,240))+'</p><small>关联来源：'+esc((finding.source_ids||[]).join('、'))+
         ' · 置信度：'+esc(({low:'低',medium:'中',high:'高'})[finding.confidence]||finding.confidence||'未记录')+
         '</small></article>').join('')+'</div>':'<p class="muted">尚未登记研究发现。</p>'):
       '<div class="empty"><b>尚未登记证据</b><p>Agent 完成搜索和网页读取后，会将来源、核验状态与快照登记在这里。</p></div>');
-  document.querySelectorAll('[data-snapshot]').forEach(button=>button.addEventListener('click',()=>openFile(button.dataset.snapshot)));
+  bindEvidenceSnapshotActions();
+}
+
+function bindEvidenceSnapshotActions() {
+  const panel = $('evidencePanel');
+  if (panel.dataset.snapshotActionsBound) return;
+  panel.dataset.snapshotActionsBound = 'true';
+  panel.addEventListener('click', event => {
+    const button = event.target.closest('button[data-snapshot-source]');
+    if (!button || !panel.contains(button) || button.disabled) return;
+    openEvidenceSnapshot(button.dataset.snapshotSource, button);
+  });
+}
+
+async function openEvidenceSnapshot(sourceId, button) {
+  const taskId = selected;
+  if (!taskId || !sourceId) return;
+  const previousText = button.textContent;
+  button.disabled = true;
+  button.textContent = '读取中…';
+  $('preview').innerHTML = '<div class="empty">正在读取证据快照 ' + esc(sourceId) + '…</div>';
+  try {
+    const response = await fetch(
+      '/tasks/' + encodeURIComponent(taskId) + '/evidence/sources/' +
+      encodeURIComponent(sourceId) + '/snapshot'
+    );
+    if (!response.ok) {
+      let detail = '';
+      try { detail = (await response.json()).detail || ''; } catch {}
+      throw Error(detail || ('读取证据快照失败：HTTP ' + response.status));
+    }
+    const content = await response.text();
+    if (selected !== taskId) return;
+    fileText = content;
+    activeFile = 'evidence/sources/' + sourceId + '.md';
+    renderArtifactPreview();
+    $('previewModeHint').textContent = '证据快照 · ' + sourceId + ' · SHA-256 已核验';
+    renderArtifacts();
+    $('preview').scrollIntoView({ behavior: 'smooth', block: 'center' });
+    button.textContent = '已打开';
+  } catch (error) {
+    if (selected === taskId) $('preview').innerHTML = '<div class="load-error">' + esc(error.message) + '</div>';
+    button.textContent = '重试查看';
+  } finally {
+    button.disabled = false;
+    if (button.textContent === '读取中…') button.textContent = previousText;
+  }
 }
 async function loadResearchState(taskId) {
   try {
@@ -591,12 +662,43 @@ function normalizedPlan(plan = {}) {
       title: String(step.title || ''),
       objective: String(step.objective || ''),
       expected_output: String(step.expected_output || ''),
-      expected_output_path: String(step.expected_output_path || '')
+      expected_output_path: String(step.expected_output_path || ''),
+      phase: String(step.phase || ''),
+      dependencies: Array.isArray(step.dependencies) ? step.dependencies.map(String) : []
     }))
   };
 }
 
 function planSnapshot() {
+  if (planSnapshotTaskId === selected && planSnapshotData) {
+    const versions = (planSnapshotData.history || []).map((item, index) => {
+      const plan = normalizedPlan(item.plan || {});
+      const payload = {
+        original_plan_text: item.original_plan_text || '',
+        change_type: item.change_type || (index ? 'replan' : 'initial')
+      };
+      return {
+        version: Number(item.version || index + 1), plan, signature: JSON.stringify(plan),
+        event: { timestamp: item.timestamp, payload }, changeType: payload.change_type,
+        trigger: item.trigger || '', newInformation: item.new_information || '',
+        problemAnalysis: item.problem_analysis || '', decision: item.decision || '',
+        changes: item.changes || '', planDiff: item.plan_diff || {}
+      };
+    });
+    if (!versions.length && planSnapshotData.current_plan) {
+      const plan = normalizedPlan(planSnapshotData.current_plan);
+      versions.push({
+        version: Number(planSnapshotData.current_version || 1), plan, signature: JSON.stringify(plan),
+        event: { timestamp: planSnapshotData.last_updated_at, payload: {} },
+        changeType: 'initial', trigger: '', newInformation: '', problemAnalysis: '',
+        decision: '', changes: '', planDiff: {}
+      });
+    }
+    const latest = versions.length ? versions[versions.length - 1] : null;
+    const finalizedEvent = planSnapshotData.finalized
+      ? { event_id: Number.MAX_SAFE_INTEGER, timestamp: planSnapshotData.finalized_at } : null;
+    return { versions, latest, finalizedEvent, progress: planSnapshotData.progress || {} };
+  }
   const versions=[];
   for(const event of events){
     if(event.event_type!=='research_plan_updated')continue;
@@ -641,15 +743,15 @@ function planHistoryEntry(version) {
 function renderPlan() {
   const {versions,latest,finalizedEvent,progress}=planSnapshot();planVersions=versions;
   const root=$('planPanel');if(!latest){root.innerHTML='<div class="empty plan-empty">Agent 尚未提交整体研究计划。</div>';return;}
-  const counts={pending:0,in_progress:0,completed:0,skipped:0,failed:0,awaiting_verification:0};
+  const counts={pending:0,in_progress:0,awaiting_verification:0,retrying:0,blocked:0,paused:0,completed:0,skipped:0,failed:0};
   const steps=latest.plan.steps.map(step=>{const status=progress[step.id]?.status||'pending';counts[status]=(counts[status]||0)+1;return {...step,status,note:progress[step.id]?.note||''};});
   const total=steps.length,done=counts.completed+counts.skipped,pct=total?Math.round(done/total*100):0;
-  const labels={pending:'待执行',in_progress:'进行中',completed:'已完成',skipped:'已跳过',failed:'失败',awaiting_verification:'待产物核验'};
+  const labels={pending:'待执行',in_progress:'进行中',awaiting_verification:'待产物核验',retrying:'重试中',blocked:'受阻',paused:'已暂停',completed:'已完成',skipped:'已跳过',failed:'失败'};
   root.innerHTML='<div class="plan-top"><div><strong>'+esc(latest.plan.title)+'</strong><p>'+esc(latest.plan.objective)+'</p></div><span class="plan-version">'+
     (finalizedEvent?'最终计划已归档':'规划执行中')+' · v'+latest.version+'</span></div>'+
     '<div class="plan-progress"><span>执行进度 '+done+'/'+total+'（'+pct+'%）</span><div><i style="width:'+pct+'%"></i></div></div>'+
     '<div class="plan-progress-counts"><span>已完成 '+counts.completed+'</span><span>进行中 '+counts.in_progress+'</span><span>待执行 '+counts.pending+
-    '</span><span>已跳过 '+counts.skipped+'</span><span>失败 '+counts.failed+'</span></div>'+
+    '</span><span>待核验 '+counts.awaiting_verification+'</span><span>重试中 '+counts.retrying+'</span><span>受阻 '+counts.blocked+'</span><span>已暂停 '+counts.paused+'</span><span>已跳过 '+counts.skipped+'</span><span>失败 '+counts.failed+'</span></div>'+
     '<div class="plan-section-label">当前整体执行计划</div><ol class="plan-steps">'+steps.map((s,i)=>
       '<li class="plan-step '+esc(s.status)+'"><span class="plan-index">'+(i+1)+'</span><div><strong>'+esc(s.title)+'</strong>'+
       (s.objective?'<p>'+esc(s.objective)+'</p>':'')+(s.expected_output?'<small>预期成果：'+esc(s.expected_output)+'</small>':'')+

@@ -454,3 +454,121 @@ def test_final_text_extraction_does_not_fall_back_to_an_earlier_progress_message
         {"role": "assistant", "content": ""},
     ]}
     assert extract_final_text(result) == ""
+
+
+
+def test_agent_progress_for_one_step_does_not_block_runtime_tracking_of_another(settings, db):
+    from app.runtime.plan_progress import PlanProgressTracker
+
+    task, service = make_service(settings, db)
+    service.update_research_plan(json.dumps({
+        "title": "分步骤跟踪", "objective": "验证 Agent 与 Runtime 分别维护步骤",
+        "steps": [
+            {"id": "reading", "title": "阅读官方文档", "phase": "reading"},
+            {"id": "discovery", "title": "检索官方资料", "phase": "discovery"},
+        ],
+    }, ensure_ascii=False))
+    service.update_plan_step_status("reading", "in_progress", "Agent 正在阅读官方文档")
+    tracker = PlanProgressTracker(db, task["task_id"], service.artifacts)
+
+    context = tracker.sync_plan_progress_for_tool("web_search", '{"query":"official docs"}')
+    progress = service._latest_step_progress(db.get_events(task["task_id"]))
+
+    assert progress["reading"]["status"] == "in_progress"
+    assert progress["reading"]["source"] == "agent"
+    assert progress["discovery"]["status"] == "in_progress"
+    assert progress["discovery"]["source"] == "runtime"
+    assert context["step_id"] == "discovery"
+
+
+def test_active_plan_step_is_attached_to_tool_call_events(settings, db):
+    from app.runtime.plan_progress import PlanProgressTracker
+
+    task, service = make_service(settings, db)
+    service.update_research_plan(json.dumps({
+        "title": "步骤关联", "objective": "关联工具与步骤",
+        "steps": [{"id": "read", "title": "阅读官方源码", "phase": "reading"}],
+    }, ensure_ascii=False))
+    tracker = PlanProgressTracker(db, task["task_id"], service.artifacts)
+    tracker.activate_step("read", "开始阅读源码")
+    callback = TaskEventCallback(
+        db, task["task_id"], __import__("time").monotonic(), 3600,
+        plan_progress_service=tracker,
+    )
+    callback.on_tool_start(
+        {"name": "fetch_url"}, '{"url":"https://example.org"}', run_id="linked-read",
+    )
+    event = next(
+        item for item in reversed(db.get_events(task["task_id"]))
+        if item["event_type"] == "tool_call_started"
+    )
+    assert event["payload"]["plan_step_id"] == "read"
+    assert event["payload"]["plan_version"] == 1
+    assert event["payload"]["plan_step_phase"] == "reading"
+
+
+def test_tool_failure_transitions_associated_step_to_retrying_then_resumes(settings, db):
+    from app.runtime.plan_progress import PlanProgressTracker
+
+    task, service = make_service(settings, db)
+    service.update_research_plan(json.dumps({
+        "title": "失败恢复", "objective": "验证工具失败后的步骤状态",
+        "steps": [{"id": "reading", "title": "阅读官方文档", "phase": "reading"}],
+    }, ensure_ascii=False))
+    tracker = PlanProgressTracker(db, task["task_id"], service.artifacts)
+    tracker.activate_step("reading", "开始阅读")
+    callback = TaskEventCallback(
+        db, task["task_id"], __import__("time").monotonic(), 3600,
+        plan_progress_service=tracker,
+    )
+    callback.on_tool_start({"name": "fetch_url"}, '{"url":"https://example.org"}', run_id="read-fail")
+    callback.on_tool_error(RuntimeError("temporary network failure"), run_id="read-fail")
+    progress = service._latest_step_progress(db.get_events(task["task_id"]))
+    assert progress["reading"]["status"] == "retrying"
+
+    callback.on_tool_start({"name": "fetch_url"}, '{"url":"https://mirror.example.org"}', run_id="read-retry")
+    progress = service._latest_step_progress(db.get_events(task["task_id"]))
+    assert progress["reading"]["status"] == "in_progress"
+
+
+def test_structured_tool_failure_updates_step_and_trace_as_failed(settings, db):
+    from app.runtime.plan_progress import PlanProgressTracker
+
+    task, service = make_service(settings, db)
+    service.update_research_plan(json.dumps({
+        "title": "结构化失败", "objective": "验证工具返回失败结果",
+        "steps": [{"id": "read", "title": "阅读官方网页", "phase": "reading"}],
+    }, ensure_ascii=False))
+    tracker = PlanProgressTracker(db, task["task_id"], service.artifacts)
+    tracker.activate_step("read", "读取来源")
+    callback = TaskEventCallback(
+        db, task["task_id"], __import__("time").monotonic(), 3600,
+        plan_progress_service=tracker,
+    )
+    callback.on_tool_start({"name": "fetch_url"}, '{"url":"https://example.org"}', run_id="structured-fail")
+    callback.on_tool_end(
+        '{"success":false,"retryable":true,"error":"timeout"}',
+        run_id="structured-fail",
+    )
+    events = db.get_events(task["task_id"])
+    progress = service._latest_step_progress(events)
+    failed = next(event for event in reversed(events) if event["event_type"] == "tool_call_failed")
+    assert progress["read"]["status"] == "retrying"
+    assert failed["payload"]["failure_mode"] == "structured_result"
+    assert failed["payload"]["plan_step_id"] == "read"
+
+
+def test_plan_snapshot_tracker_persists_active_step_and_history(settings, db):
+    from app.runtime.plan_progress import PlanProgressTracker
+
+    task, service = make_service(settings, db)
+    service.update_research_plan(json.dumps({
+        "title": "快照计划", "objective": "验证持久化计划快照",
+        "steps": [{"id": "one", "title": "阅读资料", "phase": "reading"}],
+    }, ensure_ascii=False))
+    service.set_active_plan_step("one", "开始阅读")
+    snapshot = PlanProgressTracker(db, task["task_id"], service.artifacts).snapshot()
+    assert snapshot["current_version"] == 1
+    assert snapshot["current_plan"]["steps"][0]["status"] == "in_progress"
+    assert snapshot["active_step"]["step_id"] == "one"
+    assert snapshot["history"][0]["version"] == 1

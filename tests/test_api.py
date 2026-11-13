@@ -433,3 +433,70 @@ def test_degraded_delivery_requires_confirmation_and_readback_verified_artifact(
         assert delivered[-1]["payload"]["manual_approval"] is True
         assert len(delivered[-1]["payload"]["sha256"]) == 64
 
+
+
+
+def test_task_plan_snapshot_api_returns_current_plan_progress_and_history(tmp_path, monkeypatch):
+    monkeypatch.setenv("APP_HOME", str(tmp_path))
+    monkeypatch.setenv("DATA_DIR", str(tmp_path / "data"))
+    monkeypatch.setenv("WORKSPACE_DIR", str(tmp_path / "workspaces"))
+    with TestClient(app) as client:
+        created = client.post("/tasks", json={"goal": "Research a sufficiently detailed plan snapshot scenario"})
+        task_id = created.json()["task_id"]
+        db = client.app.state.db
+        plan = {
+            "title": "研究计划", "objective": "验证快照 API",
+            "steps": [{"id": "read", "title": "阅读官方文档", "phase": "reading"}],
+        }
+        db.add_event(task_id, "research_plan_updated", {
+            "version": 1, "change_type": "initial", "plan": plan,
+            "original_plan_text": "initial plan",
+        })
+        db.add_event(task_id, "research_plan_step_status", {
+            "step_id": "read", "step_title": "阅读官方文档",
+            "status": "in_progress", "previous_status": "pending",
+            "plan_version": 1, "source": "agent", "phase": "reading",
+            "note": "正在阅读",
+        })
+        response = client.get(f"/tasks/{task_id}/plan")
+        assert response.status_code == 200
+        payload = response.json()
+        assert payload["current_version"] == 1
+        assert payload["current_plan"]["steps"][0]["status"] == "in_progress"
+        assert payload["progress"]["read"]["note"] == "正在阅读"
+        assert payload["history"][0]["original_plan_text"] == "initial plan"
+        assert payload["progress_counts"]["in_progress"] == 1
+
+
+def test_evidence_snapshot_api_reads_registered_snapshot_and_rejects_tampering(tmp_path, monkeypatch):
+    from app.infrastructure.evidence_registry import EvidenceRegistry
+
+    monkeypatch.setenv("APP_HOME", str(tmp_path))
+    monkeypatch.setenv("DATA_DIR", str(tmp_path / "data"))
+    monkeypatch.setenv("WORKSPACE_DIR", str(tmp_path / "workspaces"))
+    with TestClient(app) as client:
+        created = client.post("/tasks", json={"goal": "Research a sufficiently detailed evidence snapshot scenario"})
+        task_id = created.json()["task_id"]
+        store = ArtifactStore(tmp_path / "workspaces", task_id)
+        source = EvidenceRegistry(store).register_source(
+            url="https://example.org/primary",
+            title="Primary source",
+            content="Snapshot body that must remain content-addressed.",
+        )
+        response = client.get(f"/tasks/{task_id}/evidence/sources/{source['source_id']}/snapshot")
+        assert response.status_code == 200
+        assert "Snapshot body that must remain content-addressed." in response.text
+        store.write_text(source["snapshot_path"], "# Tampered snapshot\\n")
+        tampered = client.get(f"/tasks/{task_id}/evidence/sources/{source['source_id']}/snapshot")
+        assert tampered.status_code == 409
+
+
+def test_evidence_snapshot_api_returns_404_for_unknown_source(tmp_path, monkeypatch):
+    monkeypatch.setenv("APP_HOME", str(tmp_path))
+    monkeypatch.setenv("DATA_DIR", str(tmp_path / "data"))
+    monkeypatch.setenv("WORKSPACE_DIR", str(tmp_path / "workspaces"))
+    with TestClient(app) as client:
+        created = client.post("/tasks", json={"goal": "Research a sufficiently detailed missing snapshot scenario"})
+        task_id = created.json()["task_id"]
+        response = client.get(f"/tasks/{task_id}/evidence/sources/S9999/snapshot")
+        assert response.status_code == 404
