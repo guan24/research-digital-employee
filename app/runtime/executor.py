@@ -45,6 +45,38 @@ def _content_as_text(content: Any) -> str:
     return json.dumps(content, ensure_ascii=False, default=str)
 
 
+def _prioritize_human_decision(agent, snapshot, config, human_messages):
+    """Supersede the pending tool batch and resume at the model with valid message history."""
+    from langchain_core.messages import AIMessage, ToolMessage, convert_to_messages
+    from langgraph.types import Overwrite
+    from app.runtime.errors import DeliveryValidationExhausted
+
+    messages = convert_to_messages((snapshot.values or {}).get("messages", []))
+    decision_ids = {message.id for message in human_messages}
+    existing_ids = {message.id for message in messages}
+    unseen = [message for message in human_messages if message.id not in existing_ids]
+    last_ai = next((i for i in range(len(messages) - 1, -1, -1) if isinstance(messages[i], AIMessage)), None)
+    latest_decision = max((i for i, message in enumerate(messages) if message.id in decision_ids), default=-1)
+    if not unseen and (last_ai is None or latest_decision < last_ai):
+        return []
+    updater = getattr(agent, "update_state", None)
+    if not callable(updater) or last_ai is None or not messages[last_ai].tool_calls:
+        raise DeliveryValidationExhausted("Cannot route the pending tool checkpoint to the model before applying the human decision.")
+    tail = messages[last_ai + 1:]
+    results = [message for message in tail if isinstance(message, ToolMessage)]
+    answered = {message.tool_call_id for message in results}
+    pending = [call for call in messages[last_ai].tool_calls if call["id"] not in answered]
+    results.extend(ToolMessage(
+        content=json.dumps({"success": False, "error_type": "superseded_by_human_decision",
+                            "reason": "This pending call was not replayed. Any previous side effects remain in the execution audit. Process the latest human instruction before choosing new tools."}),
+        tool_call_id=call["id"], name=call["name"], status="error",
+    ) for call in pending)
+    # Put tool results before the human instruction, including instructions already saved by an older resume.
+    reordered = messages[:last_ai + 1] + results + [m for m in tail if not isinstance(m, ToolMessage)] + unseen
+    updater(config, {"messages": Overwrite(reordered)}, as_node="tools")
+    return pending
+
+
 def _serialize_model_response(response: Any) -> dict[str, Any]:
     """Preserve text, valid/invalid tool calls and provider finish diagnostics."""
     generations = getattr(response, "generations", None) or []
@@ -781,7 +813,15 @@ class ResearchExecutor:
 
             if snapshot is not None and getattr(snapshot, "next", ()):
                 self.db.add_event(task_id, "checkpoint_resume", {"pending_nodes": list(snapshot.next)})
-                if unseen_human_messages:
+                if registration.agent_type == "research" and "tools" in snapshot.next and human_messages:
+                    superseded = _prioritize_human_decision(agent, snapshot, config, human_messages)
+                    if superseded:
+                        self.db.add_event(task_id, "checkpoint_tools_superseded_by_human", {
+                            "tool_calls": [{"id": call["id"], "name": call["name"]} for call in superseded],
+                            "human_message_ids": [message.id for message in human_messages],
+                        })
+                    result = agent.invoke(None, config=config)
+                elif unseen_human_messages:
                     updater = getattr(agent, "update_state", None)
                     if callable(updater):
                         updater(config, {"messages": unseen_human_messages})

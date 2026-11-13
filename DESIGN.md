@@ -14,6 +14,8 @@
 
 研究控制器的停滞计数不会自动放宽。仅当人工决策明确继续研究、改变方向或补充需求时，数据库在同一决策事务中重置停滞窗口并记录 `research_stagnation_reset`，已有证据缺口、质量门槛、预算和研究版本保持不变。新窗口仍受两个无进展周期约束。
 
+Research Agent 的 Checkpoint 停在 `tools` 节点时，新的人工指令优先于旧工具批次：Executor 为尚无结果的调用补记被人工决策取代的 ToolMessage，保留已有工具结果及历史副作用，再通过 `update_state(as_node="tools")` 将流程转回模型节点。工具结果排在人工指令之前，保持模型消息协议合法；替代的调用 ID 记录在 `checkpoint_tools_superseded_by_human` 事件中。普通 Checkpoint 恢复保持原行为。该机制只保证模型先处理新指令，不替代后续工具权限或研究收尾策略。
+
 浏览器是操作控制台，FastAPI 负责创建和控制持久化任务；独立 Worker 获取全局 SQLite 租约后领取任务，Executor 打开任务工作区和 LangGraph Checkpoint，构建岗位 Agent。Agent 自行调用工具、收集证据、修改计划和生成报告，运行时没有固定的搜索、阅读、写作流水线。
 
 | 组件 | 当前职责 |

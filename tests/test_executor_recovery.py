@@ -223,6 +223,135 @@ def test_resumed_agent_receives_human_natural_language_instruction(settings, db)
     assert db.list_unconsumed_human_decisions(task["task_id"]) == []
 
 
+@pytest.mark.parametrize("human_decision", [False, True])
+@pytest.mark.parametrize("old_tool", ["web_search", "fetch_url", "save_artifact"])
+def test_real_production_tool_checkpoint_applies_human_decision_first(settings, db, monkeypatch, human_decision, old_tool):
+    import json
+    from langchain_core.language_models.fake_chat_models import FakeMessagesListChatModel
+    from langchain_core.messages import AIMessage, HumanMessage, ToolMessage
+    from app.agents.research.agent import build_research_agent
+    from app.runtime.executor import sqlite_checkpointer
+    from app.tools.research_tools import ResearchToolService
+
+    task = db.create_task("Research a topic with enough detail", max_total_tokens=100000)
+    assert db.acquire_worker_lease("decision-worker", 3600)
+    task = db.claim_next_task("decision-worker")
+    _register_evidence(settings, task)
+    store = ArtifactStore(settings.workspace_dir, task["task_id"])
+    store.write_text("notes/existing.md", "Previously verified output")
+    report = FakeAgent().result["messages"][0]["content"]
+    seen = []
+    order = []
+
+    class DecisionModel(FakeMessagesListChatModel):
+        def bind_tools(self, tools, **kwargs):
+            return self
+
+        def get_num_tokens(self, text):
+            return max(1, len(text) // 4)
+
+        def _generate(self, messages, **kwargs):
+            seen.append(messages)
+            order.append("model")
+            return super()._generate(messages, **kwargs)
+
+    def old_call(*args, **kwargs):
+        order.append(old_tool)
+        return json.dumps({"success": True, "message": "Old scheduled tool ran offline"})
+
+    monkeypatch.setattr(ResearchToolService, old_tool, old_call)
+    model = DecisionModel(responses=[AIMessage(content=report)])
+    args = {"web_search": {"query": "old scheduled search"},
+            "fetch_url": {"url": "https://example.org/old-page"},
+            "save_artifact": {"path": "notes/existing.md", "content": "Old scheduled overwrite"}}[old_tool]
+    config = {"configurable": {"thread_id": task["task_id"]}}
+    with sqlite_checkpointer(settings.checkpoint_path) as saver:
+        graph = build_research_agent(settings, db, task, saver, time.monotonic(), model=model)
+        graph.update_state(config, {"messages": [
+            HumanMessage(content=task["goal"]),
+            AIMessage(content="", tool_calls=[{"name": old_tool, "args": args, "id": "old-pending-call", "type": "tool_call"}]),
+        ]}, as_node="model")
+        assert graph.get_state(config).next == ("tools",)
+
+    instruction = "不要再搜索了，直接给出结论报告"
+    if human_decision:
+        intervention = db.set_waiting_for_human(task["task_id"], "research_control_requires_human",
+            {"choices": ["continue_research", "terminate"]}, worker_id="decision-worker")
+        db.resolve_human_intervention(task["task_id"], intervention, "continue_research", {"instruction": instruction})
+        task = db.claim_next_task("decision-worker")
+
+    executor = ResearchExecutor(settings, db, quality_review_enabled=False,
+        agent_builder=lambda *a: build_research_agent(*a, model=model))
+    executor.run(task)
+    assert order == (["model"] if human_decision else [old_tool, "model"])
+    assert store.read_text("notes/existing.md") == "Previously verified output"
+    assert store.read_text("report.md").strip() == report.strip()
+    events = db.get_events(task["task_id"], limit=5000)
+    superseded = [e for e in events if e["event_type"] == "checkpoint_tools_superseded_by_human"]
+    assert len(superseded) == int(human_decision)
+    if human_decision:
+        messages = seen[0]
+        result_index = next(i for i, m in enumerate(messages) if isinstance(m, ToolMessage) and m.tool_call_id == "old-pending-call")
+        instruction_index = next(i for i, m in enumerate(messages) if isinstance(m, HumanMessage) and instruction in m.content)
+        assert result_index < instruction_index
+        assert json.loads(messages[result_index].content)["error_type"] == "superseded_by_human_decision"
+        assert superseded[0]["payload"]["tool_calls"] == [{"id": "old-pending-call", "name": old_tool}]
+        assert not any(e["event_type"] == "tool_call_started" and e["payload"].get("tool") == old_tool for e in events)
+        assert db.list_unconsumed_human_decisions(task["task_id"]) == []
+
+
+def test_pending_tool_redirect_preserves_results_and_existing_human_message():
+    from langchain_core.messages import AIMessage, HumanMessage, ToolMessage
+    from app.runtime.executor import _prioritize_human_decision
+
+    instruction = HumanMessage(content="Stop searching and write the report", id="operator-decision")
+    answered = ToolMessage(content="Persisted old result", name="read_artifact", tool_call_id="done")
+    snapshot = SimpleNamespace(values={"messages": [
+        AIMessage(content="", tool_calls=[
+            {"name": "read_artifact", "args": {"path": "notes/existing.md"}, "id": "done", "type": "tool_call"},
+            {"name": "web_search", "args": {"query": "old search"}, "id": "pending", "type": "tool_call"},
+        ]), answered, instruction,
+    ]})
+    updates = []
+    agent = SimpleNamespace(update_state=lambda config, values, **kwargs: updates.append((values, kwargs)))
+    pending = _prioritize_human_decision(agent, snapshot, {}, [instruction])
+    assert [c["id"] for c in pending] == ["pending"]
+    messages = updates[0][0]["messages"].value
+    assert messages[1] is answered and messages[-1] is instruction
+    assert sum(m.id == instruction.id for m in messages) == 1
+    assert [m.tool_call_id for m in messages if isinstance(m, ToolMessage)] == ["done", "pending"]
+    assert updates[0][1] == {"as_node": "tools"}
+
+
+def test_instruction_already_processed_by_model_does_not_cancel_its_new_tools():
+    from langchain_core.messages import AIMessage, HumanMessage
+    from app.runtime.executor import _prioritize_human_decision
+
+    instruction = HumanMessage(content="Research the new direction", id="operator-decision")
+    snapshot = SimpleNamespace(values={"messages": [instruction, AIMessage(content="", tool_calls=[
+        {"name": "web_search", "args": {"query": "new direction"}, "id": "new-call", "type": "tool_call"},
+    ])]})
+    assert _prioritize_human_decision(SimpleNamespace(), snapshot, {}, [instruction]) == []
+
+
+def test_pending_tool_resume_without_state_update_fails_before_any_invocation(settings, db):
+    from langchain_core.messages import AIMessage
+    from app.runtime.errors import DeliveryValidationExhausted
+
+    task = db.create_task("Research a topic with enough detail")
+    task = db.claim_next_task("worker-before-human")
+    intervention = db.set_waiting_for_human(task["task_id"], "research_control_requires_human",
+        {"choices": ["continue_research", "terminate"]}, worker_id="worker-before-human")
+    db.resolve_human_intervention(task["task_id"], intervention, "continue_research", {"instruction": "Stop searching"})
+    task = db.claim_next_task("worker-after-human")
+    agent = FakeAgent(snapshot=SimpleNamespace(next=("tools",), values={"messages": [AIMessage(content="", tool_calls=[
+        {"name": "web_search", "args": {"query": "old"}, "id": "old", "type": "tool_call"},
+    ])]}))
+    with pytest.raises(DeliveryValidationExhausted, match="Cannot route"):
+        _make_runner(settings, db, agent).run(task)
+    assert agent.invocations == []
+
+
 def test_real_sqlite_checkpoint_resumes_after_interrupted_node(tmp_path):
     from typing import TypedDict
     from langgraph.graph import END, START, StateGraph
