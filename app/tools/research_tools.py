@@ -964,6 +964,23 @@ class ResearchToolService(TaskToolService):
             return correction_failure(self.db, self.task_id, name, error,
                                       self.worker_id, self.worker_generation)
 
+        def step_feedback(name, error):
+            from pydantic import ValidationError
+            self.check_control()
+            events = self.db.get_events(self.task_id, limit=5000)
+            latest = next((e["payload"] for e in reversed(events) if e["event_type"] == "research_plan_updated"), {})
+            details = error.errors(include_input=False, include_url=False) if isinstance(error, ValidationError) else [
+                {"type": type(error).__name__, "loc": [], "msg": str(error)}]
+            payload = {
+                "success": False, "error_type": "plan_step_validation", "tool": name,
+                "recoverable": True, "retryable": False, "message": str(error), "errors": details,
+                "current_plan": {"version": latest.get("version"), "steps": [
+                    {"id": step["id"], "title": step["title"]} for step in (latest.get("plan") or {}).get("steps", [])]},
+                "suggestion": "Choose an existing step ID. If the strategy must change, use update_research_plan with the complete audited plan. Decide whether to correct this call, revise the plan, or take another action. No automatic retry was performed.",
+            }
+            self.db.add_event(self.task_id, "research_plan_step_validation_failed", payload)
+            return json.dumps(payload, ensure_ascii=False)
+
         @tool("update_research_plan", args_schema=ResearchPlanInput)
         def update_research_plan_tool(
             title: str,
@@ -1001,12 +1018,18 @@ class ResearchToolService(TaskToolService):
             output_path: str | None = None,
         ) -> str:
             """Update one plan-step state. completed requires a non-empty artifact that the runtime can read back and hash. blocked, failed and skipped are Agent decisions; retrying and paused are runtime-managed."""
-            return self.update_plan_step_status(step_id, status, note, output_path)
+            try:
+                return self.update_plan_step_status(step_id, status, note, output_path)
+            except ValueError as exc:
+                return step_feedback("update_plan_step_status", exc)
 
         @tool("set_active_plan_step")
         def set_active_plan_step_tool(step_id: str, note: str = "") -> str:
             """Declare the current plan step before starting work; subsequent search/read/analyze tool calls are correlated with this step in the execution trace."""
-            return self.set_active_plan_step(step_id, note)
+            try:
+                return self.set_active_plan_step(step_id, note)
+            except ValueError as exc:
+                return step_feedback("set_active_plan_step", exc)
 
         @tool("record_finding")
         def record_finding_tool(claim: str, source_ids: list[str], rationale: str = "",
@@ -1122,6 +1145,8 @@ class ResearchToolService(TaskToolService):
 
         update_research_plan_tool.handle_validation_error = lambda exc: feedback("update_research_plan", exc)
         define_research_requirements_tool.handle_validation_error = lambda exc: feedback("define_research_requirements", exc)
+        update_plan_step_status_tool.handle_validation_error = lambda exc: step_feedback("update_plan_step_status", exc)
+        set_active_plan_step_tool.handle_validation_error = lambda exc: step_feedback("set_active_plan_step", exc)
         return [
             *self.as_common_tools(),
             record_finding_tool,

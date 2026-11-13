@@ -269,3 +269,33 @@ def test_worker_survives_first_schema_error_and_bounds_correction(run_research, 
         assert result["task"]["status"] == "failed"
         assert "TOOL_ARGUMENT_CORRECTION_EXHAUSTED" in result["task"]["last_error"]
         assert not any(e["event_type"] == "research_requirements_updated" for e in result["events"])
+
+
+def test_worker_keeps_running_when_model_corrects_unknown_step_id(run_research):
+    class CorrectingStepModel(ConditionalResearchModel):
+        error_sent: bool = False
+        feedback_seen: bool = False
+
+        def _generate(self, messages, **kwargs):
+            feedback = [m for m in messages if isinstance(m, ToolMessage) and m.name == "set_active_plan_step"
+                        and str(m.content).startswith("{") and json.loads(m.content).get("error_type") == "plan_step_validation"]
+            if feedback and not self.feedback_seen:
+                self.feedback_seen = True
+                current = json.loads(feedback[-1].content)["current_plan"]
+                assert "context" in [s["id"] for s in current["steps"]]
+                return ChatResult(generations=[ChatGeneration(message=call("set_active_plan_step", step_id="context"))])
+            result = super()._generate(messages, **kwargs)
+            for tc in result.generations[0].message.tool_calls:
+                if tc["name"] == "set_active_plan_step" and not self.error_sent:
+                    tc["args"]["step_id"] = "write-report"
+                    self.error_sent = True
+            return result
+
+    model = CorrectingStepModel()
+    result = run_research(CONTRADICTION, model=model)
+    assert result["task"]["status"] == "completed", result["task"].get("last_error")
+    assert model.feedback_seen and result["store"].exists("report.md")
+    errors = [e for e in result["events"] if e["event_type"] == "tool_call_failed"]
+    assert len(errors) == 1 and errors[0]["payload"]["tool"] == "set_active_plan_step"
+    assert not any(e["event_type"] == "task_error_classified" for e in result["events"])
+    assert result["db"].list_quality_assessments(result["task"]["task_id"])[-1]["passed"] is True

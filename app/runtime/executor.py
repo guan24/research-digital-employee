@@ -555,7 +555,7 @@ class TaskEventCallback(BaseCallbackHandler):
             payload.update(failure_mode="structured_result", retryable=bool(failure.get("retryable", False)))
         if not self._record_tool_terminal(call_id, bool(failure), output, payload):
             return
-        if failure and self.plan_progress_service is not None:
+        if failure and failure.get("error_type") != "plan_step_validation" and self.plan_progress_service is not None:
             self.plan_progress_service.record_tool_failure(context, tool_call_id=call_id, tool_name=tool_name,
                 error=str(failure.get("error") or failure.get("message") or "structured tool failure"),
                 retryable=bool(failure.get("retryable", False)))

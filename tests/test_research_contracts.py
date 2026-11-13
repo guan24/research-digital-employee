@@ -129,6 +129,100 @@ def call(name, args, index, finish="tool_calls"):
                      response_metadata={"finish_reason": finish})
 
 
+@pytest.mark.parametrize("name,args", [
+    ("set_active_plan_step", {"step_id": "write-report"}),
+    ("update_plan_step_status", {"step_id": "write-report", "status": "in_progress"}),
+    ("update_plan_step_status", {"step_id": "s0", "status": "invented-status"}),
+    ("update_plan_step_status", {"step_id": "s0", "status": "completed"}),
+    ("set_active_plan_step", {"step_id": ["wrong type"]}),
+    ("set_active_plan_step", {}),
+])
+def test_step_argument_failure_returns_current_plan_without_changing_state(settings, db, name, args):
+    task, svc = service(settings, db)
+    svc.update_research_plan(json.dumps(plan()))
+    old_plan = svc.artifacts.read_text("notes/research_plan.json")
+    old_progress = [e for e in db.get_events(task["task_id"]) if e["event_type"] in {
+        "research_plan_updated", "research_plan_step_status", "research_plan_step_focus_changed"}]
+    tools = {t.name: t for t in svc.as_langchain_tools()}
+    from app.runtime.plan_progress import PlanProgressTracker
+    callback = TaskEventCallback(db, task["task_id"], time.monotonic(), 60,
+        plan_progress_service=PlanProgressTracker(db, task["task_id"], svc.artifacts))
+    result = json.loads(tools[name].invoke(args, config={"callbacks": [callback]}))
+    assert result["success"] is False and result["recoverable"] is True
+    assert result["error_type"] == "plan_step_validation" and result["tool"] == name
+    assert result["errors"] and result["suggestion"]
+    assert result["current_plan"]["version"] == 1
+    assert [s["id"] for s in result["current_plan"]["steps"]] == ["s0", "s1", "s2"]
+    assert svc.artifacts.read_text("notes/research_plan.json") == old_plan
+    assert [e for e in db.get_events(task["task_id"]) if e["event_type"] in {
+        "research_plan_updated", "research_plan_step_status", "research_plan_step_focus_changed"}] == old_progress
+
+
+@pytest.mark.parametrize("decision", ["correct_id", "revise_plan", "stop"])
+def test_production_model_decides_how_to_handle_step_error(settings, db, decision):
+    task, svc = service(settings, db)
+    svc.update_research_plan(json.dumps(plan()))
+    bad = call("set_active_plan_step", {"step_id": "write-report"}, 1)
+    if decision == "revise_plan":
+        revised = plan()
+        revised["steps"][2]["id"] = "write-report"
+        revised.update(trigger="New report workstream", new_information="Operator requested a distinct report step",
+                       problem_analysis="Existing IDs do not describe the intended workstream", decision="Revise the complete plan",
+                       changes="Replace s2 with write-report")
+        responses = [bad, call("update_research_plan", revised, 2),
+                     call("set_active_plan_step", {"step_id": "write-report"}, 3), AIMessage(content="Done")]
+    elif decision == "correct_id":
+        responses = [bad, call("set_active_plan_step", {"step_id": "s2"}, 2), AIMessage(content="Done")]
+    else:
+        responses = [bad, AIMessage(content="Stop here and explain the limitation")]
+    model = ScriptedModel(responses=responses)
+    agent = build_research_agent(settings, db, task, None, time.monotonic(), model=model)
+    callback = TaskEventCallback(db, task["task_id"], time.monotonic(), 60)
+    agent.invoke({"messages": [HumanMessage(content="Work on the report step")]}, {"callbacks": [callback]})
+    feedback = next(m for m in model.seen[1] if isinstance(m, ToolMessage) and m.name == "set_active_plan_step")
+    assert json.loads(feedback.content)["current_plan"]["steps"][2]["id"] == "s2"
+    events = db.get_events(task["task_id"])
+    assert len([e for e in events if e["event_type"] == "tool_call_failed"]) == 1
+    focus = [e for e in events if e["event_type"] == "research_plan_step_focus_changed"]
+    if decision == "stop":
+        assert focus == [] and len(model.seen) == 2
+    else:
+        assert focus[-1]["payload"]["step_id"] == ("s2" if decision == "correct_id" else "write-report")
+    plans = [e for e in events if e["event_type"] == "research_plan_updated"]
+    assert len(plans) == (2 if decision == "revise_plan" else 1)
+
+
+def test_repeated_step_errors_still_obey_tool_budget(settings, db):
+    from app.runtime.control import TaskStepLimitExceeded
+    task = db.create_task("Report workstream", max_steps=2, max_total_tokens=100000)
+    assert db.acquire_worker_lease("step-budget-worker", 3600)
+    task = db.claim_next_task("step-budget-worker")
+    store = ArtifactStore(settings.workspace_dir, task["task_id"])
+    svc = ResearchToolService(settings, db, task["task_id"], store, time.monotonic())
+    svc.update_research_plan(json.dumps(plan()))
+    model = ScriptedModel(responses=[call("set_active_plan_step", {"step_id": "write-report"}, i) for i in range(5)])
+    agent = build_research_agent(settings, db, task, None, time.monotonic(), model=model)
+    callback = TaskEventCallback(db, task["task_id"], time.monotonic(), 60)
+    with pytest.raises(TaskStepLimitExceeded):
+        agent.invoke({"messages": [HumanMessage(content="Work on the report")]}, {"callbacks": [callback]})
+    assert db.get_task(task["task_id"])["execution_steps"] == 2
+    assert len([e for e in db.get_events(task["task_id"]) if e["event_type"] == "research_plan_step_validation_failed"]) == 2
+
+
+@pytest.mark.parametrize("signal_name", ["TaskPaused", "TaskCancelled", "TaskDeadlineExceeded", "WorkerLeaseLost"])
+def test_step_feedback_never_swallows_task_control_signals(settings, db, monkeypatch, signal_name):
+    from app.runtime import control
+    task, svc = service(settings, db)
+    signal = getattr(control, signal_name)
+    def stopped():
+        raise signal("Execution must stop")
+    monkeypatch.setattr(svc, "check_control", stopped)
+    tools = {t.name: t for t in svc.as_langchain_tools()}
+    with pytest.raises(signal):
+        tools["set_active_plan_step"].invoke({"step_id": "write-report"})
+    assert not any(e["event_type"] == "research_plan_step_validation_failed" for e in db.get_events(task["task_id"]))
+
+
 @pytest.mark.parametrize("correct", [True, False])
 def test_production_graph_returns_schema_errors_and_bounds_correction(settings, db, correct):
     task, _ = service(settings, db)
