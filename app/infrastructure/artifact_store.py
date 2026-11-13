@@ -53,7 +53,7 @@ class ArtifactStore:
             except OSError:
                 pass
             raise
-        return str(target.relative_to(self.root_dir))
+        return target.relative_to(self.root_dir).as_posix()
 
     def read_text(self, relative_path: str) -> str:
         target = self._resolve(relative_path)

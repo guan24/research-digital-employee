@@ -216,6 +216,7 @@ class TaskEventCallback(BaseCallbackHandler):
         self._tool_started: dict[str, float] = {}
         self._tool_names: dict[str, str] = {}
         self._tool_inputs: dict[str, str] = {}
+        self._tool_call_ids: dict[str, str] = {}
         self._tool_plan_context: dict[str, dict[str, Any] | None] = {}
         self._last_lifecycle_phase: str | None = None
         self._token_reservations: set[str] = set()
@@ -387,10 +388,11 @@ class TaskEventCallback(BaseCallbackHandler):
                 "plan_step_source": step_context.get("source"),
             })
         if self.recovery_manager is not None:
-            self.recovery_manager.begin_tool_call(
+            call_id = self.recovery_manager.begin_tool_call(
                 self.task_id, call_id, tool_name, str(input_str),
                 int(self.worker_generation or 0), tool_metadata,
             )
+        self._tool_call_ids[str(run_id)] = call_id
         event_payload = {
             "tool": tool_name, "input": str(input_str)[:2500], "run_id": str(run_id),
             "call_id": call_id, "recovery_tracking": self.recovery_manager is not None,
@@ -475,6 +477,7 @@ class TaskEventCallback(BaseCallbackHandler):
 
     @staticmethod
     def _structured_tool_failure(output: Any) -> dict[str, Any] | None:
+        output = getattr(output, "content", output)
         try:
             payload = json.loads(output) if isinstance(output, str) else output
         except (TypeError, json.JSONDecodeError):
@@ -489,18 +492,20 @@ class TaskEventCallback(BaseCallbackHandler):
                 "plan_step_phase": context.get("phase"), "plan_step_source": context.get("source")}
 
     def on_tool_end(self, output, *, run_id, **kwargs):
+        self._check_tool_ownership()
         key = str(run_id)
+        call_id = self._tool_call_ids.pop(key, key)
         started = self._tool_started.pop(key, time.monotonic())
         tool_name = self._tool_names.pop(key, "unknown")
         input_value = self._tool_inputs.pop(key, "")
         step_context = self._tool_plan_context.pop(key, None)
-        if self.recovery_manager is not None:
-            self.recovery_manager.finish_tool_call(self.task_id, key, output)
         failure = self._structured_tool_failure(output)
         if failure:
+            if self.recovery_manager is not None:
+                self.recovery_manager.fail_tool_call(self.task_id, call_id, output)
             if self.plan_progress_service is not None:
                 self.plan_progress_service.record_tool_failure(
-                    step_context, tool_call_id=key, tool_name=tool_name,
+                    step_context, tool_call_id=call_id, tool_name=tool_name,
                     error=str(failure.get("error") or failure.get("message") or failure.get("error_type") or "structured tool failure"),
                     retryable=bool(failure.get("retryable", False)),
                 )
@@ -508,37 +513,53 @@ class TaskEventCallback(BaseCallbackHandler):
                 "output": str(output)[:20000], "failure_mode": "structured_result",
                 "retryable": bool(failure.get("retryable", False)),
                 "duration_ms": int((time.monotonic() - started) * 1000),
-                "run_id": key, "call_id": key, "tool": tool_name,
+                "run_id": key, "call_id": call_id, "tool": tool_name,
                 **self._step_event_context(step_context),
             })
         else:
+            if self.recovery_manager is not None:
+                self.recovery_manager.finish_tool_call(self.task_id, call_id, output)
             self.db.add_event(self.task_id, "tool_call_completed", {
                 "output": str(output)[:20000], "duration_ms": int((time.monotonic() - started) * 1000),
-                "run_id": key, "call_id": key, "tool": tool_name,
+                "run_id": key, "call_id": call_id, "tool": tool_name,
                 **self._step_event_context(step_context),
             })
         self._observe_research_phase(tool_name, input_value)
         self._check_control()
 
     def on_tool_error(self, error, *, run_id, **kwargs):
+        self._check_tool_ownership()
         key = str(run_id)
+        call_id = self._tool_call_ids.pop(key, key)
         started = self._tool_started.pop(key, time.monotonic())
         tool_name = self._tool_names.pop(key, "unknown")
         self._tool_inputs.pop(key, None)
         step_context = self._tool_plan_context.pop(key, None)
         if self.recovery_manager is not None:
-            self.recovery_manager.fail_tool_call(self.task_id, key, error)
+            self.recovery_manager.fail_tool_call(self.task_id, call_id, error)
         if self.plan_progress_service is not None:
             self.plan_progress_service.record_tool_failure(
-                step_context, tool_call_id=key, tool_name=tool_name,
+                step_context, tool_call_id=call_id, tool_name=tool_name,
                 error=str(error), retryable=True,
             )
         self.db.add_event(self.task_id, "tool_call_failed", {
             "error": str(error)[:4000], "duration_ms": int((time.monotonic() - started) * 1000),
-            "run_id": key, "call_id": key, "tool": tool_name,
+            "run_id": key, "call_id": call_id, "tool": tool_name,
             **self._step_event_context(step_context),
         })
         self._check_control()
+
+    def _check_tool_ownership(self) -> None:
+        task = self.db.get_task(self.task_id)
+        if self.worker_generation is not None and (
+            not task or int(task.get("worker_generation") or 0) != self.worker_generation
+        ):
+            raise WorkerLeaseLost("task execution generation changed")
+        if self.worker_id and (
+            not task or task.get("worker_id") != self.worker_id
+            or not self.db.owns_worker_lease(self.worker_id)
+        ):
+            raise WorkerLeaseLost("task ownership changed")
 
 
 def extract_final_text(state_or_result: Any) -> str:
@@ -976,4 +997,4 @@ class ResearchExecutor:
                     "最终成果已持久化并完成交付。",
                     output_path=artifact_path,
                 )
-        return str((artifacts.workspace / artifact_path).resolve())
+        return (artifacts.workspace / artifact_path).resolve().as_posix()

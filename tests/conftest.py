@@ -7,6 +7,34 @@ from app.config import Settings
 from app.infrastructure.database import Database
 
 
+@pytest.fixture(autouse=True)
+def offline_network_guard(monkeypatch):
+    """Tests may use mocked transports and in-process ASGI, never live sockets."""
+    import socket
+    import ipaddress
+    original_connect = socket.socket.connect
+    original_connect_ex = socket.socket.connect_ex
+    original_getaddrinfo = socket.getaddrinfo
+
+    def offline_dns(host, *args, **kwargs):
+        try:
+            ipaddress.ip_address(host)
+        except ValueError:
+            # Mocked HTTP clients still exercise the public-address validator.
+            host = "127.0.0.1" if host == "localhost" else "93.184.216.34"
+        return original_getaddrinfo(host, *args, **kwargs)
+
+    def guarded_connect(sock, address, *, original=original_connect):
+        # Windows asyncio uses a loopback socket pair for its wakeup pipe.
+        if isinstance(address, tuple) and address[0] in {"127.0.0.1", "::1"}:
+            return original(sock, address)
+        raise AssertionError("Offline test attempted a real network connection")
+
+    monkeypatch.setattr(socket.socket, "connect", guarded_connect)
+    monkeypatch.setattr(socket.socket, "connect_ex", lambda sock, addr: guarded_connect(sock, addr, original=original_connect_ex))
+    monkeypatch.setattr(socket, "getaddrinfo", offline_dns)
+
+
 @pytest.fixture
 def settings(tmp_path: Path) -> Settings:
     return Settings(

@@ -9,16 +9,25 @@ from typing import Any
 
 from app.infrastructure.artifact_store import ArtifactStore
 from app.infrastructure.database import Database
-from app.infrastructure.evidence_registry import EvidenceRegistry
 
 
 READ_ONLY_TOOLS = {
     "web_search", "fetch_url", "fetch_pdf", "github_repo", "github_tree",
     "github_read", "github_releases", "arxiv_search", "arxiv_paper",
+    "read_artifact", "list_artifacts", "read_research_memory", "get_budget_status",
+    "get_human_decisions", "get_evidence_registry",
 }
 WRITE_TOOLS = {
     "save_artifact", "record_finding", "update_research_plan",
     "update_plan_step_status", "define_research_requirements",
+    "save_research_memory",
+}
+
+MANUAL_TOOLS = {"set_active_plan_step", "get_research_status", "request_budget_extension"}
+TOOL_RECOVERY_POLICIES = {
+    **dict.fromkeys(READ_ONLY_TOOLS, "retry_allowed"),
+    **dict.fromkeys(WRITE_TOOLS, "verify_persistence"),
+    **dict.fromkeys(MANUAL_TOOLS, "manual_review"),
 }
 
 
@@ -93,7 +102,7 @@ class RecoveryManager:
                     "reason": f"{type(exc).__name__}: {exc}"}
 
     def _verify_unknown_call(self, task_id: str, record: dict[str, Any],
-                             artifacts: ArtifactStore, registry: EvidenceRegistry) -> dict[str, Any]:
+                             artifacts: ArtifactStore, registry: Any = None) -> dict[str, Any]:
         tool_name = str(record.get("tool_name") or "")
         arguments, _ = self._json_input(str(record.get("input_json") or ""))
         call_id = str(record.get("call_id") or "")
@@ -115,9 +124,21 @@ class RecoveryManager:
                                 "bytes": len(persisted.encode("utf-8"))}
                 except (OSError, ValueError):
                     pass
+                return {"action": "manual_review", "confidence": "low",
+                        "reason": "Artifact exists with conflicting or unreadable content; preserve it.", "path": path}
             return {"action": "retry_allowed", "confidence": "medium",
-                    "reason": "未发现与原始参数完全一致的 Artifact，可在 Checkpoint 恢复后重试。", "path": path}
+                    "reason": "Artifact is absent; retry from checkpoint.", "path": path}
+        if tool_name == "save_research_memory":
+            path = "notes/research_memory.md"
+            content = str(arguments.get("content") or "").strip() + "\n"
+            if artifacts.exists(path) and artifacts.read_text(path) == content:
+                self.db.finish_tool_call(task_id, call_id, "recovered by memory read-back")
+                return {"action": "mark_succeeded", "confidence": "high", "reason": "Exact memory read-back."}
+            return {"action": "manual_review", "confidence": "low", "reason": "Memory write cannot be verified."}
         if tool_name == "record_finding":
+            if registry is None:
+                from app.infrastructure.evidence_registry import EvidenceRegistry
+                registry = EvidenceRegistry(artifacts)
             snapshot = registry.summary()
             for finding in snapshot.get("findings", []):
                 if (finding.get("claim") == arguments.get("claim")
@@ -148,6 +169,20 @@ class RecoveryManager:
             candidate = normalize_plan(arguments)
             persisted = normalize_plan((latest or {}).get("payload", {}).get("plan") or {})
             if latest and candidate == persisted:
+                plan_path = "notes/research_plan.json"
+                if not artifacts.exists(plan_path):
+                    return {"action": "manual_review", "confidence": "low", "reason": "Plan file is missing."}
+                try:
+                    saved_plan = json.loads(artifacts.read_text(plan_path))
+                except (ValueError, OSError):
+                    saved_plan = {}
+                if (normalize_plan(saved_plan) != persisted
+                        or saved_plan.get("version") != latest["payload"].get("version")):
+                    return {"action": "manual_review", "confidence": "low", "reason": "Plan file and event disagree."}
+                progress = [e["payload"] for e in events if e["event_type"] == "research_plan_step_status"]
+                if any(not any(p.get("step_id") == step["id"] and p.get("plan_version") == latest["payload"].get("version")
+                               for p in progress) for step in persisted["steps"]):
+                    return {"action": "manual_review", "confidence": "low", "reason": "Plan progress synchronization is incomplete."}
                 self.db.finish_tool_call(task_id, call_id, "recovered by exact plan comparison")
                 return {"action": "mark_succeeded", "confidence": "high",
                         "reason": "数据库中存在与本次工具输入完全一致的研究计划。",
@@ -172,6 +207,9 @@ class RecoveryManager:
             expected_output_path = str(
                 arguments.get("output_path") or current_step.get("expected_output_path") or ""
             ).strip()
+            latest_status = next((event for event in reversed(events)
+                                  if event.get("event_type") == "research_plan_step_status"
+                                  and (event.get("payload") or {}).get("step_id") == step_id), None)
             exists = any(
                 event.get("event_type") == "research_plan_step_status"
                 and (event.get("payload") or {}).get("step_id") == step_id
@@ -185,8 +223,17 @@ class RecoveryManager:
                         and (event.get("payload") or {}).get("verified_output", {}).get("path") == expected_output_path
                     )
                 )
-                for event in events
+                for event in ([latest_status] if latest_status else [])
             )
+            if exists and status == "completed":
+                verified = latest_status["payload"].get("verified_output") or {}
+                try:
+                    content = artifacts.read_text(expected_output_path)
+                    exists = bool(content.strip()) and hashlib.sha256(content.encode("utf-8")).hexdigest() == verified.get("sha256")
+                except (OSError, ValueError):
+                    exists = False
+                if not exists:
+                    return {"action": "manual_review", "confidence": "low", "reason": "Completed step artifact no longer matches its verified hash."}
             if exists:
                 self.db.finish_tool_call(task_id, call_id, "recovered by exact plan progress comparison")
                 return {"action": "mark_succeeded", "confidence": "high",
@@ -216,12 +263,16 @@ class RecoveryManager:
     def reconcile_stale_task(self, task: dict[str, Any]) -> dict[str, Any]:
         task_id = str(task["task_id"])
         artifacts = ArtifactStore(self.workspace_dir, task_id)
-        registry = EvidenceRegistry(artifacts)
         decisions = []
         ambiguous = []
         for record in self.db.get_open_tool_calls(task_id):
             self.db.mark_tool_call_unknown(task_id, record["call_id"], "worker heartbeat expired")
-            result = self._verify_unknown_call(task_id, record, artifacts, registry)
+            result = self._verify_unknown_call(task_id, record, artifacts)
+            if result["action"] == "mark_succeeded":
+                self.db.add_event(task_id, "tool_call_completed", {
+                    "call_id": record["call_id"], "tool": record["tool_name"],
+                    "recovered": True, "verification": result,
+                })
             decisions.append({"call_id": record["call_id"], "tool": record["tool_name"], **result})
             self.db.record_recovery_decision(
                 task_id, "tool_call_reconciliation", result["action"], result["confidence"],
