@@ -71,6 +71,36 @@ class EvidenceRegistry:
         self._save(registry)
         return source
 
+    def read_snapshot(self, source_id: str) -> str:
+        """Read a registered snapshot and verify the content-addressed body."""
+        normalized_id = str(source_id or "").strip().upper()
+        if not normalized_id:
+            raise ValueError("source_id cannot be empty")
+        registry = self.load()
+        source = next(
+            (item for item in registry["sources"]
+             if str(item.get("source_id") or "").upper() == normalized_id),
+            None,
+        )
+        if source is None:
+            raise KeyError(normalized_id)
+        path = str(source.get("snapshot_path") or "").strip()
+        if not path or not path.startswith("evidence/sources/") or ".." in path.split("/"):
+            raise RuntimeError("registered source has an invalid snapshot path")
+        snapshot = self.artifacts.read_text(path)
+        expected_hash = str(source.get("content_hash") or "").strip()
+        source_marker = f"- Source ID: {normalized_id}\n"
+        url_marker = f"- URL: {source.get('url', '')}\n"
+        hash_marker = f"- Content SHA-256: {expected_hash}\n\n"
+        if not expected_hash or source_marker not in snapshot or url_marker not in snapshot or hash_marker not in snapshot:
+            raise RuntimeError("evidence snapshot metadata does not match the registry")
+        body = snapshot.split(hash_marker, 1)[1]
+        if body.endswith("\n"):
+            body = body[:-1]
+        if hashlib.sha256(body.encode("utf-8")).hexdigest() != expected_hash:
+            raise RuntimeError("evidence snapshot content hash mismatch")
+        return snapshot
+
     def record_finding(self, *, claim: str, source_ids: list[str],
                        rationale: str = "", confidence: str = "medium",
                        dimension_id: str | None = None) -> dict[str, Any]:

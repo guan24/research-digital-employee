@@ -121,6 +121,35 @@ def get_task_evidence(task_id: str, request: Request):
     return EvidenceRegistry(store).summary()
 
 
+@router.get("/tasks/{task_id}/evidence/sources/{source_id}/snapshot", response_class=PlainTextResponse)
+def get_task_evidence_snapshot(task_id: str, source_id: str, request: Request):
+    if not _db(request).get_task(task_id):
+        raise HTTPException(status_code=404, detail="task not found")
+    from app.infrastructure.evidence_registry import EvidenceRegistry
+    store = ArtifactStore(_settings(request).workspace_dir, task_id)
+    try:
+        content = EvidenceRegistry(store).read_snapshot(source_id)
+    except KeyError:
+        raise HTTPException(status_code=404, detail="evidence source not found")
+    except FileNotFoundError:
+        raise HTTPException(status_code=404, detail="evidence snapshot file not found")
+    except RuntimeError as exc:
+        raise HTTPException(status_code=409, detail=str(exc))
+    except ArtifactError as exc:
+        raise HTTPException(status_code=400, detail=str(exc))
+    return PlainTextResponse(content, media_type="text/markdown")
+
+
+@router.get("/tasks/{task_id}/plan")
+def get_task_plan_snapshot(task_id: str, request: Request):
+    db = _db(request)
+    if not db.get_task(task_id):
+        raise HTTPException(status_code=404, detail="task not found")
+    from app.runtime.plan_progress import PlanProgressTracker
+    store = ArtifactStore(_settings(request).workspace_dir, task_id)
+    return PlanProgressTracker(db, task_id, store).snapshot()
+
+
 @router.get("/tasks/{task_id}/memory")
 def get_task_memory(task_id: str, request: Request):
     if not _db(request).get_task(task_id):
