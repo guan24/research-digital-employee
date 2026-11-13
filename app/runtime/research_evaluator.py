@@ -1,6 +1,8 @@
 from __future__ import annotations
 
+import hashlib
 import json
+import math
 import re
 import uuid
 from pathlib import Path
@@ -155,6 +157,32 @@ class ResearchEvaluator:
         }
 
     @staticmethod
+    def _normalize_review_result(value: Any) -> dict[str, Any]:
+        if not isinstance(value, dict) or not isinstance(value.get("scores"), dict):
+            raise ValueError("reviewer response must contain a scores object")
+        scores = {}
+        for key in DIMENSIONS:
+            if key not in value["scores"]:
+                raise ValueError("reviewer omitted score dimension: " + key)
+            if isinstance(value["scores"][key], bool):
+                raise ValueError("reviewer score must be numeric: " + key)
+            try:
+                score = float(value["scores"][key])
+            except (TypeError, ValueError) as exc:
+                raise ValueError("reviewer score is not numeric: " + key) from exc
+            if not math.isfinite(score) or not 0 <= score <= 100:
+                raise ValueError("reviewer score outside 0-100: " + key)
+            scores[key] = round(score, 2)
+        normalized = dict(value)
+        normalized["scores"] = scores
+        for key in ("unsupported_claims", "contradictions", "missing_dimensions", "actionable_repairs"):
+            if not isinstance(normalized.get(key, []), list):
+                raise ValueError("reviewer field must be an array: " + key)
+            normalized.setdefault(key, [])
+        normalized["status"] = normalized.get("status") or "completed"
+        return normalized
+
+    @staticmethod
     def _parse_json(content: Any) -> dict[str, Any]:
         if isinstance(content, list):
             content = "\n".join(str(item.get("text") or item) if isinstance(item, dict) else str(item) for item in content)
@@ -164,27 +192,11 @@ class ResearchEvaluator:
         start, end = text.find("{"), text.rfind("}")
         if start < 0 or end <= start:
             raise ValueError("LLM reviewer did not return a JSON object")
-        value = json.loads(text[start:end + 1])
-        if not isinstance(value, dict) or not isinstance(value.get("scores"), dict):
-            raise ValueError("LLM reviewer response is missing scores")
-        scores = {}
-        for key in DIMENSIONS:
-            score = float(value["scores"].get(key))
-            if not 0 <= score <= 100:
-                raise ValueError("LLM reviewer score out of range: " + key)
-            scores[key] = round(score, 2)
-        value["scores"] = scores
-        for key in ("unsupported_claims", "contradictions", "missing_dimensions", "actionable_repairs"):
-            if not isinstance(value.get(key, []), list):
-                raise ValueError("LLM reviewer field must be an array: " + key)
-        return value
+        return ResearchEvaluator._normalize_review_result(json.loads(text[start:end + 1]))
 
     def review_with_llm(self, context: dict[str, Any], callback=None) -> dict[str, Any]:
         if self.reviewer is not None:
-            result = self.reviewer(context)
-            if not isinstance(result, dict):
-                raise ValueError("injected reviewer must return a dictionary")
-            return result
+            return self._normalize_review_result(self.reviewer(context))
         if not getattr(self.settings, "openai_api_key", ""):
             raise EvaluatorUnavailable("OPENAI_API_KEY is not configured for independent review")
         from langchain_openai import ChatOpenAI
@@ -197,7 +209,9 @@ class ResearchEvaluator:
         )
         system = (
             "你是独立研究质量评审器，不参与研究执行，也不继承 Agent 对话历史。"
-            "只依据目标、研究维度、报告和登记证据评审，不得编造来源。"
+            "只依据目标、研究维度、报告、来源快照摘录和登记证据评审，不得编造来源。"
+            "逐条检查关键结论是否被对应快照实质支持；仅有 URL 或标题不构成支持。"
+            "明确区分直接支持、间接支持、矛盾和无法从摘录确认的主张。"
             "严格输出 JSON：scores（五个 0-100 分数：goal_coverage、evidence_sufficiency、"
             "source_reliability、conclusion_consistency、report_completeness）、unsupported_claims、"
             "contradictions、missing_dimensions、actionable_repairs、summary。"
@@ -227,24 +241,50 @@ class ResearchEvaluator:
             reviewer = {"status": "skipped_hard_block"}
             llm_scores = {key: 0.0 for key in DIMENSIONS}
         elif allow_llm:
-            sources = [{key: item.get(key) for key in ("source_id", "title", "url", "source_type", "verified")}
-                       for item in registry.get("sources", []) if isinstance(item, dict)]
+            finding_source_ids = {
+                str(source_id).upper()
+                for finding in registry.get("findings", []) if isinstance(finding, dict)
+                for source_id in (finding.get("source_ids") or [])
+            }
+            source_records = [item for item in registry.get("sources", []) if isinstance(item, dict)]
+            source_records.sort(key=lambda item: (
+                str(item.get("source_id") or "").upper() not in finding_source_ids,
+                str(item.get("source_id") or ""),
+            ))
+            sources = []
+            for item in source_records[:8]:
+                excerpt = ""
+                if self._valid_source(item, self.artifacts):
+                    try:
+                        excerpt = self.artifacts.read_text(item["snapshot_path"])[-1000:]
+                    except (OSError, ValueError):
+                        excerpt = ""
+                sources.append({
+                    **{key: item.get(key) for key in ("source_id", "title", "url", "source_type", "verified", "content_hash")},
+                    "snapshot_excerpt": excerpt,
+                })
             findings = [{
                 "finding_id": item.get("finding_id"),
                 "dimension_id": item.get("dimension_id"),
-                "claim": str(item.get("claim") or "")[:500],
-                "source_ids": list(item.get("source_ids") or [])[:8],
+                "claim": str(item.get("claim") or "")[:300],
+                "source_ids": list(item.get("source_ids") or [])[:5],
                 "confidence": item.get("confidence"),
             } for item in registry.get("findings", []) if isinstance(item, dict)]
+            report_sha256 = hashlib.sha256(str(report or "").encode("utf-8")).hexdigest()
             context = {
                 "goal": task.get("goal", ""),
                 "requirements": (self.db.get_research_control_state(self.task_id) or {}).get("requirements", {}),
-                "coverage": coverage, "sources": sources[:80], "findings": findings[:120],
+                "coverage": coverage, "registered_source_count": len(source_records),
+                "sources": sources, "findings": findings[:30],
                 "rule_scores": rules["scores"], "rule_defects": rules["defects"],
-                "report": str(report or "")[:26000],
+                "report_sha256": report_sha256, "report": str(report or "")[:16000],
             }
-            reviewer = self.review_with_llm(context, callback)
-            llm_scores = reviewer["scores"]
+            try:
+                reviewer = self.review_with_llm(context, callback)
+                llm_scores = reviewer["scores"]
+            except EvaluatorUnavailable as exc:
+                reviewer = {"status": "unavailable", "error": str(exc)[:1200]}
+                llm_scores = dict(rules["scores"])
         else:
             reviewer = {"status": "offline_rules_only"}
             llm_scores = dict(rules["scores"])
@@ -253,21 +293,41 @@ class ResearchEvaluator:
                     for key in DIMENSIONS}
         weights = self.profile.get("weights") or DEFAULT_WEIGHTS
         total = round(sum(combined[key] * float(weights.get(key, DEFAULT_WEIGHTS[key])) / 100 for key in DIMENSIONS), 2)
+        control_state = self.db.get_research_control_state(self.task_id) or {}
+        quality_policy = (control_state.get("requirements") or {}).get("quality_policy") or {}
+        min_total_score = max(
+            float(self.profile.get("min_total_score", 80)),
+            float(quality_policy.get("min_total_score", 0)),
+        )
+        min_dimension_score = max(
+            float(self.profile.get("min_dimension_score", 60)),
+            float(quality_policy.get("min_dimension_score", 0)),
+        )
+        report_sha256 = hashlib.sha256(str(report or "").encode("utf-8")).hexdigest()
+        reviewer = dict(reviewer)
+        reviewer["report_sha256"] = report_sha256
         defects = list(rules["defects"])
         for field, code in (("unsupported_claims", "unsupported_claim"),
                             ("contradictions", "reviewer_contradiction"),
                             ("missing_dimensions", "reviewer_missing_dimension")):
             for item in reviewer.get(field, []) if isinstance(reviewer, dict) else []:
-                defects.append({"code": code, "severity": "major", "waivable": True,
+                defects.append({"code": code, "severity": "critical", "waivable": True,
                                 "message": str(item)[:1200], "repair_action": "补充证据或修订结论。"})
+        if reviewer.get("status") == "unavailable":
+            defects.append({"code": "independent_review_unavailable", "severity": "critical",
+                            "waivable": True, "message": reviewer.get("error", "独立评审不可用。"),
+                            "repair_action": "等待人工决定是否继续评审或采用降级交付。"})
+        critical_defects = [item for item in defects if item.get("severity") == "critical"]
         passed = (
             not rules["hard_blocks"]
-            and total >= float(self.profile.get("min_total_score", 80))
-            and all(value >= float(self.profile.get("min_dimension_score", 60)) for value in combined.values())
+            and not critical_defects
+            and total >= min_total_score
+            and all(value >= min_dimension_score for value in combined.values())
             and reviewer.get("status") in {"completed", "offline_rules_only"}
         )
         assessment = {
             "assessment_id": str(uuid.uuid4()), "stage": stage, "total_score": total,
+            "report_sha256": report_sha256,
             "dimension_scores": {
                 key: {"score": combined[key], "rule_score": rules["scores"][key],
                       "llm_score": llm_scores[key], "weight": float(weights.get(key, DEFAULT_WEIGHTS[key]))}
@@ -275,8 +335,10 @@ class ResearchEvaluator:
             },
             "passed": passed, "hard_blocks": rules["hard_blocks"], "defects": defects,
             "reviewer": reviewer,
-            "thresholds": {"min_total_score": self.profile.get("min_total_score", 80),
-                           "min_dimension_score": self.profile.get("min_dimension_score", 60)},
+            "thresholds": {"min_total_score": min_total_score,
+                           "min_dimension_score": min_dimension_score,
+                           "role_min_total_score": self.profile.get("min_total_score", 80),
+                           "role_min_dimension_score": self.profile.get("min_dimension_score", 60)},
             "rule_metrics": {key: value for key, value in rules.items()
                              if key not in {"scores", "hard_blocks", "defects"}},
             "repairable": not rules["hard_blocks"] and bool(defects),

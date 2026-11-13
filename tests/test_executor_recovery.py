@@ -46,7 +46,10 @@ def _make_runner(settings, db, agent):
     def builder(_settings, _db, _task, _checkpointer, _started):
         return agent
 
-    return ResearchExecutor(settings, db, agent_builder=builder, checkpointer_factory=fake_checkpointer)
+    return ResearchExecutor(
+        settings, db, agent_builder=builder, checkpointer_factory=fake_checkpointer,
+        quality_review_enabled=False,
+    )
 
 
 def test_executor_starts_new_task_without_checkpoint(settings, db):
