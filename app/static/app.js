@@ -19,6 +19,10 @@ let lastBudget = null;
 let researchState = null;
 let planSnapshotData = null;
 let planSnapshotTaskId = '';
+let pendingHumanIntervention = null;
+let humanDialogKey = '';
+let humanDialogAutoOpenedKey = '';
+
 
 const names = {
   deleting: '正在删除', queued: '排队中', running: '运行中',
@@ -555,11 +559,7 @@ function renderResearchState() {
   const pendingHtml=pending
     ?'<div class="human-pending"><b>任务正在等待人工决策</b><p>'+esc(pending.request?.message||pending.request?.summary||'系统请求人工介入。')+'</p>'+
       '<small>类型：'+esc(pending.category)+' · 创建：'+esc(time(pending.created_at))+'</small>'+
-      '<form id="humanDecisionForm" class="human-decision-form"><label>决策动作<select id="humanDecisionAction">'+
-      (Array.isArray(pending.allowed_actions)?pending.allowed_actions:(Array.isArray(pending.request?.choices)?pending.request.choices:[])).filter(key=>labels[key]).map(key=>'<option value="'+esc(key)+'">'+labels[key]+'</option>').join('')+
-      '</select></label><label>处理说明 / 方向 / 新增要求<textarea id="humanDecisionInput" rows="4" placeholder="填写决策理由；调整方向时填写新的研究方向；补充要求时填写 JSON。"></textarea></label>'+
-      '<label id="humanDecisionConfirmWrap" class="human-confirm" hidden><input type="checkbox" id="humanDecisionConfirm"> 我已审阅报告，并明确批准降级交付</label>'+
-      '<button class="primary" type="submit">提交人工决策</button></form></div>'
+      '<div class="human-pending-actions"><span>任务已暂停，等待人工处理</span><button class="primary" type="button" data-open-human-decision>打开人工决策窗口</button></div></div>'
     :'<div class="empty">'+(detail.status==='waiting_for_human'?'等待人工决策记录读取完成。':'当前没有待处理的人工决策。')+'</div>';
   root.innerHTML='<div class="panelhead">研究控制与人工干预</div>'+
     '<div class="research-overview"><span>覆盖率 <b>'+ (coverage.coverage_ratio==null?'—':Math.round(Number(coverage.coverage_ratio)*100)+'%')+'</b></span>'+
@@ -574,35 +574,126 @@ function renderResearchState() {
       '<details class="human-history"><summary>已提交人工决策（'+state.human_decisions.length+'）</summary>'+
       state.human_decisions.slice(-5).reverse().map(item=>'<p><b>'+esc(item.payload?.action||'')+'</b> · '+esc(time(item.timestamp))+
       '<br>'+esc(compact(item.payload?.payload?.reason||item.payload?.payload?.direction||'',180))+'</p>').join('')+'</details>':'');
-  const action=$('humanDecisionAction');
-  const updateForm=()=>{
-    if(!action)return;
-    const kind=action.value,input=$('humanDecisionInput'),confirm=$('humanDecisionConfirmWrap');
-    if(kind==='add_research_requirements')input.placeholder='输入 JSON，例如：{"dimensions":[{"id":"security","title":"安全边界","questions":["有哪些安全边界？"],"expected_evidence":["官方安全文档"],"priority":"critical","min_sources":2}]}';
-    else if(kind==='change_research_direction')input.placeholder='写明新的研究方向、优先级和需要解决的问题。';
-    else if(kind==='approve_degraded_delivery')input.placeholder='说明已审阅报告并批准降级交付的原因。';
-    else input.placeholder='填写本次人工决策的理由或补充说明（可选）。';
-    confirm.hidden=kind!=='approve_degraded_delivery';
+  root.querySelector('[data-open-human-decision]')?.addEventListener('click',openHumanDecisionDialog);
+  renderHumanDecisionDialog(pending);
+}
+
+function renderHumanDecisionDialog(pending) {
+  const dialog=$('humanDecisionDialog');
+  if(!dialog)return;
+  if(!pending||!detail){
+    pendingHumanIntervention=null;
+    humanDialogKey='';
+    humanDialogAutoOpenedKey='';
+    if(dialog.open)dialog.close('resolved');
+    return;
+  }
+  const key=detail.task_id+':'+String(pending.intervention_id||'');
+  if(key===humanDialogKey)return;
+  pendingHumanIntervention=pending;
+  humanDialogKey=key;
+  const labels={
+    continue_research:'继续研究',change_research_direction:'调整研究方向',
+    add_research_requirements:'补充研究要求',continue_repair:'继续修复',
+    approve_degraded_delivery:'批准降级交付',terminate:'终止任务'
   };
-  if(action)action.addEventListener('change',updateForm);
-  updateForm();
-  $('humanDecisionForm')?.addEventListener('submit',async event=>{
-    event.preventDefault();
-    const kind=$('humanDecisionAction').value,raw=$('humanDecisionInput').value.trim();
-    const body={intervention_id:pending.intervention_id,action:kind,reason:raw};
-    if(kind==='change_research_direction')body.direction=raw;
-    if(kind==='add_research_requirements'){
-      try{body.requirements=JSON.parse(raw);}catch(error){alert('研究要求必须是合法 JSON：'+error.message);return;}
-      body.reason='人工补充研究要求';
-    }
-    if(kind==='approve_degraded_delivery')body.confirm=$('humanDecisionConfirm').checked;
-    const submit=event.currentTarget.querySelector('button[type="submit"]');
-    submit.disabled=true;submit.textContent='正在提交…';
-    try{
-      await req('/tasks/'+detail.task_id+'/human-intervention/resolve',{method:'POST',body:JSON.stringify(body)});
-      detail=await req('/tasks/'+detail.task_id);renderTaskSummary();await loadResearchState(detail.task_id);renderTasks();
-    }catch(error){alert('人工决策提交失败：'+error.message);submit.disabled=false;submit.textContent='提交人工决策';}
+  const allowed=Array.isArray(pending.allowed_actions)?pending.allowed_actions:
+    (Array.isArray(pending.request?.choices)?pending.request.choices:[]);
+  const options=allowed.filter(action=>labels[action]);
+  $('humanDecisionAction').innerHTML=options.map(action=>
+    '<option value="'+esc(action)+'">'+labels[action]+'</option>').join('');
+  $('humanDecisionContext').innerHTML=
+    '<p>'+esc(pending.request?.message||pending.request?.summary||'系统请求人工介入，请审阅任务上下文后作出决策。')+'</p>'+
+    '<div><span>任务状态：等待人工决策</span><span>类型：'+esc(pending.category||'人工介入')+'</span>'+
+    '<span>请求时间：'+esc(time(pending.created_at))+'</span></div>';
+  $('humanDecisionInput').value='';
+  $('humanDecisionConfirm').checked=false;
+  $('humanDecisionError').hidden=true;
+  $('humanDecisionError').textContent='';
+  $('humanDecisionSubmit').disabled=options.length===0;
+  $('humanDecisionSubmit').textContent='提交人工决策';
+  updateHumanDecisionForm();
+  if(humanDialogAutoOpenedKey!==key){
+    humanDialogAutoOpenedKey=key;
+    openHumanDecisionDialog();
+  }
+}
+
+function updateHumanDecisionForm() {
+  const action=$('humanDecisionAction'),input=$('humanDecisionInput');
+  const confirmWrap=$('humanDecisionConfirmWrap'),confirm=$('humanDecisionConfirm');
+  if(!action||!input||!confirmWrap||!confirm)return;
+  const kind=action.value;
+  if(kind==='add_research_requirements'){
+    input.placeholder='输入 JSON，例如：{"dimensions":[{"id":"security","title":"安全边界","questions":["有哪些安全边界？"],"expected_evidence":["官方安全文档"],"priority":"critical","min_sources":2}]}';
+  }else if(kind==='change_research_direction'){
+    input.placeholder='写明新的研究方向、优先级和需要解决的问题。';
+  }else if(kind==='approve_degraded_delivery'){
+    input.placeholder='说明已审阅报告并批准降级交付的原因。';
+  }else{
+    input.placeholder='填写本次人工决策的理由或补充说明（可选）。';
+  }
+  input.required=['change_research_direction','add_research_requirements','approve_degraded_delivery'].includes(kind);
+  confirmWrap.hidden=kind!=='approve_degraded_delivery';
+  confirm.required=kind==='approve_degraded_delivery';
+  if(kind!=='approve_degraded_delivery')confirm.checked=false;
+}
+
+function openHumanDecisionDialog() {
+  const dialog=$('humanDecisionDialog');
+  if(!dialog||!pendingHumanIntervention)return;
+  if(!dialog.open)dialog.showModal();
+  requestAnimationFrame(()=>{
+    const input=$('humanDecisionInput');
+    if(dialog.open&&input&&!input.disabled)input.focus({preventScroll:true});
   });
+}
+
+function closeHumanDecisionDialog() {
+  const dialog=$('humanDecisionDialog');
+  if(dialog?.open)dialog.close('later');
+}
+
+async function submitHumanDecision(event) {
+  event.preventDefault();
+  const pending=pendingHumanIntervention;
+  if(!pending||!detail)return;
+  const taskId=detail.task_id,kind=$('humanDecisionAction').value;
+  const raw=$('humanDecisionInput').value.trim();
+  const errorNode=$('humanDecisionError');
+  const body={intervention_id:pending.intervention_id,action:kind,reason:raw};
+  if(kind==='change_research_direction')body.direction=raw;
+  if(kind==='add_research_requirements'){
+    try{body.requirements=JSON.parse(raw);}
+    catch(error){
+      errorNode.textContent='研究要求必须是合法 JSON：'+error.message;
+      errorNode.hidden=false;
+      $('humanDecisionInput').focus();
+      return;
+    }
+    body.reason='人工补充研究要求';
+  }
+  if(kind==='approve_degraded_delivery')body.confirm=$('humanDecisionConfirm').checked;
+  const submit=$('humanDecisionSubmit');
+  submit.disabled=true;
+  submit.textContent='正在提交…';
+  errorNode.hidden=true;
+  try{
+    await req('/tasks/'+encodeURIComponent(taskId)+'/human-intervention/resolve',{
+      method:'POST',body:JSON.stringify(body)
+    });
+    closeHumanDecisionDialog();
+    if(selected!==taskId)return;
+    detail=await req('/tasks/'+taskId);
+    renderTaskSummary();
+    await loadResearchState(taskId);
+    renderTasks();
+  }catch(error){
+    errorNode.textContent='人工决策提交失败：'+error.message;
+    errorNode.hidden=false;
+    submit.disabled=false;
+    submit.textContent='提交人工决策';
+  }
 }
 
 function renderQuality() {
@@ -1107,6 +1198,11 @@ $('agentType').onchange = renderAgentDefaults;
 $('newTask').onclick = async () => { await loadAgents(); $('createDialog').showModal(); };
 $('closeDialog').onclick = () => $('createDialog').close();
 $('closeBudgetDialog').onclick = () => $('budgetDialog').close();
+$('humanDecisionClose').onclick = closeHumanDecisionDialog;
+$('humanDecisionLater').onclick = closeHumanDecisionDialog;
+$('humanDecisionAction').onchange = updateHumanDecisionForm;
+$('humanDecisionForm').onsubmit = submitHumanDecision;
+
 
 $('createForm').onsubmit = async event => {
   event.preventDefault();

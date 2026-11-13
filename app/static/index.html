@@ -152,6 +152,29 @@
           type="submit">提交任务</button></div>
     </form>
   </dialog>
+  <dialog id="humanDecisionDialog" aria-labelledby="humanDecisionTitle" aria-describedby="humanDecisionContext">
+    <div class="human-dialog-heading">
+      <div><small>HUMAN REVIEW REQUIRED</small><h2 id="humanDecisionTitle">需要人工决策</h2></div>
+      <button id="humanDecisionClose" type="button" aria-label="关闭人工决策弹窗">×</button>
+    </div>
+    <div id="humanDecisionContext" class="human-dialog-context"></div>
+    <form id="humanDecisionForm" class="human-decision-form">
+      <label for="humanDecisionAction">决策动作<select id="humanDecisionAction" required></select></label>
+      <label for="humanDecisionInput">处理说明 / 方向 / 新增要求
+        <textarea id="humanDecisionInput" rows="6" maxlength="10000"
+          placeholder="填写本次人工决策的理由或补充说明。"></textarea>
+      </label>
+      <label id="humanDecisionConfirmWrap" class="human-confirm" hidden>
+        <input type="checkbox" id="humanDecisionConfirm">
+        我已审阅报告，并明确批准降级交付
+      </label>
+      <p id="humanDecisionError" class="human-decision-error" role="alert" hidden></p>
+      <div class="actions">
+        <button id="humanDecisionLater" type="button">稍后处理</button>
+        <button id="humanDecisionSubmit" class="primary" type="submit">提交人工决策</button>
+      </div>
+    </form>
+  </dialog>
   <dialog id="budgetDialog">
     <form id="budgetForm">
       <h2>申请扩额</h2>

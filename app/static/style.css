@@ -276,3 +276,49 @@ button:focus-visible,a:focus-visible,summary:focus-visible,input:focus-visible,s
 .human-history p{padding:7px 0;border-bottom:1px solid #2a3b52}
 .plan-step-note{display:block}
 @media(max-width:900px){.research-overview{grid-template-columns:repeat(2,minmax(0,1fr))}.research-score-grid{grid-template-columns:repeat(2,minmax(0,1fr))}}
+
+
+/* Human intervention is a persistent modal, outside the polled research panel. */
+#humanDecisionDialog{
+  width:min(620px,calc(100vw - 32px));
+  max-width:620px;
+  max-height:min(88vh,820px);
+  overflow-y:auto;
+  overscroll-behavior:contain;
+  padding:22px;
+}
+#humanDecisionDialog::backdrop{background:rgba(3,8,16,.78);backdrop-filter:blur(3px)}
+.human-dialog-heading{display:flex;justify-content:space-between;align-items:flex-start;gap:16px;margin-bottom:14px}
+.human-dialog-heading small{color:#91baff;font-size:10px;letter-spacing:1.5px}
+.human-dialog-heading h2{margin:5px 0 0;color:#f0f5fc;font-size:20px}
+#humanDecisionClose{width:34px;height:34px;padding:0;font-size:22px;line-height:1}
+.human-dialog-context{padding:12px 14px;margin:0 0 16px;border:1px solid #6c5735;border-left:3px solid #e0ad54;border-radius:8px;background:#292a2b}
+.human-dialog-context p{margin:0 0 9px;color:#e8edf5;font-size:13px;line-height:1.7;white-space:pre-wrap;overflow-wrap:anywhere}
+.human-dialog-context>div{display:flex;flex-wrap:wrap;gap:7px 14px;color:#b8c4d4;font-size:10px}
+#humanDecisionDialog .human-decision-form{display:grid;gap:10px;margin:0}
+#humanDecisionDialog .human-decision-form label{display:grid;gap:6px;color:#c3d1e4;font-size:12px}
+#humanDecisionDialog #humanDecisionAction,
+#humanDecisionDialog #humanDecisionInput{
+  display:block;width:100%;margin:0;padding:11px 12px;border:1px solid #465c78;border-radius:8px;
+  background:#0d1828;color:#f0f5fc;font:inherit;font-size:13px;line-height:1.6;
+}
+#humanDecisionDialog #humanDecisionInput{min-height:150px;resize:vertical;white-space:pre-wrap;overflow-wrap:anywhere}
+#humanDecisionDialog #humanDecisionInput:focus,
+#humanDecisionDialog #humanDecisionAction:focus{outline:2px solid #78a9ff;outline-offset:2px;border-color:#78a9ff}
+#humanDecisionDialog .human-confirm{display:flex;align-items:flex-start;gap:9px;padding:10px;border:1px solid #705b39;border-radius:7px;background:#2a2b2c;line-height:1.5}
+#humanDecisionDialog .human-confirm[hidden]{display:none}
+#humanDecisionDialog .human-confirm input{width:auto;margin:2px 0 0}
+.human-decision-error{margin:0;padding:9px 11px;border:1px solid #8d4b53;border-radius:7px;background:#38252d;color:#ffb5b5;font-size:12px;line-height:1.5}
+.human-decision-error[hidden]{display:none}
+#humanDecisionDialog .actions{justify-content:flex-end;margin:5px 0 0}
+.human-pending-actions{display:flex;justify-content:space-between;align-items:center;gap:12px;margin-top:12px}
+.human-pending-actions span{color:#f0c77f;font-size:11px}
+.human-pending-actions button{flex-shrink:0}
+@media(max-width:560px){
+  #humanDecisionDialog{width:calc(100vw - 20px);max-height:90vh;padding:16px}
+  .human-dialog-heading h2{font-size:18px}
+  #humanDecisionDialog #humanDecisionInput{min-height:125px}
+  .human-pending-actions{align-items:stretch;flex-direction:column}
+  .human-pending-actions button{width:100%}
+  #humanDecisionDialog .actions{display:grid;grid-template-columns:1fr 1fr}
+}

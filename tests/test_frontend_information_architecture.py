@@ -92,3 +92,36 @@ def test_delivery_validation_event_exposes_existing_quality_metrics():
     assert '"evidence_coverage": getattr(validation, "evidence_coverage", None)' in source
     assert '"source_count": getattr(validation, "source_count", None)' in source
     assert '"finding_count": getattr(validation, "finding_count", None)' in source
+
+
+
+def test_human_intervention_is_presented_in_a_stable_modal():
+    dialog_start = HTML.index('<dialog id="humanDecisionDialog"')
+    dialog_end = HTML.index("</dialog>", dialog_start)
+    dialog = HTML[dialog_start:dialog_end]
+    panel_start = HTML.index('<section id="researchControlPanel"')
+    panel_end = HTML.index("</section>", panel_start)
+    panel = HTML[panel_start:panel_end]
+
+    assert 'id="humanDecisionForm"' in dialog
+    assert 'id="humanDecisionInput"' in dialog
+    assert 'id="humanDecisionAction"' in dialog
+    assert 'id="humanDecisionForm"' not in panel
+    assert 'id="humanDecisionInput"' not in panel
+    assert 'data-open-human-decision' in JS
+    assert "dialog.showModal()" in JS
+    assert "requestAnimationFrame" in JS
+    assert "humanDialogKey" in JS
+
+
+def test_human_decision_modal_is_not_rebuilt_during_three_second_refresh():
+    render_start = JS.index("function renderHumanDecisionDialog(pending)")
+    render_end = JS.index("\nfunction updateHumanDecisionForm()", render_start)
+    render_function = JS[render_start:render_end]
+
+    assert "if(key===humanDialogKey)return;" in render_function
+    assert "humanDialogAutoOpenedKey!==key" in render_function
+    assert "humanDecisionForm" not in render_function
+    assert "humanDecisionInput').value=''" in render_function
+    assert "root.querySelector('[data-open-human-decision]')" in JS
+    assert "loadResearchState(taskId)" in JS
