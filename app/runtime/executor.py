@@ -216,6 +216,7 @@ class TaskEventCallback(BaseCallbackHandler):
         self._tool_started: dict[str, float] = {}
         self._tool_names: dict[str, str] = {}
         self._tool_inputs: dict[str, str] = {}
+        self._tool_plan_context: dict[str, dict[str, Any] | None] = {}
         self._last_lifecycle_phase: str | None = None
         self._token_reservations: set[str] = set()
 
@@ -363,28 +364,45 @@ class TaskEventCallback(BaseCallbackHandler):
         self._tool_names[str(run_id)] = tool_name
         self._tool_inputs[str(run_id)] = str(input_str)
         call_id = str(run_id)
-        if self.recovery_manager is not None:
-            metadata = kwargs.get("metadata") or {}
-            self.recovery_manager.begin_tool_call(
-                self.task_id, call_id, tool_name, str(input_str),
-                int(self.worker_generation or 0),
-                metadata if isinstance(metadata, dict) else {},
-            )
-        self.db.add_event(
-            self.task_id,
-            "tool_call_started",
-            {"tool": tool_name, "input": str(input_str)[:2500], "run_id": str(run_id),
-             "call_id": call_id, "recovery_tracking": self.recovery_manager is not None},
-        )
+        supplied_metadata = kwargs.get("metadata") or {}
+        tool_metadata = dict(supplied_metadata) if isinstance(supplied_metadata, dict) else {}
+        step_context = None
         if self.plan_progress_service is not None:
             try:
-                self.plan_progress_service.sync_plan_progress_for_tool(tool_name, str(input_str))
+                step_context = self.plan_progress_service.sync_plan_progress_for_tool(
+                    tool_name, str(input_str), tool_metadata,
+                )
             except (TaskPaused, TaskCancelled, TaskDeadlineExceeded, WorkerLeaseLost):
                 raise
             except Exception as exc:
                 self.db.add_event(self.task_id, "research_plan_progress_sync_failed", {
                     "tool": tool_name, "error_type": type(exc).__name__, "error": str(exc)[:1000],
                 })
+        self._tool_plan_context[call_id] = step_context
+        if step_context:
+            tool_metadata.update({
+                "plan_step_id": step_context.get("step_id"),
+                "plan_version": step_context.get("plan_version"),
+                "plan_step_phase": step_context.get("phase"),
+                "plan_step_source": step_context.get("source"),
+            })
+        if self.recovery_manager is not None:
+            self.recovery_manager.begin_tool_call(
+                self.task_id, call_id, tool_name, str(input_str),
+                int(self.worker_generation or 0), tool_metadata,
+            )
+        event_payload = {
+            "tool": tool_name, "input": str(input_str)[:2500], "run_id": str(run_id),
+            "call_id": call_id, "recovery_tracking": self.recovery_manager is not None,
+        }
+        if step_context:
+            event_payload.update({
+                "plan_step_id": step_context.get("step_id"),
+                "plan_version": step_context.get("plan_version"),
+                "plan_step_phase": step_context.get("phase"),
+                "plan_step_source": step_context.get("source"),
+            })
+        self.db.add_event(self.task_id, "tool_call_started", event_payload)
 
     def sync_plan_progress_for_phase(self, phase: str, note: str = "") -> None:
         if self.plan_progress_service is None:
@@ -455,19 +473,50 @@ class TaskEventCallback(BaseCallbackHandler):
                 "phase": phase, "error_type": type(exc).__name__, "error": str(exc)[:1000],
             })
 
+    @staticmethod
+    def _structured_tool_failure(output: Any) -> dict[str, Any] | None:
+        try:
+            payload = json.loads(output) if isinstance(output, str) else output
+        except (TypeError, json.JSONDecodeError):
+            return None
+        return payload if isinstance(payload, dict) and payload.get("success") is False else None
+
+    @staticmethod
+    def _step_event_context(context):
+        if not context:
+            return {}
+        return {"plan_step_id": context.get("step_id"), "plan_version": context.get("plan_version"),
+                "plan_step_phase": context.get("phase"), "plan_step_source": context.get("source")}
+
     def on_tool_end(self, output, *, run_id, **kwargs):
         key = str(run_id)
         started = self._tool_started.pop(key, time.monotonic())
         tool_name = self._tool_names.pop(key, "unknown")
         input_value = self._tool_inputs.pop(key, "")
+        step_context = self._tool_plan_context.pop(key, None)
         if self.recovery_manager is not None:
             self.recovery_manager.finish_tool_call(self.task_id, key, output)
-        self.db.add_event(
-            self.task_id,
-            "tool_call_completed",
-            {"output": str(output)[:20000], "duration_ms": int((time.monotonic() - started) * 1000),
-             "run_id": key, "call_id": key},
-        )
+        failure = self._structured_tool_failure(output)
+        if failure:
+            if self.plan_progress_service is not None:
+                self.plan_progress_service.record_tool_failure(
+                    step_context, tool_call_id=key, tool_name=tool_name,
+                    error=str(failure.get("error") or failure.get("message") or failure.get("error_type") or "structured tool failure"),
+                    retryable=bool(failure.get("retryable", False)),
+                )
+            self.db.add_event(self.task_id, "tool_call_failed", {
+                "output": str(output)[:20000], "failure_mode": "structured_result",
+                "retryable": bool(failure.get("retryable", False)),
+                "duration_ms": int((time.monotonic() - started) * 1000),
+                "run_id": key, "call_id": key, "tool": tool_name,
+                **self._step_event_context(step_context),
+            })
+        else:
+            self.db.add_event(self.task_id, "tool_call_completed", {
+                "output": str(output)[:20000], "duration_ms": int((time.monotonic() - started) * 1000),
+                "run_id": key, "call_id": key, "tool": tool_name,
+                **self._step_event_context(step_context),
+            })
         self._observe_research_phase(tool_name, input_value)
         self._check_control()
 
@@ -476,14 +525,19 @@ class TaskEventCallback(BaseCallbackHandler):
         started = self._tool_started.pop(key, time.monotonic())
         tool_name = self._tool_names.pop(key, "unknown")
         self._tool_inputs.pop(key, None)
+        step_context = self._tool_plan_context.pop(key, None)
         if self.recovery_manager is not None:
             self.recovery_manager.fail_tool_call(self.task_id, key, error)
-        self.db.add_event(
-            self.task_id,
-            "tool_call_failed",
-            {"error": str(error)[:4000], "duration_ms": int((time.monotonic() - started) * 1000),
-             "run_id": key, "call_id": key, "tool": tool_name},
-        )
+        if self.plan_progress_service is not None:
+            self.plan_progress_service.record_tool_failure(
+                step_context, tool_call_id=key, tool_name=tool_name,
+                error=str(error), retryable=True,
+            )
+        self.db.add_event(self.task_id, "tool_call_failed", {
+            "error": str(error)[:4000], "duration_ms": int((time.monotonic() - started) * 1000),
+            "run_id": key, "call_id": key, "tool": tool_name,
+            **self._step_event_context(step_context),
+        })
         self._check_control()
 
 
@@ -563,6 +617,11 @@ class ResearchExecutor:
     def finalize_plan(self, task_id: str, outcome: str) -> Any:
         # Backward-compatible alias; lifecycle is now dispatched by role.
         return self.finalize_task(task_id, outcome)
+
+    def pause_plan_steps(self, task_id: str) -> int:
+        from app.runtime.plan_progress import PlanProgressTracker
+        artifacts = ArtifactStore(self.settings.workspace_dir, task_id)
+        return PlanProgressTracker(self.db, task_id, artifacts).pause_active_steps()
 
     @staticmethod
     def _validation_ok(result: Any) -> bool:

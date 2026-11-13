@@ -66,6 +66,14 @@ class Worker:
             logger.info("task %s is waiting for a human decision", task["task_id"])
         except TaskPaused:
             self.db.mark_paused(task["task_id"], self.worker_id)
+            pause_steps = getattr(self.executor, "pause_plan_steps", None)
+            if callable(pause_steps):
+                try:
+                    pause_steps(task["task_id"])
+                except Exception as exc:
+                    self.db.add_event(task["task_id"], "research_plan_progress_sync_failed", {
+                        "phase": "pause", "error_type": type(exc).__name__, "error": str(exc)[:1000],
+                    })
         except TaskCancelled:
             self.db.mark_cancelled(task["task_id"], self.worker_id)
             self._finalize_role_if_terminal(task["task_id"])
