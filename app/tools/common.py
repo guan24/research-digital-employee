@@ -14,7 +14,7 @@ except ImportError:
 
 from app.infrastructure.artifact_store import ArtifactStore
 from app.infrastructure.database import Database
-from app.runtime.control import TaskCancelled, TaskPaused, TaskDeadlineExceeded, WorkerLeaseLost
+from app.runtime.control import TaskCancelled, TaskPaused, TaskDeadlineExceeded, TaskWaitingForHuman, WorkerLeaseLost
 
 
 class TaskToolService:
@@ -35,6 +35,8 @@ class TaskToolService:
         task = self.db.get_task(self.task_id)
         if task is None:
             raise TaskCancelled("task record no longer exists")
+        if task.get("status") == "waiting_for_human":
+            raise TaskWaitingForHuman("task is waiting for an operator decision")
         if self.worker_id:
             if task.get("worker_id") != self.worker_id:
                 raise WorkerLeaseLost("task ownership changed")

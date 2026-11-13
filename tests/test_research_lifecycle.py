@@ -2,12 +2,16 @@ from __future__ import annotations
 
 import json
 from types import SimpleNamespace
+import time
+import pytest
 
 from app.infrastructure.artifact_store import ArtifactStore
 from app.infrastructure.evidence_registry import EvidenceRegistry
 from app.runtime.recovery_manager import RecoveryManager
 from app.runtime.research_controller import ResearchController
 from app.runtime.research_evaluator import ResearchEvaluator
+from app.runtime.plan_progress import PlanProgressTracker
+from app.tools.research_tools import ResearchToolService
 
 
 def _running_task(db, goal="验证研究闭环"):
@@ -310,3 +314,102 @@ def test_event_limit_returns_latest_events_for_long_running_tasks(db):
         db.add_event(task["task_id"], "synthetic_progress", {"index": index})
     events = db.get_events(task["task_id"], limit=5)
     assert [event["payload"]["index"] for event in events] == [25, 26, 27, 28, 29]
+
+
+def test_plan_step_completion_requires_existing_nonempty_readback_artifact(settings, db):
+    task = _running_task(db)
+    artifacts = ArtifactStore(settings.workspace_dir, task["task_id"])
+    tracker = PlanProgressTracker(db, task["task_id"], artifacts)
+    step = {
+        "id": "analysis", "title": "证据分析", "objective": "综合证据",
+        "expected_output": "分析报告", "expected_output_path": "reports/analysis.md",
+    }
+    db.add_event(task["task_id"], "research_plan_updated", {
+        "version": 1, "plan": {
+            "title": "研究计划", "objective": "完成研究",
+            "steps": [step],
+        },
+    })
+
+    tracker._append_status(step, "completed", "分析阶段已结束", "analysis", 1)
+    event = [item for item in db.get_events(task["task_id"])
+             if item["event_type"] == "research_plan_step_status"][-1]
+    assert event["payload"]["status"] == "awaiting_verification"
+    assert event["payload"]["verified_output"] is None
+
+    artifacts.write_text("reports/analysis.md", "# Evidence analysis\n\nVerified output.")
+    tracker._append_status(
+        step, "completed", "分析报告已读回核验", "analysis", 1,
+        output_path="reports/analysis.md",
+    )
+    event = [item for item in db.get_events(task["task_id"])
+             if item["event_type"] == "research_plan_step_status"][-1]
+    assert event["payload"]["status"] == "completed"
+    assert event["payload"]["verified_output"]["path"] == "reports/analysis.md"
+    assert len(event["payload"]["verified_output"]["sha256"]) == 64
+
+
+def test_agent_cannot_mark_plan_step_completed_without_verified_artifact(settings, db):
+    task = _running_task(db)
+    artifacts = ArtifactStore(settings.workspace_dir, task["task_id"])
+    db.add_event(task["task_id"], "research_plan_updated", {
+        "version": 1, "plan": {
+            "title": "研究计划", "objective": "完成研究",
+            "steps": [{
+                "id": "analysis", "title": "证据分析",
+                "objective": "综合证据", "expected_output": "分析报告",
+                "expected_output_path": "reports/analysis.md",
+            }],
+        },
+    })
+    service = ResearchToolService(
+        settings, db, task["task_id"], artifacts, time.monotonic(),
+    )
+    with pytest.raises(ValueError, match="requires an existing"):
+        service.update_plan_step_status("analysis", "completed")
+
+    artifacts.write_text("reports/analysis.md", "# Analysis\n\nRead-back verified.")
+    service.update_plan_step_status(
+        "analysis", "completed", note="已完成并保存", output_path="reports/analysis.md",
+    )
+    event = [item for item in db.get_events(task["task_id"])
+             if item["event_type"] == "research_plan_step_status"][-1]
+    assert event["payload"]["status"] == "completed"
+    assert event["payload"]["verified_output"]["bytes"] > 0
+
+
+def test_recovery_manager_does_not_accept_historical_plan_as_current_write(settings, db):
+    task = _running_task(db)
+    artifacts = ArtifactStore(settings.workspace_dir, task["task_id"])
+    old_plan = {
+        "title": "旧计划", "objective": "旧目标",
+        "steps": [{"id": "step-1", "title": "旧步骤", "objective": "旧工作",
+                   "expected_output": "旧产物"}],
+    }
+    db.add_event(task["task_id"], "research_plan_updated", {
+        "version": 1, "plan": old_plan,
+    })
+    candidate = {
+        "title": "新计划", "objective": "新目标",
+        "steps": [{"id": "step-1", "title": "新步骤", "objective": "新工作",
+                   "expected_output": "新产物"}],
+    }
+    manager = RecoveryManager(db, settings.workspace_dir, settings.checkpoint_path)
+    result = manager._verify_unknown_call(
+        task["task_id"],
+        {"call_id": "unknown-plan-write", "tool_name": "update_research_plan",
+         "input_json": json.dumps(candidate, ensure_ascii=False)},
+        artifacts, EvidenceRegistry(artifacts),
+    )
+    assert result["action"] == "retry_allowed"
+    assert "不完全一致" in result["reason"]
+
+def test_research_toolset_exposes_both_research_status_and_human_decisions(settings, db):
+    task = _running_task(db)
+    artifacts = ArtifactStore(settings.workspace_dir, task["task_id"])
+    service = ResearchToolService(
+        settings, db, task["task_id"], artifacts, time.monotonic(),
+    )
+    tool_names = {item.name for item in service.as_langchain_tools()}
+    assert "get_research_status" in tool_names
+    assert "get_human_decisions" in tool_names

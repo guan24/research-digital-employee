@@ -1,12 +1,15 @@
 from __future__ import annotations
 
 from contextlib import contextmanager
+import time
+import pytest
 from pathlib import Path
 from types import SimpleNamespace
 
 from app.infrastructure.artifact_store import ArtifactStore
 from app.infrastructure.evidence_registry import EvidenceRegistry
-from app.runtime.executor import ResearchExecutor
+from app.runtime.executor import ResearchExecutor, TaskEventCallback
+from app.runtime.control import TaskWaitingForHuman
 
 
 @contextmanager
@@ -324,3 +327,84 @@ def test_executor_persists_repair_response_when_agent_does_not_call_save_artifac
     assert "Repaired report" in persisted
     assert any(event["event_type"] == "report_delivered" for event in events)
     assert sum(event["event_type"] == "delivery_validation_completed" for event in events) == 2
+
+
+def test_research_controller_request_human_parks_worker_and_stops_callbacks(db):
+    task = db.create_task("Park when research controller requires operator input")
+    claimed = db.claim_next_task("worker-controller-human")
+
+    class ProgressProbe:
+        @staticmethod
+        def _tool_phase(_tool_name, _input_value):
+            return "analysis"
+
+    class LifecycleProbe:
+        @staticmethod
+        def assess_progress(trigger):
+            assert trigger == "phase_boundary"
+            return {
+                "coverage": {"coverage_ratio": 0.25, "critical_gaps": [{"dimension_id": "security"}]},
+                "decision": {
+                    "recommended_action": "REQUEST_HUMAN",
+                    "reason": "关键安全维度连续评估无进展。",
+                },
+            }
+
+    callback = TaskEventCallback(
+        db, task["task_id"], time.monotonic(), 120,
+        worker_id="worker-controller-human",
+        worker_generation=claimed["worker_generation"],
+        plan_progress_service=ProgressProbe(),
+        lifecycle_coordinator=LifecycleProbe(),
+    )
+    with pytest.raises(TaskWaitingForHuman):
+        callback._observe_research_phase("record_finding", "{}")
+
+    assert db.get_task(task["task_id"])["status"] == "waiting_for_human"
+    pending = db.get_pending_human_intervention(task["task_id"])
+    assert pending["category"] == "research_control_requires_human"
+    assert "add_research_requirements" in pending["request"]["choices"]
+    with pytest.raises(TaskWaitingForHuman):
+        callback._check_control()
+
+
+def test_executor_injects_human_decision_when_resuming_completed_checkpoint(settings, db):
+    task = db.create_task("Research a topic with enough detail")
+    first_claim = db.claim_next_task("worker-human-resume")
+    _register_evidence(settings, first_claim)
+    intervention_id = db.set_waiting_for_human(
+        task["task_id"], "research_control_requires_human",
+        {"message": "请调整研究重点。", "choices": ["change_research_direction", "terminate"]},
+        worker_id="worker-human-resume",
+    )
+    db.resolve_human_intervention(
+        task["task_id"], intervention_id, "change_research_direction",
+        {"reason": "优先研究安全边界。", "direction": "将安全边界和权限隔离作为首要研究方向。"},
+    )
+    resumed_task = db.claim_next_task("worker-human-resume")
+    assert resumed_task["resume_mode"] == 1
+
+    snapshot = SimpleNamespace(
+        next=(),
+        values={"messages": [{"role": "assistant", "content": (
+            "# Research report\n\n## 摘要\n\n"
+            + ("Evidence-backed result and analysis is supported by the registered primary source [S0001]. " * 8)
+            + "\n\n## Sources\n- https://example.org/research-source"
+        )}]},
+    )
+    agent = FakeAgent(snapshot=snapshot)
+    runner = _make_runner(settings, db, agent)
+    runner.run(resumed_task)
+
+    assert len(agent.invocations) == 1
+    injected = agent.invocations[0]["messages"]
+    human_message = next(message for message in injected if getattr(message, "id", None) == f"human-intervention-{intervention_id}")
+    assert "安全边界和权限隔离" in human_message.content
+    assert "change_research_direction" in human_message.content
+    events = db.get_events(task["task_id"])
+    assert any(
+        event["event_type"] == "human_decision_consumed"
+        and event["payload"]["intervention_id"] == intervention_id
+        for event in events
+    )
+

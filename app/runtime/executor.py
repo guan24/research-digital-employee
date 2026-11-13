@@ -221,6 +221,8 @@ class TaskEventCallback(BaseCallbackHandler):
 
     def _check_control(self) -> None:
         task = self.db.get_task(self.task_id)
+        if task and task.get("status") == "waiting_for_human":
+            raise TaskWaitingForHuman("task is waiting for an operator decision")
         if self.worker_id:
             if not self.db.owns_worker_lease(self.worker_id):
                 raise WorkerLeaseLost("worker singleton lease was lost")
@@ -396,11 +398,11 @@ class TaskEventCallback(BaseCallbackHandler):
                 "phase": phase, "error_type": type(exc).__name__, "error": str(exc)[:1000],
             })
 
-    def complete_active_plan_step(self, note: str) -> None:
+    def complete_active_plan_step(self, note: str, output_path: str | None = None) -> None:
         if self.plan_progress_service is None:
             return
         try:
-            self.plan_progress_service.complete_active_plan_step(note)
+            self.plan_progress_service.complete_active_plan_step(note, output_path=output_path)
         except (TaskPaused, TaskCancelled, TaskDeadlineExceeded, WorkerLeaseLost):
             raise
         except Exception as exc:
@@ -416,12 +418,36 @@ class TaskEventCallback(BaseCallbackHandler):
             return
         try:
             result = self.lifecycle_coordinator.assess_progress(trigger="phase_boundary")
+            decision = result.get("decision") or {}
             self.db.add_event(self.task_id, "research_phase_boundary_observed", {
                 "phase": phase,
                 "coverage_ratio": result.get("coverage", {}).get("coverage_ratio"),
-                "recommended_action": result.get("decision", {}).get("recommended_action"),
+                "recommended_action": decision.get("recommended_action"),
             })
             self._last_lifecycle_phase = phase
+            if decision.get("recommended_action") == "REQUEST_HUMAN":
+                intervention_id = self.db.set_waiting_for_human(
+                    self.task_id, "research_control_requires_human",
+                    {
+                        "message": decision.get("reason") or "研究控制器检测到持续性关键缺口，需要人工决定研究方向。",
+                        "coverage": result.get("coverage"),
+                        "decision": decision,
+                        "choices": [
+                            "continue_research", "change_research_direction",
+                            "add_research_requirements", "terminate",
+                        ],
+                    },
+                    worker_id=self.worker_id,
+                )
+                if not intervention_id:
+                    raise RuntimeError("research controller requested human review but task could not be parked")
+                self.db.add_event(self.task_id, "research_controller_parked_for_human", {
+                    "intervention_id": intervention_id, "phase": phase,
+                    "recommended_action": "REQUEST_HUMAN",
+                })
+                raise TaskWaitingForHuman(
+                    f"research controller parked task for human decision ({intervention_id})"
+                )
         except (TaskPaused, TaskCancelled, TaskDeadlineExceeded, WorkerLeaseLost, TaskWaitingForHuman):
             raise
         except Exception as exc:
@@ -627,22 +653,79 @@ class ResearchExecutor:
         with self.checkpointer_factory(self.settings.checkpoint_path) as checkpointer:
             agent = self._build_agent(task, checkpointer, started, registration)
             snapshot = agent.get_state(config)
+            human_decisions = (
+                self.db.list_unconsumed_human_decisions(task_id, limit=10)
+                if task.get("resume_mode") else []
+            )
+            human_messages = []
+            for decision in human_decisions:
+                event_payload = decision.get("payload") or {}
+                decision_payload = event_payload.get("payload") or {}
+                intervention_id = str(event_payload.get("intervention_id") or "")
+                action = str(event_payload.get("action") or "")
+                request_payload = event_payload.get("request") or {}
+                instruction = {
+                    "action": action,
+                    "reason": decision_payload.get("reason", ""),
+                    "direction": decision_payload.get("direction", ""),
+                    "requirements": decision_payload.get("requirements"),
+                    "request": request_payload,
+                }
+                content = (
+                    "任务刚刚经过人工干预并已恢复。请严格执行以下人工决策，先核对研究状态和现有证据，"
+                    "必要时更新计划，不要重复已经完成的研究步骤。\n"
+                    + json.dumps(instruction, ensure_ascii=False, indent=2)
+                    + "\n如需读取完整审计记录，请调用 get_human_decisions。"
+                )
+                from langchain_core.messages import HumanMessage
+                human_messages.append(HumanMessage(
+                    id=f"human-intervention-{intervention_id}", content=content,
+                ))
+
+            existing_message_ids = set()
+            if snapshot is not None:
+                values = getattr(snapshot, "values", None) or {}
+                for message in values.get("messages", []) if isinstance(values, dict) else []:
+                    message_id = message.get("id") if isinstance(message, dict) else getattr(message, "id", None)
+                    if message_id:
+                        existing_message_ids.add(str(message_id))
+            unseen_human_messages = [
+                message for message in human_messages
+                if str(getattr(message, "id", "")) not in existing_message_ids
+            ]
+
             if snapshot is not None and getattr(snapshot, "next", ()):
                 self.db.add_event(task_id, "checkpoint_resume", {"pending_nodes": list(snapshot.next)})
-                result = agent.invoke(None, config=config)
+                if unseen_human_messages:
+                    updater = getattr(agent, "update_state", None)
+                    if callable(updater):
+                        updater(config, {"messages": unseen_human_messages})
+                        result = agent.invoke(None, config=config)
+                    else:
+                        result = agent.invoke({"messages": unseen_human_messages}, config=config)
+                else:
+                    result = agent.invoke(None, config=config)
             elif snapshot is not None and getattr(snapshot, "values", None):
                 self.db.add_event(task_id, "checkpoint_already_complete", {})
                 result = snapshot.values
+                resume_messages = list(unseen_human_messages)
                 if task.get("resume_mode"):
                     events = self.db.get_events(task_id, limit=5000)
                     failed_validation = next((event for event in reversed(events) if event["event_type"] == "delivery_validation_completed" and not event["payload"].get("valid")), None)
                     if failed_validation:
                         repair = "上次交付校验未通过，请基于已保存的报告和以下校验反馈进行定向修复，不要重新执行已完成的研究：\\n" + str(failed_validation["payload"].get("errors", "")) + "\\n修复后覆盖岗位声明的产物文件。"
                         self.db.add_event(task_id, "delivery_repair_resumed", {"source_event_id": failed_validation["event_id"]})
-                        result = agent.invoke({"messages": [{"role": "user", "content": repair}]}, config=config)
+                        resume_messages.append({"role": "user", "content": repair})
+                if resume_messages:
+                    result = agent.invoke({"messages": resume_messages}, config=config)
             else:
                 self.db.add_event(task_id, "agent_initial_run", {})
-                result = agent.invoke({"messages": [{"role": "user", "content": task["goal"]}]}, config=config)
+                initial_messages = [{"role": "user", "content": task["goal"]}, *unseen_human_messages]
+                result = agent.invoke({"messages": initial_messages}, config=config)
+
+            for decision in human_decisions:
+                intervention_id = str((decision.get("payload") or {}).get("intervention_id") or "")
+                self.db.mark_human_decision_consumed(task_id, intervention_id)
 
             # Re-check after graph execution so a provider call that ran past the
             # deadline cannot be accepted as a successful final response.
@@ -696,6 +779,7 @@ class ResearchExecutor:
                         if reviewer_status == "unavailable":
                             self._park_for_human(task_id, worker_id, "independent_review_unavailable", {
                                 "message": "独立研究质量评审不可用，不能自动通过交付。",
+                                "artifact_path": artifact_path,
                                 "assessment": quality_assessment,
                                 "choices": ["continue_research", "continue_repair", "approve_degraded_delivery", "terminate"],
                             })
@@ -767,7 +851,10 @@ class ResearchExecutor:
                             "quality_total_score": (quality_assessment or {}).get("total_score"),
                             "quality_dimension_scores": (quality_assessment or {}).get("dimension_scores"),
                         })
-                        callback.complete_active_plan_step("最终报告已通过交付校验并正式交付。")
+                        callback.complete_active_plan_step(
+                            "最终报告已通过交付校验并正式交付。",
+                            output_path=artifact_path,
+                        )
                         break
 
                     if revision >= registration.max_revisions:
@@ -826,5 +913,8 @@ class ResearchExecutor:
                     "sha256": hashlib.sha256(persisted.encode("utf-8")).hexdigest(),
                     "validation_required": False,
                 })
-                callback.complete_active_plan_step("最终成果已持久化并完成交付。")
+                callback.complete_active_plan_step(
+                    "最终成果已持久化并完成交付。",
+                    output_path=artifact_path,
+                )
         return str((artifacts.workspace / artifact_path).resolve())

@@ -483,6 +483,43 @@ class Database:
             result.append(item)
         return list(reversed(result))
 
+    def list_human_decisions(self, task_id: str, limit: int = 10) -> list[dict[str, Any]]:
+        """Return audited operator decisions for the Agent to consume after checkpoint resume."""
+        events = self.get_events(task_id, limit=5000)
+        decisions = [
+            event for event in events
+            if event.get("event_type") == "human_intervention_resolved"
+        ]
+        return decisions[-max(1, min(int(limit), 50)):]
+
+    def list_unconsumed_human_decisions(self, task_id: str, limit: int = 10) -> list[dict[str, Any]]:
+        """Return resolved continuation decisions not yet acknowledged by a resumed worker."""
+        events = self.get_events(task_id, limit=5000)
+        consumed = {
+            str((event.get("payload") or {}).get("intervention_id") or "")
+            for event in events if event.get("event_type") == "human_decision_consumed"
+        }
+        decisions = [
+            event for event in events
+            if event.get("event_type") == "human_intervention_resolved"
+            and (event.get("payload") or {}).get("action") not in {"terminate", "approve_degraded_delivery"}
+            and str((event.get("payload") or {}).get("intervention_id") or "") not in consumed
+        ]
+        return decisions[-max(1, min(int(limit), 50)):]
+
+    def mark_human_decision_consumed(self, task_id: str, intervention_id: str) -> None:
+        if not intervention_id:
+            return
+        existing = [
+            event for event in self.get_events(task_id, limit=5000)
+            if event.get("event_type") == "human_decision_consumed"
+            and (event.get("payload") or {}).get("intervention_id") == intervention_id
+        ]
+        if not existing:
+            self.add_event(task_id, "human_decision_consumed", {
+                "intervention_id": intervention_id,
+            })
+
     def set_waiting_for_human(self, task_id: str, category: str, request: dict[str, Any],
                               worker_id: str | None = None) -> str | None:
         self.release_pending_token_reservations(task_id)
@@ -545,6 +582,38 @@ class Database:
             if action not in {"continue_research", "change_research_direction", "add_research_requirements",
                               "continue_repair", "approve_degraded_delivery", "terminate"}:
                 raise ValueError("unsupported human decision action")
+            request = json.loads(intervention["request_json"] or "{}")
+            choices = request.get("choices") if isinstance(request, dict) else None
+            if not isinstance(choices, list) or not choices:
+                defaults = {
+                    "recovery_conflict": ["terminate"],
+                    "research_control_requires_human": [
+                        "continue_research", "change_research_direction",
+                        "add_research_requirements", "terminate",
+                    ],
+                    "independent_review_unavailable": [
+                        "continue_research", "continue_repair",
+                        "approve_degraded_delivery", "terminate",
+                    ],
+                    "quality_not_satisfied": [
+                        "continue_repair", "approve_degraded_delivery", "terminate",
+                    ],
+                }
+                choices = defaults.get(str(intervention["category"] or ""), ["terminate"])
+            if action not in choices:
+                raise ValueError("action is not allowed for this intervention")
+            if action == "approve_degraded_delivery":
+                verification = payload.get("delivery_verification") or {}
+                digest = str(verification.get("sha256") or "").lower()
+                if (
+                    not payload.get("confirm")
+                    or not verification.get("read_back_verified")
+                    or not verification.get("path")
+                    or int(verification.get("bytes") or 0) <= 0
+                    or len(digest) != 64
+                    or any(char not in "0123456789abcdef" for char in digest)
+                ):
+                    raise ValueError("degraded delivery requires explicit confirmation and a read-back-verified artifact SHA-256")
             new_status = "cancelled" if action == "terminate" else (
                 "completed" if action == "approve_degraded_delivery" else "queued"
             )
@@ -555,15 +624,22 @@ class Database:
             )
             conn.execute(
                 """UPDATE tasks SET status=?,worker_id=NULL,heartbeat_at=NULL,next_run_at=0,
-                   resume_mode=1,pause_requested=0,cancel_requested=0,updated_at=?,
-                   completed_at=CASE WHEN ?='completed' THEN ? ELSE NULL END
+                   resume_mode=?,pause_requested=0,cancel_requested=0,updated_at=?,
+                   completed_at=CASE WHEN ?='completed' THEN ? ELSE NULL END,
+                   result_path=CASE WHEN ?='completed' THEN COALESCE(?,result_path) ELSE result_path END,
+                   last_error=CASE WHEN ?='queued' THEN NULL ELSE last_error END,
+                   error_code=CASE WHEN ?='queued' THEN NULL ELSE error_code END,
+                   error_category=CASE WHEN ?='queued' THEN NULL ELSE error_category END
                    WHERE task_id=?""",
-                (new_status, now, new_status, now, task_id),
+                (new_status, 1 if new_status == "queued" else 0, now, new_status, now,
+                 new_status, (payload.get("delivery_verification") or {}).get("result_path"),
+                 new_status, new_status, new_status, task_id),
             )
             conn.execute(
                 "INSERT INTO events(task_id,timestamp,event_type,payload_json) VALUES(?,?,?,?)",
                 (task_id, now, "human_intervention_resolved",
                  json.dumps({"intervention_id": intervention_id, "action": action, "payload": payload,
+                             "category": intervention["category"], "request": request,
                              "next_status": new_status}, ensure_ascii=False, default=str)),
             )
         return self.get_task(task_id)

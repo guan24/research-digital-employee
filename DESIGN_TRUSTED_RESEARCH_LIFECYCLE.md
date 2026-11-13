@@ -494,3 +494,47 @@ def recover(task):
 7. 离线故障注入和完整闭环验收。
 
 每一步都先建立可验证的不变量，再进入下一步；不以一次大改覆盖现有稳定功能。
+
+## 13. 实际执行接线与人工干预闭环补充
+
+### 13.1 控制器停车语义
+
+- `TaskEventCallback` 仅在研究阶段切换时触发阶段评估；当决策为 `REQUEST_HUMAN`，通过数据库事务将任务置为 `waiting_for_human`、释放 Worker 所有权并持久化人工待办。
+- 工具层与回调层均在检查 Worker lease 前检查 `waiting_for_human`。因此停车信号不会被误分类为 stale lease 或普通工具失败。
+- Worker 将 `TaskWaitingForHuman` 视为控制流终态，不进入自动重试。任务只有在人工决策 API 完成 CAS 式待办解析后才重新进入队列。
+
+### 13.2 人工决策 API 与动作约束
+
+- `GET /tasks/{task_id}/research` 返回研究覆盖矩阵、最近质量评估、恢复决策、待处理人工干预及人工决策历史。
+- `POST /tasks/{task_id}/human-intervention/resolve` 处理人工决策。服务端依据该条待办的 `choices` 校验动作；未声明动作时按故障类别使用保守默认值，Checkpoint/副作用冲突只允许终止。
+- `add_research_requirements` 先规范化新增维度、拒绝 ID 冲突，再与既有维度合并并持久化；质量门槛只允许提高。
+- `change_research_direction` 要求提供明确的新方向；决策连同原始待办上下文写入事件，供恢复后的 Agent 读取。
+- `approve_degraded_delivery` 必须显式勾选确认、填写理由，并对报告文件执行写入、读回、非空检查和 SHA-256 计算。数据库拒绝没有读回证明的降级完成操作；批准说明会追加到交付文件并产生人工批准交付事件。
+
+### 13.3 决策如何回到 Agent
+
+- 人工决策事件不只用于 UI 展示。Worker 恢复时查询未消费的 continuation 决策，将其转换为带稳定 message ID 的 `HumanMessage`，写入当前 LangGraph Checkpoint 或已完成图的新一轮输入。
+- Agent 同时拥有 `get_human_decisions` 工具，可读取未消费决策的完整审计上下文；执行成功后写入 `human_decision_consumed` 事件。
+- 稳定 message ID 用于识别“消息已写入 Checkpoint、消费事件尚未写入”的中断窗口，避免恢复时重复注入同一条人工指令。
+- `independent_review_unavailable` 待办包含实际报告路径，因此人工批准或继续修复均针对真实报告，不依赖猜测默认文件名。
+
+### 13.4 计划步骤完成证明
+
+- 计划步骤可声明 `expected_output_path`；Agent 也可在完成动作时传入 `output_path`。
+- 标记 `completed` 前必须确认路径位于任务 Artifact 工作区内、文件存在且非空，并读回内容计算 SHA-256。
+- 阶段切换只能推断步骤进入 `awaiting_verification`，不能直接伪造完成状态。Agent 后续提供并通过验证的产物后，才能写入 `completed` 事件。
+- 最终报告交付阶段将 Executor 已验证的报告路径传给计划进度服务，确保最后一个步骤的完成状态有对应产物证明。
+
+### 13.5 离线测试覆盖
+
+新增离线测试覆盖：
+- Controller 返回 `REQUEST_HUMAN` 后任务停车，后续回调抛出控制信号；
+- 恢复冲突不允许选择继续研究；
+- 人工新增研究维度与已有要求合并，恢复前完成持久化；
+- 降级交付必须显式确认且报告读回成功；
+- 已完成 Checkpoint 恢复时，人工方向决策会作为带稳定 ID 的消息注入 Agent；
+- 计划步骤缺少真实产物时只能进入 `awaiting_verification`；
+- Agent 无法在缺少非空产物时直接将步骤标记为完成；
+- 恢复管理器不会把历史计划误判为本次不同计划的写入成功；
+- Research Toolset 同时注册 `get_research_status` 和 `get_human_decisions`。
+

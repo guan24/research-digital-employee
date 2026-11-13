@@ -16,7 +16,10 @@ READ_ONLY_TOOLS = {
     "web_search", "fetch_url", "fetch_pdf", "github_repo", "github_tree",
     "github_read", "github_releases", "arxiv_search", "arxiv_paper",
 }
-WRITE_TOOLS = {"save_artifact", "record_finding", "update_research_plan", "update_plan_step_status"}
+WRITE_TOOLS = {
+    "save_artifact", "record_finding", "update_research_plan",
+    "update_plan_step_status", "define_research_requirements",
+}
 
 
 class RecoveryManager:
@@ -130,29 +133,83 @@ class RecoveryManager:
             events = self.db.get_events(task_id, limit=5000)
             latest = next((event for event in reversed(events)
                            if event.get("event_type") == "research_plan_updated"), None)
-            if latest:
-                self.db.finish_tool_call(task_id, call_id, "recovered by persisted plan event")
+            def normalize_plan(value: dict[str, Any]) -> dict[str, Any]:
+                return {
+                    "title": str(value.get("title") or "研究执行计划").strip(),
+                    "objective": str(value.get("objective") or "").strip(),
+                    "steps": [{
+                        "id": str(step.get("id") or "").strip(),
+                        "title": str(step.get("title") or "").strip(),
+                        "objective": str(step.get("objective") or "").strip(),
+                        "expected_output": str(step.get("expected_output") or "").strip(),
+                        "expected_output_path": str(step.get("expected_output_path") or "").strip(),
+                    } for step in value.get("steps") or [] if isinstance(step, dict)],
+                }
+            candidate = normalize_plan(arguments)
+            persisted = normalize_plan((latest or {}).get("payload", {}).get("plan") or {})
+            if latest and candidate == persisted:
+                self.db.finish_tool_call(task_id, call_id, "recovered by exact plan comparison")
                 return {"action": "mark_succeeded", "confidence": "high",
-                        "reason": "数据库已有持久化的研究计划版本。",
+                        "reason": "数据库中存在与本次工具输入完全一致的研究计划。",
                         "plan_version": latest.get("payload", {}).get("version")}
             return {"action": "retry_allowed", "confidence": "medium",
-                    "reason": "未发现计划更新事件，可从原 Checkpoint 重试。"}
+                    "reason": "最新持久化计划与本次工具输入不完全一致，不能将历史计划误判为本次写入成功。"}
         if tool_name == "update_plan_step_status":
             events = self.db.get_events(task_id, limit=5000)
             step_id = str(arguments.get("step_id") or "")
             status = str(arguments.get("status") or "")
+            note = str(arguments.get("note") or "")[:1500]
+            latest_plan = next((event for event in reversed(events)
+                                if event.get("event_type") == "research_plan_updated"), None)
+            latest_plan_payload = (latest_plan or {}).get("payload") or {}
+            version = int(latest_plan_payload.get("version") or 1)
+            current_plan = latest_plan_payload.get("plan") or {}
+            current_step = next(
+                (item for item in current_plan.get("steps", [])
+                 if str(item.get("id") or "") == step_id),
+                {},
+            )
+            expected_output_path = str(
+                arguments.get("output_path") or current_step.get("expected_output_path") or ""
+            ).strip()
             exists = any(
                 event.get("event_type") == "research_plan_step_status"
                 and (event.get("payload") or {}).get("step_id") == step_id
                 and (event.get("payload") or {}).get("status") == status
+                and (event.get("payload") or {}).get("note", "") == note
+                and int((event.get("payload") or {}).get("plan_version") or 1) == version
+                and (
+                    status != "completed"
+                    or (
+                        bool(expected_output_path)
+                        and (event.get("payload") or {}).get("verified_output", {}).get("path") == expected_output_path
+                    )
+                )
                 for event in events
             )
             if exists:
-                self.db.finish_tool_call(task_id, call_id, "recovered by plan progress event")
+                self.db.finish_tool_call(task_id, call_id, "recovered by exact plan progress comparison")
                 return {"action": "mark_succeeded", "confidence": "high",
-                        "reason": "数据库已有匹配的步骤状态事件。"}
+                        "reason": "数据库已有与本次参数、计划版本和产物校验完全匹配的步骤状态事件。"}
             return {"action": "retry_allowed", "confidence": "medium",
-                    "reason": "未发现匹配的步骤状态事件。"}
+                    "reason": "未发现完全匹配的步骤状态事件，允许从原 Checkpoint 重试。"}
+        if tool_name == "define_research_requirements":
+            from app.runtime.research_controller import ResearchController
+            candidate = ResearchController._normalize_requirements({
+                "dimensions": arguments.get("dimensions") or [],
+                "quality_policy": arguments.get("quality_policy") or {},
+            })
+            current = (self.db.get_research_control_state(task_id) or {}).get("requirements") or {}
+            current_normalized = (
+                ResearchController._normalize_requirements(current)
+                if current.get("dimensions") else {}
+            )
+            if candidate == current_normalized:
+                self.db.finish_tool_call(task_id, call_id, "recovered by exact requirements comparison")
+                return {"action": "mark_succeeded", "confidence": "high",
+                        "reason": "Research Controller 中已持久化完全匹配的研究要求。"}
+            return {"action": "retry_allowed", "confidence": "medium",
+                    "reason": "当前研究要求与本次工具输入不一致，可按原参数重试。"}
         return {"action": "manual_review", "confidence": "low",
                 "reason": "工具类型不在自动核验白名单中，禁止盲目重放。"}
 
@@ -186,7 +243,8 @@ class RecoveryManager:
             self.db.set_waiting_for_human(
                 task_id, "recovery_conflict",
                 {"summary": "自动恢复无法证明状态唯一正确。", "conflicts": ambiguous,
-                 "checkpoint": checkpoint, "tool_calls": decisions},
+                 "checkpoint": checkpoint, "tool_calls": decisions,
+                 "choices": ["terminate"]},
             )
         else:
             self.db.add_event(task_id, "recovery_reconciliation_completed", outcome)

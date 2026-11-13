@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from pathlib import Path
+import hashlib
 from typing import Any
 import asyncio
 import json
@@ -12,7 +13,7 @@ from fastapi import APIRouter, HTTPException, Request
 from fastapi.responses import PlainTextResponse, StreamingResponse
 
 from app.infrastructure.artifact_store import ArtifactError, ArtifactStore
-from app.schemas.task import BudgetExtensionApproval, EventOut, TaskCreate, TaskOut, TaskRetry, TaskRetryOut
+from app.schemas.task import BudgetExtensionApproval, EventOut, HumanInterventionDecision, TaskCreate, TaskOut, TaskRetry, TaskRetryOut
 
 router = APIRouter()
 
@@ -127,6 +128,162 @@ def get_task_memory(task_id: str, request: Request):
     store = ArtifactStore(_settings(request).workspace_dir, task_id)
     path = "notes/research_memory.md"
     return {"path": path, "content": store.read_text(path) if store.exists(path) else ""}
+
+
+@router.get("/tasks/{task_id}/research")
+def get_task_research_state(task_id: str, request: Request):
+    db = _db(request)
+    if not db.get_task(task_id):
+        raise HTTPException(status_code=404, detail="task not found")
+    pending = db.get_pending_human_intervention(task_id)
+    if pending:
+        pending["allowed_actions"] = _allowed_human_actions(pending)
+    return {
+        "task_id": task_id,
+        "control": db.get_research_control_state(task_id),
+        "quality_assessments": db.list_quality_assessments(task_id, limit=10),
+        "recovery_decisions": db.list_recovery_decisions(task_id, limit=50),
+        "pending_intervention": pending,
+        "human_decisions": db.list_human_decisions(task_id, limit=10),
+    }
+
+
+def _allowed_human_actions(intervention: dict[str, Any]) -> list[str]:
+    request = intervention.get("request") or {}
+    choices = request.get("choices") if isinstance(request, dict) else None
+    if isinstance(choices, list) and choices:
+        return [str(item) for item in choices]
+    defaults = {
+        "recovery_conflict": ["terminate"],
+        "research_control_requires_human": [
+            "continue_research", "change_research_direction",
+            "add_research_requirements", "terminate",
+        ],
+        "independent_review_unavailable": [
+            "continue_research", "continue_repair",
+            "approve_degraded_delivery", "terminate",
+        ],
+        "quality_not_satisfied": [
+            "continue_repair", "approve_degraded_delivery", "terminate",
+        ],
+    }
+    return defaults.get(str(intervention.get("category") or ""), ["terminate"])
+
+
+@router.post("/tasks/{task_id}/human-intervention/resolve")
+def resolve_task_human_intervention(
+    task_id: str, body: HumanInterventionDecision, request: Request,
+):
+    db = _db(request)
+    task = db.get_task(task_id)
+    if not task:
+        raise HTTPException(status_code=404, detail="task not found")
+    pending = db.get_pending_human_intervention(task_id)
+    if not pending or pending.get("intervention_id") != body.intervention_id:
+        raise HTTPException(status_code=409, detail="human intervention is no longer pending")
+    if body.action not in _allowed_human_actions(pending):
+        raise HTTPException(status_code=409, detail="the selected action is not allowed for this intervention")
+
+    payload: dict[str, Any] = {"reason": body.reason.strip()}
+    if body.action == "change_research_direction":
+        direction = body.direction.strip()
+        if len(direction) < 5:
+            raise HTTPException(status_code=422, detail="direction must contain at least 5 characters")
+        payload["direction"] = direction
+
+    if body.action == "add_research_requirements":
+        if not body.requirements:
+            raise HTTPException(status_code=422, detail="requirements are required for add_research_requirements")
+        from app.runtime.research_controller import ResearchController
+        current = db.get_research_control_state(task_id) or {}
+        current_requirements = current.get("requirements") or {}
+        try:
+            incoming = ResearchController._normalize_requirements(body.requirements)
+            current_dimensions = list(current_requirements.get("dimensions") or [])
+            existing_ids = {str(item.get("id") or "") for item in current_dimensions}
+            overlap = existing_ids.intersection({item["id"] for item in incoming["dimensions"]})
+            if overlap:
+                raise ValueError("new dimension ids already exist: " + ", ".join(sorted(overlap)))
+            old_policy = current_requirements.get("quality_policy") or {}
+            new_policy = incoming.get("quality_policy") or {}
+            merged_policy = {
+                key: max(float(old_policy.get(key, 0)), float(new_policy.get(key, 0)))
+                for key in {"min_total_score", "min_dimension_score"}
+                if key in old_policy or key in new_policy
+            }
+            merged = ResearchController._normalize_requirements({
+                "dimensions": current_dimensions + incoming["dimensions"],
+                "quality_policy": merged_policy,
+            })
+            ResearchController(db, task_id).define_requirements(merged, source="human")
+        except (TypeError, ValueError) as exc:
+            raise HTTPException(status_code=422, detail=f"invalid research requirements: {exc}") from exc
+        payload["requirements"] = incoming
+
+    if body.action == "approve_degraded_delivery":
+        if not body.confirm:
+            raise HTTPException(status_code=422, detail="explicit confirmation is required for degraded delivery")
+        if len(body.reason.strip()) < 3:
+            raise HTTPException(status_code=422, detail="a reason is required for degraded delivery")
+        artifact_path = str((pending.get("request") or {}).get("artifact_path") or "").strip()
+        if not artifact_path:
+            raise HTTPException(status_code=409, detail="the intervention has no verified report path")
+        store = ArtifactStore(_settings(request).workspace_dir, task_id)
+        try:
+            report = store.read_text(artifact_path)
+        except (FileNotFoundError, OSError, ArtifactError) as exc:
+            raise HTTPException(status_code=409, detail=f"degraded report cannot be read: {exc}") from exc
+        if not report.strip():
+            raise HTTPException(status_code=409, detail="degraded report is empty")
+        approval_note = (
+            "\n\n---\n\n## 人工批准的降级交付说明\n\n"
+            f"人工复核决定：{body.reason.strip()}\n\n"
+            "本报告未达到全部自动质量门槛，经人工明确批准后交付。\n"
+        )
+        try:
+            store.write_text(artifact_path, report.rstrip() + approval_note)
+            read_back = store.read_text(artifact_path)
+        except (OSError, ValueError, ArtifactError) as exc:
+            raise HTTPException(status_code=500, detail=f"failed to persist degraded-delivery approval: {exc}") from exc
+        if not read_back.strip() or approval_note.strip() not in read_back:
+            raise HTTPException(status_code=500, detail="degraded-delivery approval failed read-back verification")
+        encoded = read_back.encode("utf-8")
+        absolute_path = (Path(_settings(request).workspace_dir) / task_id / artifact_path).resolve()
+        app_home = Path(_settings(request).app_home).resolve()
+        result_path = str(absolute_path.relative_to(app_home)) if absolute_path.is_relative_to(app_home) else str(absolute_path)
+        payload["confirm"] = True
+        payload["delivery_verification"] = {
+            "path": artifact_path,
+            "sha256": hashlib.sha256(encoded).hexdigest(),
+            "bytes": len(encoded),
+            "read_back_verified": True,
+            "result_path": result_path,
+        }
+
+    try:
+        resolved = db.resolve_human_intervention(
+            task_id, body.intervention_id, body.action, payload,
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
+    if resolved is None:
+        raise HTTPException(status_code=409, detail="human intervention was already resolved or task state changed")
+    if body.action == "approve_degraded_delivery":
+        db.add_event(task_id, "report_delivered", {
+            **payload["delivery_verification"],
+            "manual_approval": True,
+            "reason": body.reason.strip(),
+        })
+    return {
+        "task_id": task_id,
+        "status": resolved.get("status"),
+        "action": body.action,
+        "message": (
+            "人工批准的报告已完成读回校验并交付。"
+            if body.action == "approve_degraded_delivery"
+            else "人工决策已持久化，任务已按决策进入后续状态。"
+        ),
+    }
 
 
 @router.get("/tasks/{task_id}/events", response_model=list[EventOut])

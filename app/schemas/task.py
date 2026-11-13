@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from datetime import datetime
+from typing import Any
 from pydantic import BaseModel, Field, ConfigDict
 
 
@@ -68,6 +69,15 @@ class TaskRetryOut(BaseModel):
     workspace_preserved: bool
     previous_attempts: int
     message: str
+
+
+class HumanInterventionDecision(BaseModel):
+    intervention_id: str = Field(min_length=1, max_length=64)
+    action: str = Field(min_length=1, max_length=64)
+    reason: str = Field(default="", max_length=1200)
+    direction: str = Field(default="", max_length=3000)
+    requirements: dict[str, Any] | None = None
+    confirm: bool = False
 
 
 class BudgetExtensionApproval(BaseModel):
