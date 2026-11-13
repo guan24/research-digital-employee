@@ -139,13 +139,14 @@ function renderAgentDefaults() {
 }
 async function refresh(manual = false) {
   if (document.visibilityState === 'hidden' && !manual) return;
-  const [taskResult, overviewResult] = await Promise.allSettled([req('/tasks?limit=100'), req('/system/overview')]);
+  const [taskResult, overviewResult, exampleResult] = await Promise.allSettled([req('/tasks?limit=100'), req('/system/overview'), req('/task-examples')]);
   if (taskResult.status === 'fulfilled') {
-    tasks = taskResult.value;
-    $('total').textContent = tasks.length;
-    $('running').textContent = tasks.filter(task => task.status === 'running').length;
-    $('completed').textContent = tasks.filter(task => task.status === 'completed').length;
-    $('failed').textContent = tasks.filter(task => ['failed','retry_wait'].includes(task.status)).length;
+    const liveTasks = taskResult.value;
+    tasks = [...liveTasks, ...(exampleResult.status === 'fulfilled' ? exampleResult.value : [])];
+    $('total').textContent = liveTasks.length;
+    $('running').textContent = liveTasks.filter(task => task.status === 'running').length;
+    $('completed').textContent = liveTasks.filter(task => task.status === 'completed').length;
+    $('failed').textContent = liveTasks.filter(task => ['failed','retry_wait'].includes(task.status)).length;
     renderTasks();
   } else $('error').textContent = '任务列表加载失败：' + taskResult.reason.message;
   if (overviewResult.status === 'fulfilled') {
@@ -207,6 +208,7 @@ function renderTasks() {
     const ratio=taskBudgetRatio(task), stale=taskIsStale(task);
     return '<button type="button" class="task '+(task.task_id===selected?'selected':'')+'" data-id="'+esc(task.task_id)+'">'+
       '<div class="meta"><span class="tag '+esc(task.status)+'">'+esc(names[task.status]||task.status)+'</span>'+
+      (task.is_example?'<span class="tag">只读样例</span>':'')+
       '<span>'+esc(roleLabel(task.agent_type))+' · '+esc(task.agent_type||'research')+'</span></div>'+
       '<b>'+esc(compact(task.goal,130)||'未命名任务')+'</b><div class="meta"><span>'+
       (task.status==='running'?'已运行 '+formatDuration(taskRuntimeSeconds(task)):'活动 '+time(task.updated_at))+
@@ -300,6 +302,7 @@ function startEventPolling(taskId) {
 }
 function connectEvents(taskId) {
   if(eventSource)eventSource.close();if(eventPollTimer)clearInterval(eventPollTimer);
+  if(detail?.is_example){eventStreamMode='example';setStreamStatus('只读样例 · 静态执行轨迹');return;}
   const lastId=events.length?events[events.length-1].event_id:0;
   eventStreamMode='connecting';setStreamStatus('正在建立实时事件连接…');
   eventSource=new EventSource('/tasks/'+taskId+'/events/stream?after_id='+lastId);
@@ -368,7 +371,7 @@ function renderTaskSummary() {
   const firstError=parseObject(detail.first_error_json),history=parseObject(detail.error_history_json)||[];
   const latestError=history.length?history[history.length-1]:null,plan=planSnapshot(),version=plan.latest?'v'+plan.latest.version:'尚未生成';
   const failed=['failed','retry_wait'].includes(detail.status),goal=String(detail.goal||'');
-  $('detail').innerHTML='<div class="identity-card"><div class="identity-top"><span class="role-pill">'+esc(roleLabel(detail.agent_type))+
+  $('detail').innerHTML=(detail.is_example?'<div class="sample-notice" role="note"><b>只读任务执行样例</b><p>'+esc(detail.example_description||'历史执行快照，可查看详情、轨迹和文件，不能重试、继续、修改或删除。')+'</p></div>':'')+'<div class="identity-card"><div class="identity-top"><span class="role-pill">'+esc(roleLabel(detail.agent_type))+
     '</span><code>'+esc(detail.agent_type||'research')+'</code><span class="tag '+esc(detail.status)+'">'+esc(names[detail.status]||detail.status)+'</span>'+
     '<span class="plan-version">当前计划 '+esc(version)+'</span></div><div class="identity-goal"><b>任务目标</b><p>'+esc(compact(goal,230))+'</p>'+
     (goal.length>230?'<details><summary>展开完整研究目标</summary><p>'+esc(goal)+'</p></details>':'')+'</div>'+
@@ -387,9 +390,9 @@ function renderTaskSummary() {
       '</section>':'')+'<div class="muted">创建：'+esc(time(detail.created_at))+'　开始：'+esc(time(detail.started_at))+
       '　完成：'+esc(time(detail.completed_at))+'</div></div>';
   renderHealth();renderBudgetAndEvidence();renderQuality();renderInstanceDiagnostics();
-  $('pause').disabled=detail.status!=='running';$('resume').disabled=detail.status!=='paused';
-  $('retry').disabled=detail.status!=='failed';$('cancel').disabled=!['queued','retry_wait','running','paused'].includes(detail.status);
-  $('delete').disabled=detail.status==='deleting';
+  $('pause').disabled=detail.is_example||detail.status!=='running';$('resume').disabled=detail.is_example||detail.status!=='paused';
+  $('retry').disabled=detail.is_example||detail.status!=='failed';$('cancel').disabled=detail.is_example||!['queued','retry_wait','running','paused'].includes(detail.status);
+  $('delete').disabled=detail.is_example||detail.status==='deleting';
 }
 function renderHealth() {
   if(!detail)return;
@@ -431,6 +434,7 @@ function renderBudgetAndEvidence() {
         }).join('')+((budget.state==='restricted'||budget.state==='soft_limit'||stopped)?
           '<p class="budget-instruction">探索工具已禁用，仅可复用已有证据并完成报告。</p>':'')+
           '<div class="budget-actions"><small>剩余量已扣除未结算 Token 预留。</small><button type="button" id="requestBudgetExtension">申请扩额</button></div>';
+      $('requestBudgetExtension').disabled=Boolean(detail.is_example);
       $('requestBudgetExtension').addEventListener('click',()=>$('budgetDialog').showModal());
     }else{$('budgetState').textContent='读取失败';$('budgetPanel').innerHTML='<div class="load-error">预算面板加载失败：'+esc(budgetResult.reason?.message||'未知错误')+'</div>';}
     if(evidenceResult.status==='fulfilled')renderEvidence(evidenceResult.value);
@@ -549,7 +553,7 @@ function renderResearchState() {
       '<strong>'+Number(latest.total_score||0).toFixed(1)+' 分</strong><small>评审状态：'+esc(latest.reviewer?.status||'未记录')+'</small>'+
       '<div class="research-score-grid">'+Object.entries(latest.dimension_scores||{}).map(([key,value])=>
         '<span>'+esc(({goal_coverage:'目标覆盖',evidence_sufficiency:'证据充分性',source_reliability:'来源可靠性',conclusion_consistency:'结论一致性',report_completeness:'报告完整性'})[key]||key)+
-        ' <b>'+Number(value||0).toFixed(1)+'</b></span>').join('')+'</div></div>'
+        ' <b>'+Number(value?.score??value??0).toFixed(1)+'</b></span>').join('')+'</div></div>'
     :'<div class="empty">尚无五维质量评估记录。</div>';
   const recoveryHtml=recovery.length
     ?'<div class="research-recovery-list">'+recovery.map(item=>
@@ -559,7 +563,7 @@ function renderResearchState() {
   const pendingHtml=pending
     ?'<div class="human-pending"><b>任务正在等待人工决策</b><p>'+esc(pending.request?.message||pending.request?.summary||'系统请求人工介入。')+'</p>'+
       '<small>类型：'+esc(pending.category)+' · 创建：'+esc(time(pending.created_at))+'</small>'+
-      '<div class="human-pending-actions"><span>任务已暂停，等待人工处理</span><button class="primary" type="button" data-open-human-decision>打开人工决策窗口</button></div></div>'
+      '<div class="human-pending-actions">'+(detail.is_example?'<span>历史人工介入记录（只读）</span>':'<span>任务已暂停，等待人工处理</span><button class="primary" type="button" data-open-human-decision>打开人工决策窗口</button>')+'</div></div>'
     :'<div class="empty">'+(detail.status==='waiting_for_human'?'等待人工决策记录读取完成。':'当前没有待处理的人工决策。')+'</div>';
   root.innerHTML='<div class="panelhead">研究控制与人工干预</div>'+
     '<div class="research-overview"><span>覆盖率 <b>'+ (coverage.coverage_ratio==null?'—':Math.round(Number(coverage.coverage_ratio)*100)+'%')+'</b></span>'+
@@ -581,7 +585,7 @@ function renderResearchState() {
 function renderHumanDecisionDialog(pending) {
   const dialog=$('humanDecisionDialog');
   if(!dialog)return;
-  if(!pending||!detail){
+  if(!pending||!detail||detail.is_example){
     pendingHumanIntervention=null;
     humanDialogKey='';
     humanDialogAutoOpenedKey='';
@@ -672,7 +676,7 @@ function closeHumanDecisionDialog() {
 async function submitHumanDecision(event) {
   event.preventDefault();
   const pending=pendingHumanIntervention;
-  if(!pending||!detail)return;
+  if(!pending||!detail||detail.is_example)return;
   const taskId=detail.task_id,kind=$('humanDecisionAction').value;
   const raw=$('humanDecisionInput').value.trim();
   const errorNode=$('humanDecisionError');
@@ -1157,7 +1161,7 @@ function renderArtifactPreview() {
 }
 
 async function action(name) {
-  if (!detail) return;
+  if (!detail || detail.is_example) return;
   try {
     await req('/tasks/' + detail.task_id + '/' + name, {
       method: 'POST',
@@ -1168,7 +1172,7 @@ async function action(name) {
 }
 
 async function deleteSelected() {
-  if (!detail) return;
+  if (!detail || detail.is_example) return;
   const taskId = detail.task_id;
   const running = detail.status === 'running';
   const message = running
@@ -1229,7 +1233,7 @@ $('createForm').onsubmit = async event => {
 };
 
 $('budgetForm').onsubmit = async event => {
-  event.preventDefault();if(!detail)return;
+  event.preventDefault();if(!detail||detail.is_example)return;
   const form=new FormData(event.target);
   const body={reason:form.get('reason'),additional_steps:Number(form.get('additional_steps')||0),
     additional_runtime_seconds:Number(form.get('additional_runtime_seconds')||0),additional_tokens:Number(form.get('additional_tokens')||0)};

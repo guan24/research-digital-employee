@@ -1,0 +1,72 @@
+{
+  "schema_version": 2,
+  "version": 1,
+  "title": "彩虹有几种颜色：单来源简明调研",
+  "objective": "用一次网络搜索取得的可靠来源，回答彩虹有几种颜色，并输出带引用来源的简短 Markdown 报告，不发散到其他话题。",
+  "steps": [
+    {
+      "id": "s1",
+      "title": "检索唯一来源",
+      "objective": "执行唯一一次网络搜索，定位一个权威来源（如百科/科普机构）说明彩虹的颜色数目",
+      "expected_output": "一个可引用的来源 URL 与关键摘要",
+      "expected_output_path": "notes/source.md",
+      "phase": "discovery",
+      "status": "completed",
+      "status_note": "已完成唯一一次搜索，取得维基百科等结果，并锁定一个可访问来源",
+      "status_updated_at": "2026-11-13T13:44:02+00:00",
+      "status_source": "agent",
+      "tool_call_id": null,
+      "tool_name": null,
+      "verified_output": {
+        "path": "notes/notes.md",
+        "sha256": "2e958599c53cc7d0fd84c79c6e9b846ec919b7815bd00e2ac3f3b523183ac606",
+        "bytes": 1739
+      }
+    },
+    {
+      "id": "s2",
+      "title": "读取并记录来源要点",
+      "objective": "读取该来源页面，确认其对彩虹颜色数目的表述（传统七色说法及颜色名称）",
+      "expected_output": "来源要点笔记，包含原文表述与来源 ID",
+      "expected_output_path": "notes/notes.md",
+      "phase": "reading",
+      "dependencies": [
+        "s1"
+      ],
+      "status": "completed",
+      "status_note": "已读取 S0001 PDF 全文并记录颜色数目相关原文",
+      "status_updated_at": "2026-11-13T13:44:02+00:00",
+      "status_source": "agent",
+      "tool_call_id": null,
+      "tool_name": null,
+      "verified_output": {
+        "path": "notes/notes.md",
+        "sha256": "2e958599c53cc7d0fd84c79c6e9b846ec919b7815bd00e2ac3f3b523183ac606",
+        "bytes": 1739
+      }
+    },
+    {
+      "id": "s3",
+      "title": "撰写简短报告",
+      "objective": "撰写只讲颜色数目的简短 Markdown 报告，含内联引用与 Sources 章节",
+      "expected_output": "report.md",
+      "expected_output_path": "report.md",
+      "phase": "report",
+      "dependencies": [
+        "s2"
+      ],
+      "status": "completed",
+      "status_note": "report.md 已撰写并通过读回校验",
+      "status_updated_at": "2026-11-13T13:44:19+00:00",
+      "status_source": "agent",
+      "tool_call_id": null,
+      "tool_name": null,
+      "verified_output": {
+        "path": "report.md",
+        "sha256": "6261755f70951f1ebc6679ccbdcea21fd2738bdb9d615b7115f1479a6d999d87",
+        "bytes": 1793
+      }
+    }
+  ],
+  "active_step": null
+}

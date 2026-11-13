@@ -1,0 +1,64 @@
+{
+  "schema_version": 1,
+  "sources": [
+    {
+      "source_id": "S0001",
+      "url": "https://www.ntu-ccms.ntu.edu.tw/lab/ultrafast/photonicedu/001/Upload/1183/relfile/68617/77214/97e742ca-85f0-4516-8af8-b557d6e832f7.pdf",
+      "title": "PDF source",
+      "source_type": "pdf",
+      "retrieved_at": "2026-11-13T13:43:44+00:00",
+      "content_hash": "5cf3c4d3b7bc6395cc940635c235dffcc011292e7bf04344726b51c243e1c399",
+      "snapshot_path": "evidence/sources/S0001.md",
+      "verified": true,
+      "metadata": {
+        "pdf_url": "https://www.ntu-ccms.ntu.edu.tw/lab/ultrafast/photonicedu/001/Upload/1183/relfile/68617/77214/97e742ca-85f0-4516-8af8-b557d6e832f7.pdf"
+      }
+    }
+  ],
+  "findings": [
+    {
+      "finding_id": "F0001",
+      "claim": "来源为国立台湾大学（NTU）光电教育网站托管的科普 PDF，可直接访问，文中标注原始出处为联合报系「鸣人堂」评论文章（2021/1/12）。",
+      "source_ids": [
+        "S0001"
+      ],
+      "dimension_id": "source_credibility",
+      "rationale": "URL 域名属 ntu.edu.tw，PDF 内注明资料来源与日期；属科普性质而非同行评议文献，故置信度记为中。",
+      "confidence": "medium",
+      "recorded_at": "2026-11-13T13:43:53+00:00"
+    },
+    {
+      "finding_id": "F0002",
+      "claim": "\"七色\"是人為約定而非物理上唯一正确答案：牛顿先提出五色、后加到六色、再添靛色凑成七色；文中并称理想情况下彩虹大致只能区分出六色，可见光则可分出不止七色。",
+      "source_ids": [
+        "S0001"
+      ],
+      "dimension_id": "color_count",
+      "rationale": "同一来源的原文同时给出七色的习惯说法与\"没有绝对正确的七色\"的说明，需与习惯说法并列呈现。",
+      "confidence": "medium",
+      "recorded_at": "2026-11-13T13:43:54+00:00"
+    },
+    {
+      "finding_id": "F0003",
+      "claim": "彩虹通常被描述为七种颜色：红、橙、黄、绿、蓝、靛、紫（依牛顿1666年确立的划分）。",
+      "source_ids": [
+        "S0001"
+      ],
+      "dimension_id": "color_count",
+      "rationale": "来源明确写\"我們慣稱的彩虹七⾊\"并列出红橙黄绿蓝靛紫，指出该划分源自牛顿。",
+      "confidence": "high",
+      "recorded_at": "2026-11-13T13:43:54+00:00"
+    },
+    {
+      "finding_id": "F0004",
+      "claim": "本报告只在单一来源 [S0001] 基础上回答颜色数目，全程仅 1 次网络搜索、引用 1 个来源，未涉及成因或文化象征等题外内容，满足范围控制要求。",
+      "source_ids": [
+        "S0001"
+      ],
+      "dimension_id": "scope_control",
+      "rationale": "执行记录：web_search 调用 1 次；fetch_pdf 1 次；证据登记仅 S0001；笔记 notes/notes.md 已注明未检索其他话题。",
+      "confidence": "high",
+      "recorded_at": "2026-11-13T13:44:08+00:00"
+    }
+  ]
+}

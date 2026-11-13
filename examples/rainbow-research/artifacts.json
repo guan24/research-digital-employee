@@ -1,0 +1,75 @@
+{
+  "task_id": "example-rainbow-colors",
+  "artifacts": [
+    {
+      "path": "evidence/registry.json",
+      "size_bytes": 2935,
+      "modified_at": 1794577448.715094,
+      "sha256": "b91a53f8ac7e13925469ad33c21b491beaa94ef6d803e041ccfa490b3be4b8f8",
+      "url": "/tasks/example-rainbow-colors/artifacts/evidence/registry.json"
+    },
+    {
+      "path": "evidence/sources/S0001.md",
+      "size_bytes": 3446,
+      "modified_at": 1794577424.2478812,
+      "sha256": "166fa8aff9096253f9ae19966198b2ca89f2c149c1f13a022a652c17405700e8",
+      "url": "/tasks/example-rainbow-colors/artifacts/evidence/sources/S0001.md"
+    },
+    {
+      "path": "notes/agent_execution_plan.json",
+      "size_bytes": 9990,
+      "modified_at": 1794577460.0121791,
+      "sha256": "b89256ea95fcefdf41f378ba5b5d1541266ccb13efebaa2720be8097cca7733b",
+      "url": "/tasks/example-rainbow-colors/artifacts/notes/agent_execution_plan.json"
+    },
+    {
+      "path": "notes/memory_versions/20261113T134419_4c519c8ed929.md",
+      "size_bytes": 1284,
+      "modified_at": 1794577459.8302758,
+      "sha256": "e06e6804e82f91d4ede0817adb68c13b9b906cd599ce36e601258cdc4d506557",
+      "url": "/tasks/example-rainbow-colors/artifacts/notes/memory_versions/20261113T134419_4c519c8ed929.md"
+    },
+    {
+      "path": "notes/notes.md",
+      "size_bytes": 1739,
+      "modified_at": 1794577440.051051,
+      "sha256": "2e958599c53cc7d0fd84c79c6e9b846ec919b7815bd00e2ac3f3b523183ac606",
+      "url": "/tasks/example-rainbow-colors/artifacts/notes/notes.md"
+    },
+    {
+      "path": "notes/research_memory.md",
+      "size_bytes": 1284,
+      "modified_at": 1794577459.837804,
+      "sha256": "e06e6804e82f91d4ede0817adb68c13b9b906cd599ce36e601258cdc4d506557",
+      "url": "/tasks/example-rainbow-colors/artifacts/notes/research_memory.md"
+    },
+    {
+      "path": "notes/research_plan.json",
+      "size_bytes": 2698,
+      "modified_at": 1794577459.9758062,
+      "sha256": "db90f9768cf569d11c588d8843cf6e2e661d6edebc4662c14819623ea8a787f9",
+      "url": "/tasks/example-rainbow-colors/artifacts/notes/research_plan.json"
+    },
+    {
+      "path": "report.md",
+      "size_bytes": 1988,
+      "modified_at": 1794577503.8386834,
+      "sha256": "3c54ad39040dc8578389a1e90c187b2ce4e8eca3f2402c19eed879422b79e71e",
+      "url": "/tasks/example-rainbow-colors/artifacts/report.md"
+    },
+    {
+      "path": "sources/pdf_181358616807.md",
+      "size_bytes": 3283,
+      "modified_at": 1794577424.2615893,
+      "sha256": "a8894cc04dd6182e8390e49ca5695c9197350475a0c40786ca8330a724801ea0",
+      "url": "/tasks/example-rainbow-colors/artifacts/sources/pdf_181358616807.md"
+    },
+    {
+      "path": "sources/search_f78f50488d.json",
+      "size_bytes": 16395,
+      "modified_at": 1794577382.080798,
+      "sha256": "4a6259b31ea1336df11cf9b8d94ea05720b591ec721fa6913ed5d9f8975b9d66",
+      "url": "/tasks/example-rainbow-colors/artifacts/sources/search_f78f50488d.json"
+    }
+  ]
+}

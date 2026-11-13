@@ -1,0 +1,214 @@
+{
+  "task_id": "example-rainbow-colors",
+  "current_version": 1,
+  "current_plan": {
+    "title": "彩虹有几种颜色：单来源简明调研",
+    "objective": "用一次网络搜索取得的可靠来源，回答彩虹有几种颜色，并输出带引用来源的简短 Markdown 报告，不发散到其他话题。",
+    "steps": [
+      {
+        "id": "s1",
+        "title": "检索唯一来源",
+        "objective": "执行唯一一次网络搜索，定位一个权威来源（如百科/科普机构）说明彩虹的颜色数目",
+        "expected_output": "一个可引用的来源 URL 与关键摘要",
+        "expected_output_path": "notes/source.md",
+        "phase": "discovery",
+        "status": "completed",
+        "status_note": "已完成唯一一次搜索，取得维基百科等结果，并锁定一个可访问来源",
+        "status_updated_at": "2026-11-13T13:44:02+00:00",
+        "status_source": "agent",
+        "tool_call_id": null,
+        "tool_name": null,
+        "verified_output": {
+          "path": "notes/notes.md",
+          "sha256": "2e958599c53cc7d0fd84c79c6e9b846ec919b7815bd00e2ac3f3b523183ac606",
+          "bytes": 1739
+        }
+      },
+      {
+        "id": "s2",
+        "title": "读取并记录来源要点",
+        "objective": "读取该来源页面，确认其对彩虹颜色数目的表述（传统七色说法及颜色名称）",
+        "expected_output": "来源要点笔记，包含原文表述与来源 ID",
+        "expected_output_path": "notes/notes.md",
+        "phase": "reading",
+        "dependencies": [
+          "s1"
+        ],
+        "status": "completed",
+        "status_note": "已读取 S0001 PDF 全文并记录颜色数目相关原文",
+        "status_updated_at": "2026-11-13T13:44:02+00:00",
+        "status_source": "agent",
+        "tool_call_id": null,
+        "tool_name": null,
+        "verified_output": {
+          "path": "notes/notes.md",
+          "sha256": "2e958599c53cc7d0fd84c79c6e9b846ec919b7815bd00e2ac3f3b523183ac606",
+          "bytes": 1739
+        }
+      },
+      {
+        "id": "s3",
+        "title": "撰写简短报告",
+        "objective": "撰写只讲颜色数目的简短 Markdown 报告，含内联引用与 Sources 章节",
+        "expected_output": "report.md",
+        "expected_output_path": "report.md",
+        "phase": "report",
+        "dependencies": [
+          "s2"
+        ],
+        "status": "completed",
+        "status_note": "report.md 已撰写并通过读回校验",
+        "status_updated_at": "2026-11-13T13:44:19+00:00",
+        "status_source": "agent",
+        "tool_call_id": null,
+        "tool_name": null,
+        "verified_output": {
+          "path": "report.md",
+          "sha256": "6261755f70951f1ebc6679ccbdcea21fd2738bdb9d615b7115f1479a6d999d87",
+          "bytes": 1793
+        }
+      }
+    ]
+  },
+  "progress": {
+    "s1": {
+      "step_id": "s1",
+      "status": "completed",
+      "note": "已完成唯一一次搜索，取得维基百科等结果，并锁定一个可访问来源",
+      "source": "agent",
+      "phase": "discovery",
+      "plan_version": 1,
+      "event_id": 2783,
+      "updated_at": "2026-11-13T13:44:02+00:00",
+      "verified_output": {
+        "path": "notes/notes.md",
+        "sha256": "2e958599c53cc7d0fd84c79c6e9b846ec919b7815bd00e2ac3f3b523183ac606",
+        "bytes": 1739
+      },
+      "tool_call_id": null,
+      "tool_name": null
+    },
+    "s2": {
+      "step_id": "s2",
+      "status": "completed",
+      "note": "已读取 S0001 PDF 全文并记录颜色数目相关原文",
+      "source": "agent",
+      "phase": "reading",
+      "plan_version": 1,
+      "event_id": 2784,
+      "updated_at": "2026-11-13T13:44:02+00:00",
+      "verified_output": {
+        "path": "notes/notes.md",
+        "sha256": "2e958599c53cc7d0fd84c79c6e9b846ec919b7815bd00e2ac3f3b523183ac606",
+        "bytes": 1739
+      },
+      "tool_call_id": null,
+      "tool_name": null
+    },
+    "s3": {
+      "step_id": "s3",
+      "status": "completed",
+      "note": "report.md 已撰写并通过读回校验",
+      "source": "agent",
+      "phase": "report",
+      "plan_version": 1,
+      "event_id": 2830,
+      "updated_at": "2026-11-13T13:44:19+00:00",
+      "verified_output": {
+        "path": "report.md",
+        "sha256": "6261755f70951f1ebc6679ccbdcea21fd2738bdb9d615b7115f1479a6d999d87",
+        "bytes": 1793
+      },
+      "tool_call_id": null,
+      "tool_name": null
+    }
+  },
+  "progress_counts": {
+    "awaiting_verification": 0,
+    "blocked": 0,
+    "completed": 3,
+    "failed": 0,
+    "in_progress": 0,
+    "paused": 0,
+    "pending": 0,
+    "retrying": 0,
+    "skipped": 0
+  },
+  "history": [
+    {
+      "version": 1,
+      "event_id": 2689,
+      "timestamp": "2026-11-13T13:42:53+00:00",
+      "change_type": "initial",
+      "trigger": "任务启动",
+      "new_information": "用户提供的研究目标与交付要求",
+      "problem_analysis": "尚无执行期证据，先建立可验证的研究路径",
+      "decision": "将研究目标拆解为有序、可执行且可验证的工作步骤",
+      "changes": "建立初始研究执行计划",
+      "plan_diff": {
+        "title_changed": false,
+        "objective_changed": false,
+        "added_steps": [
+          {
+            "id": "s1",
+            "title": "检索唯一来源"
+          },
+          {
+            "id": "s2",
+            "title": "读取并记录来源要点"
+          },
+          {
+            "id": "s3",
+            "title": "撰写简短报告"
+          }
+        ],
+        "removed_steps": [],
+        "modified_steps": [],
+        "order_changed": false
+      },
+      "original_plan_text": "{\"title\": \"彩虹有几种颜色：单来源简明调研\", \"objective\": \"用一次网络搜索取得的可靠来源，回答彩虹有几种颜色，并输出带引用来源的简短 Markdown 报告，不发散到其他话题。\", \"steps\": [{\"id\": \"s1\", \"title\": \"检索唯一来源\", \"objective\": \"执行唯一一次网络搜索，定位一个权威来源（如百科/科普机构）说明彩虹的颜色数目\", \"expected_output\": \"一个可引用的来源 URL 与关键摘要\", \"phase\": \"discovery\", \"expected_output_path\": \"notes/source.md\"}, {\"id\": \"s2\", \"title\": \"读取并记录来源要点\", \"objective\": \"读取该来源页面，确认其对彩虹颜色数目的表述（传统七色说法及颜色名称）\", \"expected_output\": \"来源要点笔记，包含原文表述与来源 ID\", \"phase\": \"reading\", \"dependencies\": [\"s1\"], \"expected_output_path\": \"notes/notes.md\"}, {\"id\": \"s3\", \"title\": \"撰写简短报告\", \"objective\": \"撰写只讲颜色数目的简短 Markdown 报告，含内联引用与 Sources 章节\", \"expected_output\": \"report.md\", \"phase\": \"report\", \"dependencies\": [\"s2\"], \"expected_output_path\": \"report.md\"}]}",
+      "plan": {
+        "title": "彩虹有几种颜色：单来源简明调研",
+        "objective": "用一次网络搜索取得的可靠来源，回答彩虹有几种颜色，并输出带引用来源的简短 Markdown 报告，不发散到其他话题。",
+        "steps": [
+          {
+            "id": "s1",
+            "title": "检索唯一来源",
+            "objective": "执行唯一一次网络搜索，定位一个权威来源（如百科/科普机构）说明彩虹的颜色数目",
+            "expected_output": "一个可引用的来源 URL 与关键摘要",
+            "expected_output_path": "notes/source.md",
+            "phase": "discovery"
+          },
+          {
+            "id": "s2",
+            "title": "读取并记录来源要点",
+            "objective": "读取该来源页面，确认其对彩虹颜色数目的表述（传统七色说法及颜色名称）",
+            "expected_output": "来源要点笔记，包含原文表述与来源 ID",
+            "expected_output_path": "notes/notes.md",
+            "phase": "reading",
+            "dependencies": [
+              "s1"
+            ]
+          },
+          {
+            "id": "s3",
+            "title": "撰写简短报告",
+            "objective": "撰写只讲颜色数目的简短 Markdown 报告，含内联引用与 Sources 章节",
+            "expected_output": "report.md",
+            "expected_output_path": "report.md",
+            "phase": "report",
+            "dependencies": [
+              "s2"
+            ]
+          }
+        ]
+      }
+    }
+  ],
+  "active_step": null,
+  "finalized": false,
+  "finalized_at": null,
+  "outcome": null,
+  "status": "running",
+  "last_updated_at": "2026-11-13T13:44:19+00:00"
+}

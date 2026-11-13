@@ -19,6 +19,8 @@ class TaskOut(BaseModel):
     model_config = ConfigDict(extra="ignore")
 
     task_id: str
+    is_example: bool = False
+    example_description: str | None = None
     goal: str
     agent_type: str = "research"
     runtime_seconds_used: float = 0

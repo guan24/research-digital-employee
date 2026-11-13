@@ -1,0 +1,51 @@
+{
+  "enabled": false,
+  "state": "disabled",
+  "phase": "unbounded",
+  "trigger_dimension": "tokens",
+  "dimensions": {
+    "tool_calls": {
+      "used": 24,
+      "limit": 30,
+      "remaining": 6,
+      "ratio": 0.8,
+      "convergence_reserve": 0,
+      "exploration_limit": 30,
+      "exploration_remaining": 6,
+      "convergence_remaining": 6
+    },
+    "runtime_seconds": {
+      "used": 116.11,
+      "limit": 3600,
+      "remaining": 3484,
+      "ratio": 0.03222222222222222,
+      "convergence_reserve": 0,
+      "exploration_limit": 3600,
+      "exploration_remaining": 3484,
+      "convergence_remaining": 3484
+    },
+    "tokens": {
+      "used": 302728,
+      "reserved": 0,
+      "limit": 100000,
+      "remaining": 0,
+      "ratio": 3.02728,
+      "convergence_reserve": 0,
+      "exploration_limit": 100000,
+      "exploration_remaining": 0,
+      "convergence_remaining": 0
+    }
+  },
+  "convergence": {
+    "active": false,
+    "active_dimensions": [],
+    "reserve_tokens": 0,
+    "reserve_tool_calls": 0,
+    "reserve_runtime_seconds": 0,
+    "remaining_tokens": 0,
+    "remaining_tool_calls": 6,
+    "remaining_runtime_seconds": 3484
+  },
+  "policy": "hard total limits; exploration stops at per-dimension reserve thresholds; 30% tokens, 25% tool calls and 20% runtime protected for convergence",
+  "instruction": "Budget gates are disabled for this task."
+}

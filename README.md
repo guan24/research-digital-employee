@@ -116,6 +116,8 @@ Back up both SQLite databases and the workspace directory together. Task data is
 
 ## Tests
 
+Use Python 3.12 and Node.js 22 for the test suite. Node runs frontend behavior checks; the application itself does not require Node.
+
 Run the offline suite:
 
 ~~~powershell
@@ -143,6 +145,11 @@ The arXiv adapter uses the official Atom API, a process-wide three-second reques
 
 
 ## Offline decision and recovery verification
+
+The console includes a bundled [read-only task execution example](examples/rainbow-research/README.md),
+with a real generated report, redacted model/tool traces, sources, plan and human decision history.
+It is served from repository files, never enters the runnable task database, and rejects all mutation requests.
+This example ended with human-approved degraded delivery; its independent quality review did not pass.
 
 Research tools expose nested Pydantic contracts: requirements contain 3–12 typed dimensions,
 and plans contain 3–8 complete steps with unique IDs. Invalid arguments return structured
