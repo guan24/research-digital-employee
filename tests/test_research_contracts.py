@@ -2,6 +2,7 @@ import asyncio
 import copy
 import json
 import time
+from concurrent.futures import ThreadPoolExecutor
 from types import SimpleNamespace
 
 import pytest
@@ -13,6 +14,7 @@ from pydantic import Field, ValidationError
 
 from app.agents.research.agent import build_research_agent
 from app.infrastructure.artifact_store import ArtifactStore
+from app.infrastructure.evidence_registry import EvidenceRegistry
 from app.runtime.errors import ClassifiedTaskError
 from app.runtime.executor import TaskEventCallback, _serialize_model_response, _model_response_kind, _model_response_summary
 from app.runtime.research_safety import model_output_guard
@@ -206,3 +208,43 @@ def test_async_truncation_uses_same_bounded_guard(settings, db):
     with pytest.raises(ClassifiedTaskError):
         asyncio.run(guard.awrap_model_call(request, handler))
     assert len(requests) == 2
+
+
+
+def test_parallel_finding_writes_are_not_lost(settings, db, monkeypatch):
+    _, svc = service(settings, db)
+    registry = EvidenceRegistry(svc.artifacts)
+    source = registry.register_source(
+        url="https://example.com/parallel-evidence",
+        title="Parallel evidence",
+        content="One verified source supports multiple separately recorded dimensions.",
+    )
+
+    original_save = EvidenceRegistry._save
+
+    def delayed_save(self, payload):
+        # Widen the read/modify/write race window so an unlocked implementation
+        # deterministically loses updates when independent tool calls overlap.
+        time.sleep(0.02)
+        return original_save(self, payload)
+
+    monkeypatch.setattr(EvidenceRegistry, "_save", delayed_save)
+
+    def record(index):
+        return EvidenceRegistry(svc.artifacts).record_finding(
+            claim=f"Finding {index}",
+            source_ids=[source["source_id"]],
+            dimension_id=f"dimension-{index}",
+            rationale="Concurrent write regression test",
+        )
+
+    with ThreadPoolExecutor(max_workers=8) as pool:
+        written = list(pool.map(record, range(8)))
+
+    final = EvidenceRegistry(svc.artifacts).summary()
+    assert final["finding_count"] == 8
+    assert len({item["finding_id"] for item in final["findings"]}) == 8
+    assert {item["dimension_id"] for item in final["findings"]} == {
+        f"dimension-{index}" for index in range(8)
+    }
+    assert len(written) == 8
