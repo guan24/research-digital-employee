@@ -125,3 +125,27 @@ def test_human_decision_modal_is_not_rebuilt_during_three_second_refresh():
     assert "humanDecisionInput').value=''" in render_function
     assert "root.querySelector('[data-open-human-decision]')" in JS
     assert "loadResearchState(taskId)" in JS
+
+
+
+def test_human_decision_uses_plain_language_and_passes_instruction_to_agent():
+    assert "输入 JSON" not in JS
+    assert "JSON.parse(raw)" not in JS
+    assert "body.instruction=raw" in JS
+    assert "add_research_requirements" in JS
+    assert "无需填写 JSON" in JS
+    assert "给 Agent 的指令 / 处理说明" in HTML
+    assert 'id="humanDecisionInputHint"' in HTML
+
+
+def test_human_decision_is_an_agent_instruction_not_an_internal_schema():
+    prompt = (ROOT / "app" / "agents" / "research" / "system_prompt.md").read_text(encoding="utf-8")
+    routes = (ROOT / "app" / "api" / "routes.py").read_text(encoding="utf-8")
+    decision_route = routes.split('@router.post("/tasks/{task_id}/human-intervention/resolve")', 1)[1].split(
+        '@router.get("/tasks/{task_id}/events")', 1
+    )[0]
+    assert "Never ask the operator to write JSON" in prompt
+    assert "get_research_status" in prompt
+    assert "define_research_requirements" in prompt
+    assert "ResearchController" not in decision_route
+    assert 'payload["instruction"]' in decision_route

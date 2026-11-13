@@ -192,6 +192,37 @@ def test_manual_retry_resumes_original_checkpoint_thread_id(settings, db):
     )
 
 
+def test_resumed_agent_receives_human_natural_language_instruction(settings, db):
+    from langchain_core.messages import HumanMessage
+
+    task = db.create_task("Research a topic with enough detail")
+    claimed = db.claim_next_task("worker-before-human")
+    _register_evidence(settings, claimed)
+    intervention_id = db.set_waiting_for_human(
+        task["task_id"], "research_control_requires_human",
+        {"message": "需要补充研究范围。", "choices": ["add_research_requirements", "terminate"]},
+        worker_id="worker-before-human",
+    )
+    operator_instruction = "请补充安全边界和权限隔离机制，并优先核验官方文档。"
+    db.resolve_human_intervention(
+        task["task_id"], intervention_id, "add_research_requirements",
+        {"reason": "", "instruction": operator_instruction},
+    )
+    resumed_task = db.claim_next_task("worker-after-human")
+    assert bool(resumed_task["resume_mode"])
+
+    agent = FakeAgent(snapshot=SimpleNamespace(next=("agent",), values={"messages": []}))
+    runner = _make_runner(settings, db, agent)
+    runner.run(resumed_task)
+
+    assert agent.invocations
+    injected = agent.invocations[0]["messages"][0]
+    assert isinstance(injected, HumanMessage)
+    assert operator_instruction in injected.content
+    assert "add_research_requirements" in injected.content
+    assert db.list_unconsumed_human_decisions(task["task_id"]) == []
+
+
 def test_real_sqlite_checkpoint_resumes_after_interrupted_node(tmp_path):
     from typing import TypedDict
     from langgraph.graph import END, START, StateGraph

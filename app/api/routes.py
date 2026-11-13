@@ -214,40 +214,18 @@ def resolve_task_human_intervention(
         raise HTTPException(status_code=409, detail="the selected action is not allowed for this intervention")
 
     payload: dict[str, Any] = {"reason": body.reason.strip()}
-    if body.action == "change_research_direction":
-        direction = body.direction.strip()
-        if len(direction) < 5:
-            raise HTTPException(status_code=422, detail="direction must contain at least 5 characters")
-        payload["direction"] = direction
-
-    if body.action == "add_research_requirements":
-        if not body.requirements:
-            raise HTTPException(status_code=422, detail="requirements are required for add_research_requirements")
-        from app.runtime.research_controller import ResearchController
-        current = db.get_research_control_state(task_id) or {}
-        current_requirements = current.get("requirements") or {}
-        try:
-            incoming = ResearchController._normalize_requirements(body.requirements)
-            current_dimensions = list(current_requirements.get("dimensions") or [])
-            existing_ids = {str(item.get("id") or "") for item in current_dimensions}
-            overlap = existing_ids.intersection({item["id"] for item in incoming["dimensions"]})
-            if overlap:
-                raise ValueError("new dimension ids already exist: " + ", ".join(sorted(overlap)))
-            old_policy = current_requirements.get("quality_policy") or {}
-            new_policy = incoming.get("quality_policy") or {}
-            merged_policy = {
-                key: max(float(old_policy.get(key, 0)), float(new_policy.get(key, 0)))
-                for key in {"min_total_score", "min_dimension_score"}
-                if key in old_policy or key in new_policy
-            }
-            merged = ResearchController._normalize_requirements({
-                "dimensions": current_dimensions + incoming["dimensions"],
-                "quality_policy": merged_policy,
-            })
-            ResearchController(db, task_id).define_requirements(merged, source="human")
-        except (TypeError, ValueError) as exc:
-            raise HTTPException(status_code=422, detail=f"invalid research requirements: {exc}") from exc
-        payload["requirements"] = incoming
+    if body.action in {"continue_research", "change_research_direction",
+                       "add_research_requirements", "continue_repair"}:
+        instruction = body.instruction.strip() or body.direction.strip()
+        if body.action in {"change_research_direction", "add_research_requirements"} and len(instruction) < 5:
+            raise HTTPException(
+                status_code=422,
+                detail="please describe the requested change in natural language (at least 5 characters)",
+            )
+        if instruction:
+            payload["instruction"] = instruction
+        if body.action == "change_research_direction":
+            payload["direction"] = instruction  # legacy audit-reader compatibility
 
     if body.action == "approve_degraded_delivery":
         if not body.confirm:

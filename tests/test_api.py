@@ -347,7 +347,7 @@ def test_research_api_exposes_human_choices_and_rejects_unsafe_recovery_action(t
         assert decision[-1]["payload"]["action"] == "terminate"
 
 
-def test_human_requirements_decision_merges_and_persists_before_resume(tmp_path, monkeypatch):
+def test_human_requirements_decision_stores_natural_language_for_agent(tmp_path, monkeypatch):
     monkeypatch.setenv("APP_HOME", str(tmp_path))
     monkeypatch.setenv("DATA_DIR", str(tmp_path / "data"))
     monkeypatch.setenv("WORKSPACE_DIR", str(tmp_path / "workspaces"))
@@ -359,13 +359,13 @@ def test_human_requirements_decision_merges_and_persists_before_resume(tmp_path,
         db = client.app.state.db
         db.claim_next_task("human-requirements-worker")
         from app.runtime.research_controller import ResearchController
-        ResearchController(db, task_id).define_requirements({
-            "dimensions": [{
-                "id": "architecture", "title": "架构机制",
-                "questions": ["系统如何组织执行？"], "expected_evidence": ["官方源码"],
-                "priority": "critical", "min_sources": 1,
-            }]
-        })
+        initial_dimensions = [
+            {"id": f"dimension-{index}", "title": f"研究维度 {index}",
+             "questions": [f"需要回答的问题 {index}"], "expected_evidence": ["官方资料"],
+             "priority": "critical" if index == 1 else "normal", "min_sources": 1}
+            for index in range(1, 4)
+        ]
+        ResearchController(db, task_id).define_requirements({"dimensions": initial_dimensions})
         intervention_id = db.set_waiting_for_human(
             task_id, "research_control_requires_human",
             {"message": "请补充研究要求。",
@@ -373,23 +373,44 @@ def test_human_requirements_decision_merges_and_persists_before_resume(tmp_path,
                          "add_research_requirements", "terminate"]},
             worker_id="human-requirements-worker",
         )
+        instruction = "请补充安全边界、权限隔离和敏感数据处理机制的研究，并优先查阅官方安全文档。"
+
+        missing_instruction = client.post(f"/tasks/{task_id}/human-intervention/resolve", json={
+            "intervention_id": intervention_id,
+            "action": "add_research_requirements",
+        })
+        assert missing_instruction.status_code == 422
+        assert db.get_task(task_id)["status"] == "waiting_for_human"
+
+        legacy_json_contract = client.post(f"/tasks/{task_id}/human-intervention/resolve", json={
+            "intervention_id": intervention_id,
+            "action": "add_research_requirements",
+            "requirements": {"dimensions": []},
+        })
+        assert legacy_json_contract.status_code == 422
+        assert db.get_task(task_id)["status"] == "waiting_for_human"
+
         response = client.post(f"/tasks/{task_id}/human-intervention/resolve", json={
             "intervention_id": intervention_id,
             "action": "add_research_requirements",
-            "requirements": {"dimensions": [{
-                "id": "security", "title": "安全边界",
-                "questions": ["系统的安全边界是什么？"],
-                "expected_evidence": ["官方安全文档"],
-                "priority": "critical", "min_sources": 2,
-            }]},
+            "instruction": instruction,
         })
         assert response.status_code == 200
         assert response.json()["status"] == "queued"
+
         state = db.get_research_control_state(task_id)
-        assert [item["id"] for item in state["requirements"]["dimensions"]] == ["architecture", "security"]
-        decision = db.list_human_decisions(task_id)[-1]
-        assert decision["payload"]["action"] == "add_research_requirements"
-        assert decision["payload"]["request"]["message"] == "请补充研究要求。"
+        assert [item["id"] for item in state["requirements"]["dimensions"]] == [
+            item["id"] for item in initial_dimensions
+        ]
+        decision = db.list_human_decisions(task_id)[-1]["payload"]
+        assert decision["action"] == "add_research_requirements"
+        assert decision["payload"]["instruction"] == instruction
+        assert "requirements" not in decision["payload"]
+        requirement_events = [
+            event for event in db.get_events(task_id)
+            if event["event_type"] == "research_requirements_updated"
+        ]
+        assert len(requirement_events) == 1
 
 
 def test_degraded_delivery_requires_confirmation_and_readback_verified_artifact(tmp_path, monkeypatch):

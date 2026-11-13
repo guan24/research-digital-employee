@@ -72,11 +72,15 @@ class TaskRetryOut(BaseModel):
 
 
 class HumanInterventionDecision(BaseModel):
+    model_config = ConfigDict(extra="forbid", str_strip_whitespace=True)
+
     intervention_id: str = Field(min_length=1, max_length=64)
     action: str = Field(min_length=1, max_length=64)
+    # Natural-language instruction from the operator; internal schemas stay inside the Agent.
+    instruction: str = Field(default="", max_length=10000)
     reason: str = Field(default="", max_length=1200)
+    # Temporary compatibility for clients using the former direction-only field.
     direction: str = Field(default="", max_length=3000)
-    requirements: dict[str, Any] | None = None
     confirm: bool = False
 
 

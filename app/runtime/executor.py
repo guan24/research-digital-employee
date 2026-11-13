@@ -743,14 +743,22 @@ class ResearchExecutor:
                 request_payload = event_payload.get("request") or {}
                 instruction = {
                     "action": action,
+                    "operator_instruction": (
+                        decision_payload.get("instruction")
+                        or decision_payload.get("direction")
+                        or ""
+                    ),
                     "reason": decision_payload.get("reason", ""),
-                    "direction": decision_payload.get("direction", ""),
-                    "requirements": decision_payload.get("requirements"),
+                    # Legacy structured decisions remain readable for tasks created before this change.
+                    "legacy_requirements": decision_payload.get("requirements"),
                     "request": request_payload,
                 }
                 content = (
-                    "任务刚刚经过人工干预并已恢复。请严格执行以下人工决策，先核对研究状态和现有证据，"
-                    "必要时更新计划，不要重复已经完成的研究步骤。\n"
+                    "【人工决策恢复指令】任务刚刚由人工决策后恢复。用户输入的是自然语言，不是要求用户提供的 JSON。"
+                    "请先调用 get_human_decisions 和 get_research_status，结合当前计划、研究需求矩阵、已有证据理解并执行用户指令。"
+                    "对于 add_research_requirements，必须由你解释用户意图，保留现有研究维度，再调用 define_research_requirements "
+                    "提交完整且合法的研究需求矩阵；禁止由 API 或 Worker 直接替用户生成研究维度。"
+                    "对于 change_research_direction，按证据驱动重规划协议更新完整计划。不要重复已经完成的研究步骤。\n"
                     + json.dumps(instruction, ensure_ascii=False, indent=2)
                     + "\n如需读取完整审计记录，请调用 get_human_decisions。"
                 )

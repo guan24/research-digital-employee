@@ -624,16 +624,31 @@ function updateHumanDecisionForm() {
   const confirmWrap=$('humanDecisionConfirmWrap'),confirm=$('humanDecisionConfirm');
   if(!action||!input||!confirmWrap||!confirm)return;
   const kind=action.value;
+  const hint=$('humanDecisionInputHint');
   if(kind==='add_research_requirements'){
-    input.placeholder='输入 JSON，例如：{"dimensions":[{"id":"security","title":"安全边界","questions":["有哪些安全边界？"],"expected_evidence":["官方安全文档"],"priority":"critical","min_sources":2}]}';
+    input.placeholder='例如：请补充安全边界、权限隔离和敏感数据处理机制的研究，并优先查阅官方安全文档。';
+    if(hint)hint.textContent='直接用自然语言描述要补充的研究内容、需要回答的问题和证据偏好。Agent 会结合现有研究计划理解并形成结构化需求，无需填写 JSON。';
   }else if(kind==='change_research_direction'){
-    input.placeholder='写明新的研究方向、优先级和需要解决的问题。';
+    input.placeholder='例如：将研究重点从功能罗列调整为架构机制比较，并重点分析上下文压缩和长期记忆。';
+    if(hint)hint.textContent='直接告诉 Agent 希望如何调整研究方向、范围和优先级。';
+  }else if(kind==='continue_research'){
+    input.placeholder='例如：继续研究尚未覆盖的关键问题，优先核验官方资料。';
+    if(hint)hint.textContent='可补充下一阶段的研究重点；内容会作为新的指令交给 Agent。';
+  }else if(kind==='continue_repair'){
+    input.placeholder='例如：重点修复证据不足的结论，保留已有可靠来源，不要重做已完成部分。';
+    if(hint)hint.textContent='直接描述需要修复的问题和验收要求，Agent 会据此继续修复。';
   }else if(kind==='approve_degraded_delivery'){
     input.placeholder='说明已审阅报告并批准降级交付的原因。';
+    if(hint)hint.textContent='此说明会写入交付审计记录，不会作为新的研究指令。';
+  }else if(kind==='terminate'){
+    input.placeholder='说明终止任务的原因（可选）。';
+    if(hint)hint.textContent='此说明会写入任务审计记录；终止后 Agent 不会继续执行。';
   }else{
     input.placeholder='填写本次人工决策的理由或补充说明（可选）。';
+    if(hint)hint.textContent='直接用自然语言说明你的决定。';
   }
   input.required=['change_research_direction','add_research_requirements','approve_degraded_delivery'].includes(kind);
+  input.maxLength=['approve_degraded_delivery','terminate'].includes(kind)?1200:10000;
   confirmWrap.hidden=kind!=='approve_degraded_delivery';
   confirm.required=kind==='approve_degraded_delivery';
   if(kind!=='approve_degraded_delivery')confirm.checked=false;
@@ -661,17 +676,11 @@ async function submitHumanDecision(event) {
   const taskId=detail.task_id,kind=$('humanDecisionAction').value;
   const raw=$('humanDecisionInput').value.trim();
   const errorNode=$('humanDecisionError');
-  const body={intervention_id:pending.intervention_id,action:kind,reason:raw};
-  if(kind==='change_research_direction')body.direction=raw;
-  if(kind==='add_research_requirements'){
-    try{body.requirements=JSON.parse(raw);}
-    catch(error){
-      errorNode.textContent='研究要求必须是合法 JSON：'+error.message;
-      errorNode.hidden=false;
-      $('humanDecisionInput').focus();
-      return;
-    }
-    body.reason='人工补充研究要求';
+  const body={intervention_id:pending.intervention_id,action:kind,reason:''};
+  if(['continue_research','change_research_direction','add_research_requirements','continue_repair'].includes(kind)){
+    body.instruction=raw;
+  }else{
+    body.reason=raw;
   }
   if(kind==='approve_degraded_delivery')body.confirm=$('humanDecisionConfirm').checked;
   const submit=$('humanDecisionSubmit');

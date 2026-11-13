@@ -160,9 +160,10 @@
     <div id="humanDecisionContext" class="human-dialog-context"></div>
     <form id="humanDecisionForm" class="human-decision-form">
       <label for="humanDecisionAction">决策动作<select id="humanDecisionAction" required></select></label>
-      <label for="humanDecisionInput">处理说明 / 方向 / 新增要求
+      <label for="humanDecisionInput">给 Agent 的指令 / 处理说明
         <textarea id="humanDecisionInput" rows="6" maxlength="10000"
-          placeholder="填写本次人工决策的理由或补充说明。"></textarea>
+          placeholder="直接用自然语言告诉 Agent 你希望它接下来做什么。"></textarea>
+        <small id="humanDecisionInputHint" class="form-hint">直接用自然语言表达你的要求，无需填写 JSON 或了解系统内部数据结构。</small>
       </label>
       <label id="humanDecisionConfirmWrap" class="human-confirm" hidden>
         <input type="checkbox" id="humanDecisionConfirm">
