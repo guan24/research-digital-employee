@@ -414,21 +414,38 @@ class PlanProgressTracker:
                     for s in plan["steps"]]}
         self.artifacts.write_text("notes/research_plan.json", json.dumps(live, ensure_ascii=False, indent=2))
         try:
-            progress = self._latest_progress(events)
-            history = []
-            previous_signature = None
+            previous_archive = {}
+            if self.artifacts.exists("notes/agent_execution_plan.json"):
+                try:
+                    loaded_archive = json.loads(self.artifacts.read_text("notes/agent_execution_plan.json"))
+                    previous_archive = loaded_archive if isinstance(loaded_archive, dict) else {}
+                except (ValueError, OSError):
+                    previous_archive = {}
+            progress = dict(previous_archive.get("progress") or {})
+            progress.update(self._latest_progress(events))
+            history = list(previous_archive.get("history") or [])
+            previous_signature = (
+                json.dumps(history[-1].get("plan") or {}, ensure_ascii=False, sort_keys=True)
+                if history else None
+            )
+            previous_timestamp = history[-1].get("timestamp") if history else None
             for event in events:
                 if event.get("event_type") != "research_plan_updated":
                     continue
                 p = event.get("payload") or {}
+                event_timestamp = event.get("timestamp")
+                if previous_timestamp and event_timestamp and str(event_timestamp) <= str(previous_timestamp):
+                    continue
                 archived_plan = self._normalize_plan(p.get("plan") or {})
                 signature = json.dumps(archived_plan, ensure_ascii=False, sort_keys=True)
                 if signature == previous_signature:
+                    previous_timestamp = event_timestamp or previous_timestamp
                     continue
                 previous_signature = signature
                 history.append({
                     "version": len(history) + 1,
-                    "timestamp": event.get("timestamp"),
+                    "event_id": event.get("event_id"),
+                    "timestamp": event_timestamp,
                     "change_type": p.get("change_type") or ("initial" if not history else "replan"),
                     "trigger": p.get("trigger") or p.get("change_reason") or "",
                     "new_information": p.get("new_information") or "",
@@ -439,6 +456,7 @@ class PlanProgressTracker:
                     "original_plan_text": p.get("original_plan_text") or "",
                     "plan": archived_plan,
                 })
+                previous_timestamp = event_timestamp or previous_timestamp
             step_progress = {
                 step["id"]: {
                     "status": progress.get(step["id"], {}).get("status", "pending"),

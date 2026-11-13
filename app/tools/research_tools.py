@@ -669,22 +669,35 @@ class ResearchToolService(TaskToolService):
             event for event in events
             if event["event_type"] == "research_plan_updated"
         ]
-        history = []
-        previous_signature = None
+        existing_archive = {}
+        if artifacts.exists("notes/agent_execution_plan.json"):
+            try:
+                loaded = json.loads(artifacts.read_text("notes/agent_execution_plan.json"))
+                existing_archive = loaded if isinstance(loaded, dict) else {}
+            except (ValueError, OSError):
+                existing_archive = {}
+        history = list(existing_archive.get("history") or [])
+        previous_signature = (
+            json.dumps(history[-1].get("plan") or {}, ensure_ascii=False, sort_keys=True)
+            if history else None
+        )
+        previous_timestamp = history[-1].get("timestamp") if history else None
         for event in plan_events:
             payload = event.get("payload", {})
-            plan = ResearchToolService._normalize_plan_structure(
-                payload.get("plan") or {}
-            )
+            event_timestamp = event.get("timestamp")
+            if previous_timestamp and event_timestamp and str(event_timestamp) <= str(previous_timestamp):
+                continue
+            plan = ResearchToolService._normalize_plan_structure(payload.get("plan") or {})
             signature = json.dumps(plan, ensure_ascii=False, sort_keys=True)
-            # Older releases emitted a new plan event for every step-status change.
-            # Collapse those records so the archive represents only strategic revisions.
+            # Preserve archived versions outside the bounded event window and append only newer revisions.
             if signature == previous_signature:
+                previous_timestamp = event_timestamp or previous_timestamp
                 continue
             previous_signature = signature
             history.append({
                 "version": len(history) + 1,
-                "timestamp": event.get("timestamp"),
+                "event_id": event.get("event_id"),
+                "timestamp": event_timestamp,
                 "change_type": payload.get("change_type") or ("initial" if not history else "replan"),
                 "trigger": payload.get("trigger") or payload.get("change_reason") or "",
                 "new_information": payload.get("new_information") or "",
@@ -695,13 +708,15 @@ class ResearchToolService(TaskToolService):
                 "plan": plan,
                 "original_plan_text": payload.get("original_plan_text") or "",
             })
+            previous_timestamp = event_timestamp or previous_timestamp
 
         if not history:
             return None
 
         task = db.get_task(task_id) or {}
         latest_plan = history[-1]["plan"]
-        latest_progress = ResearchToolService._latest_step_progress(events)
+        latest_progress = dict(existing_archive.get("progress") or {})
+        latest_progress.update(ResearchToolService._latest_step_progress(events))
         progress = {
             step["id"]: {
                 "status": latest_progress.get(step["id"], {}).get("status", "pending"),
@@ -926,22 +941,15 @@ class ResearchToolService(TaskToolService):
                 item["id"]
                 for item in (plan_diff.get("added_steps", []) + plan_diff.get("modified_steps", []))
             }
+        from app.runtime.plan_progress import PlanProgressTracker
+        progress_tracker = PlanProgressTracker(self.db, self.task_id, self.artifacts)
         for step in plan["steps"]:
             if step["id"] not in reset_step_ids:
                 continue
-            previous_status = progress_before.get(step["id"], {}).get("status", "pending")
-            self.db.add_event(
-                self.task_id,
-                "research_plan_step_status",
-                {
-                    "step_id": step["id"],
-                    "step_title": step["title"],
-                    "status": "pending",
-                    "previous_status": previous_status,
-                    "note": "初始计划建立，等待执行" if not previous_event else "计划结构发生调整，该步骤等待重新执行",
-                    "plan_version": version,
-                    "source": "system",
-                },
+            progress_tracker.transition_step(
+                step["id"], "pending",
+                "初始计划建立，等待执行" if not previous_event else "计划结构发生调整，该步骤等待重新执行",
+                source="system", expected_version=version, force=True,
             )
 
         archive_path = self.persist_plan_archive(
