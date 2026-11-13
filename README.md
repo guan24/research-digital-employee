@@ -1,180 +1,277 @@
 # Research Digital Employee
 
-A single-machine, long-running autonomous research worker built with **Deep Agents, LangGraph, FastAPI and SQLite**. A user submits a research goal; the research Agent plans the work, chooses tools, reads sources, records evidence, saves intermediate artifacts and produces a Markdown report. A separate Worker executes tasks, so closing the browser does not stop a running task.
+A long-running autonomous research system built with **Deep Agents, LangGraph, FastAPI and SQLite**. A user submits a research goal; the Research Agent creates and adapts its plan, searches and reads external sources, records evidence and findings, saves intermediate artifacts, and produces a source-backed Markdown report. A separate Worker runs tasks in the background, so closing the browser does not stop an active task.
 
-This repository is an MVP focused on durable execution and research traceability. It currently registers one role (`research`) and runs one active Worker at a time.
+The project addresses the central challenge in the development exercise: research may take tens of minutes or longer, new evidence may change the best next action, and model/provider failures or process interruptions must not erase the task's progress. Developers must also be able to inspect how a result was produced and distinguish role-specific capabilities from shared runtime services.
 
-## What is implemented
+## What the project demonstrates
 
-- **Autonomous research loop:** the Agent creates and materially revises its own research plan. It is not a fixed search/read/write pipeline. Plan strategy versions and per-step progress are persisted separately.
-- **Research tools:** Tavily web search; public HTML and PDF retrieval; read-only GitHub MCP repository inspection; arXiv Atom API search and paper retrieval.
-- **Durable work products:** task-scoped Markdown, text, JSON, CSV and YAML artifacts; versioned research memory; source snapshots; a source/Finding registry.
-- **Evidence-aware control:** a deterministic Research Controller tracks requested dimensions, Finding-to-source links, coverage and stagnation, then returns bounded next-action recommendations.
-- **Delivery quality gate:** a deterministic ReportValidator checks report structure and provenance. A ResearchEvaluator combines rule-based scores with an isolated LLM review across five dimensions. Failed reports receive bounded repair attempts; unresolved review or quality issues can be sent to a human operator.
-- **Long-running execution:** SQLite task state and event journal, LangGraph SQLite checkpoints, Worker lease/heartbeat, retry classification, cumulative budgets and stale-task reconciliation.
-- **Conservative recovery:** tool calls are journaled. After a Worker interruption, read-only calls may be retried; known writes are checked against persisted artifacts, Findings, plans or progress events. Ambiguous recovery and corrupted checkpoints are parked for human review.
-- **Operational visibility:** chronological model/tool/system events, SSE streaming with event replay, plan history, research state, budget, evidence, memory and artifact inspection.
+| Exercise requirement | Implementation |
+|---|---|
+| Autonomous research, not a fixed pipeline | The Agent chooses searches, reads, analysis and follow-up actions; material strategy changes are recorded as plan revisions |
+| External search, reading and intermediate artifacts | Tavily, web/PDF retrieval, GitHub MCP, arXiv, task-scoped artifacts, durable memory and an evidence registry |
+| Long-running execution and production failures | Independent Worker, SQLite task state, LangGraph checkpoints, lease/heartbeat, retries, budgets and conservative recovery |
+| Understand and diagnose task execution | Persistent event journal, model/tool call records, SSE replay, plan snapshots, evidence, budget, quality and recovery records |
+| Separate role capabilities from shared capabilities | Agent Registry defines role contracts; task lifecycle, Worker, persistence, budget and audit are shared runtime services |
+
+The goal is not simply to give a model tools. It is to place an autonomous research Agent inside a durable task lifecycle with evidence feedback, resource boundaries, delivery validation and recovery.
 
 ## Architecture
 
-| Layer | Responsibility |
+```mermaid
+flowchart TB
+    U["User / Operator"]
+    UI["Web Console"]
+    API["FastAPI"]
+    DB[("SQLite Task Database")]
+    W["Background Worker"]
+    EX["Shared Executor / Runtime"]
+    REG["Agent Registry"]
+    A["Research Agent"]
+    RT["Research Tools"]
+    TT["Shared Task Tools"]
+    LC["Research Lifecycle Coordinator"]
+    CP[("LangGraph Checkpoint")]
+    FS[("Task Workspace / Artifacts")]
+    EXT["Tavily / Web / PDF / GitHub MCP / arXiv"]
+
+    U --> UI
+    UI <-->|REST / SSE| API
+    API --> DB
+    W --> DB
+    W --> EX
+    EX --> REG --> A
+    A --> RT --> EXT
+    A --> TT --> FS
+    A --> LC
+    EX --> DB
+    EX --> CP
+    LC --> DB
+    LC --> FS
+    DB --> API
+```
+
+| Component | Responsibility |
 |---|---|
-| FastAPI operator API | Task creation and controls, role discovery, event/artifact/research inspection, human decisions and budget extensions |
-| Research Agent | Open-ended plan/tool loop, evidence gathering, analysis, memory and report writing |
-| Shared task tools | Task-scoped artifact read/write, durable memory, budget status and extension requests |
-| Research tools | Search, webpage/PDF retrieval, GitHub MCP and arXiv |
-| Runtime | Single Worker, lease/heartbeat, retries, LangGraph checkpoint, execution callbacks, budget gates and recovery |
-| Persistence | SQLite task/event/control records, SQLite graph checkpoints and per-task workspace |
+| FastAPI operator API | Task creation and controls; role, event, plan, research, evidence, budget and artifact inspection; human decisions |
+| Agent Registry | Role builder, profile, output artifact, validator, repair handler, finalizer and default budget |
+| Research Agent | Autonomous planning, tool selection, evidence gathering, analysis, memory and report writing |
+| Shared task tools | Task-scoped artifact I/O, durable memory, budget inspection and extension requests |
+| Research tools | Web search, webpage/PDF retrieval, GitHub repository/source inspection and arXiv |
+| Research Controller | Evidence coverage, critical gaps, stagnation and bounded next-action recommendations |
+| ResearchEvaluator / ReportValidator | Report provenance and structure checks, rule-based scoring and isolated-context review |
+| Worker / Runtime | Task claiming, lease/heartbeat, checkpointing, budget gates, error classification, retries, recovery and finalization |
+| Persistence and audit | SQLite task/control/event records, LangGraph checkpoints, workspace artifacts and tool-call journal |
 
-The task database, LangGraph checkpoint and workspace have different responsibilities. The task database owns task status, ownership, budgets and audit events; the checkpoint stores graph state; the workspace stores files and evidence. Recovery reconciles these sources rather than treating one as a complete replacement for the others.
+### Persistence ownership
 
-## Requirements
+- `data/tasks.sqlite` stores task state, Worker ownership and generation, budgets, events, tool calls, research control, quality assessments, recovery decisions and human interventions.
+- `data/checkpoints.sqlite` stores LangGraph graph state and message history, keyed by `task_id` as `thread_id`.
+- `workspaces/{task_id}/` stores plan versions, research memory, source snapshots, the evidence registry, intermediate artifacts and the final report.
 
-- Python 3.12.
-- An OpenAI or OpenAI-compatible chat-completions endpoint.
-- A Tavily API key for web search.
-- GitHub access is optional. GitHub tools require a read-only fine-grained PAT. arXiv retrieval does not require a key.
-- Windows, macOS or Linux.
+These stores have distinct responsibilities: the task database records business state, the checkpoint preserves Agent execution context, and the workspace holds research material and deliverables. Recovery reconciles them rather than treating any one store as a complete substitute for the others.
+
+## Research lifecycle
+
+1. **Accept a goal.** The API validates the requested role, creates a durable task and applies role-level budget defaults.
+2. **Claim in the background.** The Worker obtains the global lease, claims the task and increments `worker_generation`. The browser is an operator console, not the task process.
+3. **Plan the research.** The Agent creates a structured plan of 3–8 steps and a coverage matrix of 3–12 research dimensions.
+4. **Research autonomously.** The Agent chooses searches, webpage/PDF reads, GitHub inspection or arXiv retrieval. Successfully extracted sources are snapshotted; important conclusions become Findings linked to source IDs and research dimensions.
+5. **Adapt to evidence.** The Research Controller measures dimension coverage, critical gaps and stagnation, then returns bounded recommendations. The Agent chooses and performs most research actions based on the observed evidence.
+6. **Synthesize and validate.** The Agent writes `report.md`. ReportValidator checks structure, source IDs, URLs and paragraph-level citation coverage. ResearchEvaluator assesses five quality dimensions.
+7. **Repair or request a decision.** Structured defects guide up to three delivery-repair rounds. Review unavailability, unresolved quality issues or ambiguous recovery can park the task for a human decision.
+8. **Persist delivery.** The report is read back and hashed; the role finalizer archives the plan and execution outcome.
+
+```mermaid
+flowchart TD
+    A["Submit research goal"] --> B["API creates queued task"]
+    B --> C["Worker claims task"]
+    C --> D{"Checkpoint exists?"}
+    D -->|No| E["Start Research Agent"]
+    D -->|Yes| F["Resume graph state"]
+    E --> G["Create plan and coverage matrix"]
+    F --> G
+    G --> H["Search, read and analyze"]
+    H --> I["Register sources, Findings and memory"]
+    I --> J["Assess coverage and gaps"]
+    J --> K{"Change needed?"}
+    K -->|Fill gap / replan| H
+    K -->|Human decision| L["waiting_for_human"]
+    L --> M["Natural-language operator decision"]
+    M --> H
+    K -->|Converge / sufficient evidence| N["Write report"]
+    N --> O["Validate and assess quality"]
+    O --> P{"Pass?"}
+    P -->|Repairable| Q["Targeted repair"]
+    Q --> H
+    P -->|Human review| L
+    P -->|Yes| R["Read-back, hash and archive"]
+    R --> S["completed"]
+    C -.failure / interruption.-> T["Reconcile side effects and checkpoint"]
+    T -->|Safe to resume| C
+    T -->|Ambiguous| L
+```
+
+## Research tools and evidence
+
+| Tool | Purpose |
+|---|---|
+| `web_search` | Search public web sources through Tavily |
+| `fetch_url` | Read public webpage content and save a source snapshot |
+| `fetch_pdf` | Download public PDFs, extract text by page and register evidence |
+| `github_repo` / `github_tree` / `github_read` / `github_releases` | Read-only GitHub repository, directory, source and release inspection |
+| `arxiv_search` / `arxiv_paper` | Search the official arXiv Atom API and retrieve papers |
+| `save_artifact` / `read_artifact` / `list_artifacts` | Save, read bounded excerpts from and list task artifacts |
+| `save_research_memory` / `read_research_memory` | Preserve progress across context compaction and process restarts |
+| `define_research_requirements` / `get_research_status` | Define and inspect the research coverage matrix |
+| `record_finding` / `get_evidence_registry` | Record evidence-linked claims and inspect the evidence ledger |
+| `update_research_plan` / `update_plan_step_status` / `set_active_plan_step` | Manage strategy revisions, step progress and tool-to-step correlation |
+
+Source snapshots receive stable IDs such as `[S0001]` and content-hash metadata. Findings connect claims to source IDs and research dimensions. Important report claims cite `[Sxxxx]`; the Sources section includes direct URLs, creating a traceable path from the report to stored source material.
+
+GitHub access uses the official hosted read-only MCP endpoint by default. The adapter indexes directories before reading files and pins reads to the indexed commit SHA. arXiv uses its official Atom API. GitHub is optional; other research tools remain available without a PAT.
+
+## Long-running execution and recovery
+
+- **Task state and fencing:** SQLite stores task state, Worker ownership and `worker_generation`. Critical writes revalidate ownership in their transaction, preventing a superseded Worker from writing after takeover.
+- **Lease and heartbeat:** a global lease coordinates the single-machine Worker; heartbeat expiry identifies stale execution.
+- **Checkpoint recovery:** LangGraph SQLite checkpoints preserve graph state. Retry reuses the original task ID, checkpoint and workspace.
+- **Tool-call reconciliation:** tool starts and terminal outcomes are journaled. Read-only requests may be retried within budget; known writes are checked against artifacts, Findings, plans or progress records. Ambiguous side effects are parked for human handling.
+- **Error classification:** retryable and terminal errors follow different paths; retries use bounded exponential backoff. Operators can also retry failed tasks.
+- **Budget and convergence:** tool calls, cumulative runtime and tokens have hard limits. A protected reserve supports synthesis, persistence, validation and repair.
+- **Human-in-the-loop:** operators provide natural-language instructions. The original instruction and decision are audited; the Agent translates them into complete plan or requirement changes.
+
+## Runtime budgets
+
+Research-role defaults:
+
+| Resource | Default limit |
+|---|---:|
+| Tool calls (`max_steps`) | 30 |
+| Cumulative runtime | 3,600 seconds |
+| Tokens | 100,000 |
+
+Before a main Agent model call, the runtime reserves a heuristic input-token estimate, a 4,096-token output allowance and 256 tokens of framing overhead. Provider usage is preferred for settlement when available. The convergence reserve protects 30% of token budget, 25% of tool calls and 20% of runtime, subject to minimum and maximum reserve rules. Paused time is excluded from accumulated runtime.
+
+Budget extensions require operator approval. A task failed by a hard budget gate can be requeued after approval while reusing its checkpoint and workspace.
 
 ## Local setup
 
-Create a virtual environment, install dependencies and copy the example configuration:
+### Requirements
 
-~~~powershell
+- Python 3.12 (the project metadata supports Python 3.12–3.13).
+- An OpenAI or OpenAI-compatible Chat Completions endpoint.
+- A Tavily API key for web search.
+- An optional read-only GitHub fine-grained PAT.
+- Node.js 22 for frontend JavaScript tests only; Node is not required to run the backend.
+
+### Install
+
+Windows PowerShell:
+
+```powershell
 py -3.12 -m venv .venv
 .\.venv\Scripts\Activate.ps1
 python -m pip install --upgrade pip
 pip install -r requirements.txt
 Copy-Item .env.example .env
-~~~
+```
 
-On macOS/Linux, use `python3.12 -m venv .venv`, `source .venv/bin/activate` and `cp .env.example .env`.
+macOS / Linux:
+
+```bash
+python3.12 -m venv .venv
+source .venv/bin/activate
+python -m pip install --upgrade pip
+pip install -r requirements.txt
+cp .env.example .env
+```
 
 Set the required values in the project-root `.env`:
 
-- **OPENAI_API_KEY** and **OPENAI_MODEL**.
-- **TAVILY_API_KEY** for web search.
-- **OPENAI_BASE_URL** when using a compatible gateway rather than the default OpenAI endpoint.
+```dotenv
+OPENAI_API_KEY=your_api_key
+OPENAI_MODEL=your_model_name
+# Set this when using a compatible model gateway
+OPENAI_BASE_URL=https://your-compatible-endpoint/v1
 
-To enable GitHub tools, also set **GITHUB_PERSONAL_ACCESS_TOKEN**. The default transport is the official hosted read-only MCP endpoint. Transport, endpoint, timeout, restart limit and maximum file size are configurable in the same `.env`. A local stdio GitHub MCP server is an optional alternative. Never commit real credentials.
+TAVILY_API_KEY=your_tavily_key
 
-Start the API and Worker in separate terminals:
+# Optional: enable read-only GitHub tools
+GITHUB_PERSONAL_ACCESS_TOKEN=
+GITHUB_MCP_TRANSPORT=remote
+GITHUB_MCP_REMOTE_URL=https://api.githubcopilot.com/mcp/readonly
+```
 
-~~~powershell
+Model timeout and context-window settings, Worker polling/heartbeat/lease, retry policy, webpage download limits and GitHub MCP connection options are configurable in `.env.example`. Never commit real credentials.
+
+### Run
+
+Terminal 1: start the API and web console.
+
+```bash
 uvicorn app.api.main:app --reload --host 127.0.0.1 --port 8000
-~~~
+```
 
-~~~powershell
-.\.venv\Scripts\Activate.ps1
+Terminal 2: start the independent Worker.
+
+```bash
 python -m app.runtime.worker
-~~~
+```
 
-Open <http://127.0.0.1:8000/> and submit tasks through the browser console. The Worker runs independently of the browser session.
+Open <http://127.0.0.1:8000/> to create and inspect research tasks. The API and Worker run independently; closing the browser does not stop background execution.
 
-## Research workflow
+## API overview
 
-1. The Agent identifies the deliverable and creates a structured research plan.
-2. It defines a coverage matrix (research dimensions, questions, expected evidence, priority and minimum source count).
-3. It searches and reads sources, saves source snapshots, records Findings against source IDs and updates durable memory.
-4. The Research Controller assesses dimension coverage and stagnation at observed research phase boundaries and when the Agent requests research status. It returns actions such as `FILL_EVIDENCE_GAP`, `REPLAN`, `ENTER_CONVERGENCE` and `REQUEST_HUMAN`. The Agent performs most research actions; the runtime automatically parks the task when a phase-boundary decision requires human input.
-5. The Agent writes the report. ReportValidator checks structure, URLs, registered source IDs and paragraph-level citation coverage.
-6. ResearchEvaluator performs rule-based assessment and, when hard blocks do not already prevent review, a separate LLM review call. The default five dimensions are goal coverage, evidence sufficiency, source reliability, conclusion consistency and report completeness. The weighted total threshold is 80 and each dimension must reach 60 by default.
-7. The Executor persists and reads back the deliverable. The research role allows up to three delivery repair rounds; unresolved quality issues are preserved and may require an operator decision.
+| Method | Path | Purpose |
+|---|---|---|
+| `POST` | `/tasks` | Create a task |
+| `GET` | `/tasks`, `/tasks/{task_id}` | List and inspect tasks |
+| `GET` | `/agents` | List registered roles |
+| `GET` | `/tasks/{task_id}/events` | Read task events |
+| `GET` | `/tasks/{task_id}/events/stream` | Stream events through SSE |
+| `GET` | `/tasks/{task_id}/plan` | Current plan, history and step progress |
+| `GET` | `/tasks/{task_id}/research` | Research control, quality, recovery and human-decision state |
+| `GET` | `/tasks/{task_id}/evidence` | Source and Finding registry |
+| `GET` | `/tasks/{task_id}/memory` | Durable research memory |
+| `GET` | `/tasks/{task_id}/budget` | Budget usage |
+| `GET` | `/tasks/{task_id}/artifacts` | List task artifacts |
+| `POST` | `/tasks/{task_id}/pause`, `resume`, `retry`, `cancel` | Control a task |
+| `POST` | `/tasks/{task_id}/budget/approve` | Approve a budget extension |
+| `POST` | `/tasks/{task_id}/human-intervention/resolve` | Submit an operator decision |
+| `DELETE` | `/tasks/{task_id}` | Delete task data |
+| `GET` | `/health`, `/system/overview` | Health and runtime overview |
 
-## Runtime budgets
+SSE events are persisted before delivery and support `Last-Event-ID` / `after_id` replay.
 
-The research role profile defaults to 30 tool calls, 3,600 seconds and 100,000 tokens. Task-level values can override these defaults.
+## Tests and verification
 
-- Tool-call count is consumed atomically before each tool starts.
-- Cumulative runtime is checked at controlled model/tool/callback boundaries and is retained across retries. Pauses are excluded from accumulated runtime.
-- Before a main Agent model request, the runtime reserves a heuristic input-token estimate plus a 4,096-token output cap and 256-token framing overhead. The model is configured with the same 4,096 output cap. Provider-reported usage is used for settlement when available.
-- A convergence reserve protects 30% of the token budget, 25% of tool calls and 20% of runtime (subject to minimum/maximum reserve rules). When an exploration limit is reached, new searches and source reads are blocked so the remaining quota can be used for synthesis, persistence, validation and repair.
-- Budget extension requests are recorded for operator approval. Approved extensions add quota; a task failed specifically by a hard budget gate can be requeued to reuse its checkpoint and workspace.
+Run locally:
 
-Token estimates are heuristic, not provider-exact accounting. Dollar cost is not currently exposed in the console.
-
-## API
-
-- Task and role: `POST /tasks`, `GET /tasks`, `GET /tasks/{task_id}`, `GET /agents`
-- Events: `GET /tasks/{task_id}/events`, `GET /tasks/{task_id}/events/stream`
-- Task controls: `POST /tasks/{task_id}/pause`, `resume`, `retry`, `cancel`; `DELETE /tasks/{task_id}`
-- Artifacts: `GET /tasks/{task_id}/artifacts`, `GET /tasks/{task_id}/artifacts/{path}`
-- Research state: `GET /tasks/{task_id}/research`, `GET /tasks/{task_id}/evidence`, `GET /tasks/{task_id}/memory`
-- Budget: `GET /tasks/{task_id}/budget`, `POST /tasks/{task_id}/budget/approve`
-- Human intervention: `POST /tasks/{task_id}/human-intervention/resolve`
-- Operations: `GET /health`, `GET /system/overview`
-
-SSE accepts `Last-Event-ID` or `after_id`. Events are persisted in SQLite before streaming and can be replayed by monotonically increasing event ID.
-
-## Storage
-
-- `data/tasks.sqlite`: task status, worker ownership, budgets, event journal, research control state, quality assessments, tool-call records, recovery decisions and human interventions.
-- `data/checkpoints.sqlite`: LangGraph checkpoints keyed by task ID.
-- `workspaces/{task_id}/`: plan, memory, source snapshots, evidence registry, intermediate artifacts and final report.
-
-Back up both SQLite databases and the workspace directory together. Task data is retained until explicit deletion. The first additive schema migration archives legacy active tasks that predate runtime generation 2; those legacy active tasks are not automatically resumed by the current Worker.
-
-## Tests
-
-Use Python 3.12 and Node.js 22 for the test suite. Node runs frontend behavior checks; the application itself does not require Node.
-
-Run the offline suite:
-
-~~~powershell
+```bash
 python -m pytest -v
 node --check app/static/app.js
-~~~
+```
 
-GitHub Actions runs the Python test suite on Python 3.12 and checks the frontend JavaScript with Node 22. Tests use local SQLite and test doubles; they do not prove a live end-to-end research run against a real model, Tavily and GitHub services. A live smoke test requires the corresponding credentials.
+GitHub Actions runs pytest on Ubuntu and Windows with Python 3.12 and checks frontend JavaScript with Node.js 22. Automated tests use local SQLite and test doubles; they do not call a real model API or incur provider token usage.
 
-## Current boundaries and known limitations
+Key verification paths:
 
-- One machine and one active Worker. The global Worker lease deliberately prevents multiple active Workers; multi-host scheduling and concurrent role execution are not implemented.
-- Only the research role is registered by default. The registry provides role-specific builders, output artifacts, validators, postprocessors, finalizers and budget defaults, but the Executor still has research-specific lifecycle hooks.
-- Cancellation is cooperative. A blocking model or network request may finish before the next control boundary.
-- The Controller computes evidence coverage and recommends actions; the Agent still chooses and performs most research actions. The runtime directly enforces budget gates and human parking, not every recommended action.
-- Evidence snapshots are stored with SHA-256 metadata. Current integrity checks verify snapshot presence and the embedded hash/URL markers; they do not recompute the hash from the extracted source body or make the workspace tamper-proof.
-- The LLM reviewer uses the same configured model as the Agent, but a separate call and context. It reviews a bounded report/evidence excerpt, not every source in full.
-- CI is offline. Real provider reliability, end-to-end research quality and crash recovery under live external calls still require operational smoke tests.
+- `tests/test_autonomous_research_e2e.py`: evidence-dependent replanning and quality-feedback-driven report repair.
+- `tests/test_process_crash_recovery.py`: real subprocess interruption and recovery around Artifact, tool-call and checkpoint boundaries.
+- `tests/test_worker_fencing_races.py`: Worker takeover, generation fencing and competing terminal writes.
+- `tests/test_recovery_consistency.py`: cross-store state and tool-side-effect reconciliation.
+- `tests/test_role_extensibility.py`: reuse of the shared runtime by a second role in tests.
+- `tests/test_documentation.py`: document encoding, references and key design claims.
 
-## Research source integrations
+The console includes a [read-only task execution example](examples/rainbow-research/README.md) with a redacted real report, event trace, plan, evidence, budget and human-decision history. It is not imported into the runnable task database and triggers no model calls. The historical task ended with human-approved degraded delivery because its independent review was unavailable; the example demonstrates execution traceability, not an automatic quality pass.
 
-GitHub tools are registered only for the research role. The default GitHub MCP transport is the official hosted read-only endpoint at <https://api.githubcopilot.com/mcp/readonly>. The adapter uses a read-only tool allow-list, requires a prior directory index, pins file reads to the indexed commit SHA and stores task-scoped snapshots. A fine-grained PAT should have only the required read permissions.
+## Design documents
 
-The arXiv adapter uses the official Atom API, a process-wide three-second request interval and a five-minute search cache. Paper PDF retrieval reuses the public-PDF extraction path, including SSRF and download-size checks.
+- [Design statement: what makes a digital employee, module boundaries, three technical challenges and six-month improvements](DESIGN.md)
+- [System architecture and engineering trade-offs](DESIGN_OVERVIEW.md)
+- [Research lifecycle, evidence control, quality evaluation and recovery](DESIGN_TRUSTED_RESEARCH_LIFECYCLE.md)
 
+## Current operating scope
 
-## Offline decision and recovery verification
-
-The console includes a bundled [read-only task execution example](examples/rainbow-research/README.md),
-with a real generated report, redacted model/tool traces, sources, plan and human decision history.
-It is served from repository files, never enters the runnable task database, and rejects all mutation requests.
-This example ended with human-approved degraded delivery; its independent quality review did not pass.
-
-Research tools expose nested Pydantic contracts: requirements contain 3–12 typed dimensions,
-and plans contain 3–8 complete steps with unique IDs. Invalid arguments return structured
-field errors through LangChain's validation handler without changing requirements or plan versions.
-Each tool permits one correction per task; a second validation failure terminates explicitly.
-Plain-text plan extraction is no longer accepted.
-
-The production model middleware discards every `finish_reason=length` response before tool
-dispatch, including apparently valid tool calls. It permits one concise correction through
-the normal model callbacks and token reservation gate, without increasing the output limit.
-Repeated truncation fails explicitly; original responses, usage and anomalies remain in the trace.
-
-An explicit human continuation of a stagnated research task resets its stagnation window
-atomically with the decision. It preserves requirements, evidence gaps, quality thresholds
-and budgets. Two further cycles without progress can request human intervention again;
-continuation cannot make inaccessible sources or unsupported claims valid.
-
-`tests/test_autonomous_research_e2e.py` injects ConditionalResearchModel into the production Deep Agents builder, retaining the real profile, system prompt, tools, worker, executor and SQLite checkpoint. Decisions read actual tool messages: contradictory evidence causes an audited replan; supporting evidence retains V1. A counterfactual changes only HTTP evidence and verifies that the decision changes. Quality feedback drives report repair; invalid reviews and exhausted repairs prevent automatic delivery.
-
-Database uses BEGIN IMMEDIATE to validate task status, worker_id and worker_generation inside the write transaction. Tool start records/events and terminal status/events commit atomically. Task completion, failure, pause, cancellation and retry include reservation release and their outcome event in one transaction. Duplicate matching callbacks add no event; conflicting outcomes are rejected. The production replay guard returns persisted successful results without rerunning tools; uncertain writes require reconciliation. Artifact writes already matching their input are not rewritten.
-
-`tests/test_worker_fencing_races.py` uses independent SQLite connections and thread barriers for takeover races, competing outcomes and rollback after an event insert failure. `tests/test_process_crash_recovery.py` force-terminates real spawn processes at Pipe barriers after Artifact writes, tool registration and checkpointed execution. Recovery verifies generation changes, preserved messages and no repeated completed side effects. Corrupt checkpoints are preserved for human handling.
-
-`tests/test_role_extensibility.py` registers an analysis role only in tests, covering the public API/runtime, its own JSON validator/finalizer and budgets, pause/resume, cancellation and bounded retries. Production still defaults only to research and uses one active worker. `tests/test_documentation.py` checks UTF-8, nonempty documents, damaged Chinese text and documented source/test paths.
-
-Models, reviewers and external HTTP responses are simulated. No real model API or paid token usage participates. Tests block external sockets and substitute deterministic DNS; Windows asyncio loopback wakeup sockets remain allowed. CI runs full pytest and JavaScript syntax checks.
-
-The task database transaction does not span graph checkpoints or workspace files. Cross-store conflicts require verification and conservative human handling. Real-model research judgment, live provider behavior, multi-host file concurrency and exactly-once external side effects remain outside this automated acceptance.
+This is a single-machine MVP for validating the core design. Production registers the `research` role and runs one Worker under a global lease. The Agent Registry defines role-specific builders, profiles, artifacts, validators, repair handlers, finalizers and budget defaults; a second role currently verifies reuse of the shared runtime in tests. A queue, Worker pool and multi-role scheduling can be added without moving role-specific research logic into the shared runtime.

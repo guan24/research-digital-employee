@@ -1,58 +1,177 @@
-# 设计说明：长时运行的研究数字员工
+# 系统架构与关键技术取舍
 
-## 1. 如何理解“数字员工”与普通 LLM 应用的区别
+## 一、设计目标与约束
 
-普通 LLM 应用通常围绕一次请求组织：接收输入、调用模型、返回回答，状态主要依附于当前会话。它可以接入工具，但通常不负责一个持续几十分钟甚至更久的任务如何推进、保存、恢复和验收。
+本项目面向长时运行的研究任务：用户给出研究目标和交付要求，Agent 自主检索、阅读、分析资料，并根据新证据调整后续工作，最终形成有依据的 Markdown 报告。
 
-我理解的数字员工是一种**以持久化任务为中心的自治执行系统**。用户交付的是目标，而不是固定步骤；Agent 需要自行规划、调用工具、阅读资料、分析证据，并根据新信息调整计划。系统还必须承担任务状态、资源预算、中间成果、执行审计、故障恢复和最终交付质量的责任。
+架构设计围绕四个目标展开：
 
-因此，数字员工与普通 LLM 应用的本质区别不在于是否使用 Agent Framework，而在于是否具备可持续推进的任务生命周期：任务能跨请求运行，进度和成果可持久化，失败后可诊断和恢复，交付前有可验证的质量门槛。
+1. **自治性**：研究路径由 Agent 根据任务和证据决定，而不是由程序预先写死。
+2. **持久性**：任务、执行上下文、证据和中间成果能够跨请求、跨进程保存。
+3. **可诊断性**：关键模型调用、工具调用、计划变化、错误和恢复决策能够追溯。
+4. **可扩展性**：岗位差异留在岗位层，任务运行和可靠性能力沉淀为公共服务。
 
-## 2. 系统核心模块如何划分，以及为什么
+最小版本选择单机、SQLite、单 Worker，减少分布式系统带来的额外变量，优先验证长期任务状态、证据控制和恢复机制。
 
-系统按“岗位能力”和“公共运行能力”分层，避免把研究逻辑写进所有岗位都必须复用的基础设施。
+## 二、总体架构
 
-| 模块 | 当前实现 | 划分原因 |
+```mermaid
+flowchart TB
+    subgraph Operator["操作层"]
+        UI["Web 控制台"]
+        API["FastAPI"]
+    end
+
+    subgraph Runtime["公共任务运行层"]
+        W["Worker"]
+        EX["Executor"]
+        REG["Agent Registry"]
+        B["预算 / 错误分类 / 控制信号"]
+        REC["Recovery Manager"]
+    end
+
+    subgraph Role["岗位能力层"]
+        A["Research Agent"]
+        RT["Research Tools"]
+        TT["Shared Task Tools"]
+        LC["Research Lifecycle Coordinator"]
+        CTRL["Research Controller"]
+        EVAL["Research Evaluator"]
+        VAL["ReportValidator"]
+    end
+
+    subgraph Storage["持久化层"]
+        DB[("tasks.sqlite")]
+        CP[("checkpoints.sqlite")]
+        FS[("Task Workspace")]
+    end
+
+    EXT["Tavily / Web / PDF / GitHub MCP / arXiv"]
+
+    UI <-->|REST / SSE| API
+    API <--> DB
+    W <--> DB
+    W --> EX
+    EX --> REG --> A
+    EX --> B
+    EX --> REC
+    A --> RT --> EXT
+    A --> TT --> FS
+    A --> LC --> CTRL
+    LC --> EVAL
+    EX --> VAL
+    EX <--> CP
+    EX <--> DB
+    LC <--> DB
+    LC <--> FS
+    REC <--> DB
+    REC <--> CP
+    REC <--> FS
+    DB --> API
+```
+
+## 三、模块边界与职责
+
+### 3.1 操作接口层
+
+FastAPI 负责接收任务和人工操作请求，提供任务、岗位、事件、计划、研究状态、证据、记忆、预算和成果查询。Web 控制台展示执行过程并通过 SSE 接收事件。
+
+API 不承担长时间研究执行。任务创建后由独立 Worker 领取，避免将几十分钟的任务绑定到单次 HTTP 请求或浏览器会话。
+
+### 3.2 公共运行时
+
+| 组件 | 当前职责 |
+|---|---|
+| Worker | 获取全局租约、心跳、领取任务、过期任务检查、重试调度 |
+| Executor | 构建岗位 Agent、绑定 Checkpoint 和回调、管理模型/工具调用、预算控制、成果验证和修复 |
+| Agent Registry | 通过 `AgentRegistration` 描述 Builder、Profile Loader、产物路径、Validator、Postprocessor、Finalizer 和预算默认值 |
+| Recovery Manager | 标记未知工具调用、核验已发生的副作用、检查 Checkpoint 并协调安全恢复 |
+| Database | 事务化维护任务状态、Worker 所有权、执行代次、预算、事件和人工待办 |
+| Artifact Store | 在任务隔离的工作区中读写文件，限制路径和允许的文件类型 |
+
+公共运行时不应包含某个研究领域的具体检索策略。它负责让任务能够被执行、控制、保存、恢复和审计。
+
+### 3.3 岗位能力层
+
+当前生产环境注册 `research` 岗位。Research Agent 负责理解研究目标、创建计划、定义研究维度、选择工具、形成 Finding、保存记忆和撰写报告。
+
+研究工具与公共任务工具分开：
+
+- 研究工具：Tavily、网页/PDF、GitHub MCP、arXiv，以及研究计划、需求、Finding 和证据状态工具。
+- 公共任务工具：Artifact 读写、长期记忆、预算查询和扩额申请。
+
+岗位注册契约允许不同岗位定义自己的模型构建器、Profile、产物、校验器、修复器、Finalizer 和预算。`tests/test_role_extensibility.py` 通过测试专用的分析岗位验证这一接口可以复用公共 API、Worker、Executor、Checkpoint 和任务工具；生产默认仍只注册 Research Agent。
+
+### 3.4 研究生命周期控制
+
+ResearchLifecycleCoordinator 在研究阶段边界和最终交付阶段协调：
+
+- Research Controller：根据需求矩阵、Finding 和来源快照计算覆盖率、关键缺口和停滞，输出受限行动建议。
+- Research Evaluator：组合规则评分和独立上下文 LLM 评审，输出五维质量分数、硬阻断和可修复缺陷。
+- ReportValidator：检查 Markdown 结构、来源 ID、直接 URL 和正文引用覆盖率。
+
+Controller 不负责替 Agent 搜索或重写计划。Agent 根据证据和建议选择下一步；Runtime 负责执行预算硬闸门和必要的人工停车。
+
+## 四、三类持久化数据的所有权
+
+| 存储 | 主要内容 | 设计目的 |
 |---|---|---|
-| 岗位 Agent 层 | Research Agent、岗位 Profile/Prompt、研究工具集 | 研究策略、资料来源和交付规范属于岗位职责，应允许不同岗位独立替换 |
-| 公共任务运行层 | FastAPI、Worker、Executor、任务状态机、租约/心跳、重试、Checkpoint、预算 | 所有岗位都需要稳定的任务执行、控制和恢复能力，不应由岗位 Prompt 自行保证 |
-| 持久化与证据层 | SQLite 任务/事件/控制记录、LangGraph Checkpoint、任务 Artifact、Evidence Registry | 区分任务事实、Agent 图状态和研究成果，支持断点恢复与结果溯源 |
-| 研究质量控制层 | Research Controller、ReportValidator、ResearchEvaluator、人工干预 | 自主研究需要覆盖缺口识别、证据约束、质量评价和必要的人机协同 |
-| 可观测层 | 事件日志、模型/工具回调、SSE、计划进度和诊断信息 | 让开发者能解释任务如何执行、在哪里失败以及恢复采取了什么动作 |
+| `data/tasks.sqlite` | 任务状态、Worker owner/generation、预算、事件、工具调用、研究控制、质量评估、恢复决策、人工干预 | 保存任务业务事实和审计记录 |
+| `data/checkpoints.sqlite` | LangGraph 消息、图节点状态和待执行节点 | 恢复 Agent 的图执行上下文 |
+| `workspaces/{task_id}/` | 当前计划、计划历史、研究记忆、来源快照、Evidence Registry、中间文件和报告 | 保存研究过程材料与最终交付物 |
 
-当前采用 Deep Agents + LangGraph 承担开放式工具使用和图状态 Checkpoint；FastAPI 提供操作接口；SQLite 和单 Worker 降低 MVP 的部署复杂度。当前没有提前引入消息队列、分布式调度和多 Agent 协作，因为本阶段更重要的是先验证任务状态、证据和恢复的一致性。
+三类存储不能互相替代。任务数据库回答“任务处于什么状态”，Checkpoint 回答“Agent 执行到哪里”，工作区回答“研究资料和成果保存在哪里”。它们之间通过工具副作用核验、读回校验和恢复记录进行协调，而不是依赖跨数据库和文件系统的分布式事务。
 
-## 3. 当前方案最重要的三个技术问题
+## 五、任务运行与状态控制
 
-**问题一：长任务中的状态一致性与可靠恢复。** 任务数据库、LangGraph Checkpoint、工具副作用和工作区文件分别保存不同事实。进程可能在工具执行后、结果落库前中断。当前通过工具调用生命周期、幂等键、Worker generation、Checkpoint 检查和按工具类型核验，尽量避免盲目重放。核心难点是判断“上一步究竟有没有完成”，而不只是重新启动模型。
+```mermaid
+stateDiagram-v2
+    [*] --> queued
+    queued --> running: Worker claim
+    retry_wait --> running: retry becomes due
+    running --> completed: validated delivery
+    running --> failed: terminal error / hard budget exhausted
+    running --> retry_wait: retryable error
+    running --> paused: pause request
+    running --> cancelled: cancel request
+    running --> waiting_for_human: research / quality / recovery decision
+    paused --> queued: resume
+    waiting_for_human --> queued: operator continues
+    waiting_for_human --> completed: approved degraded delivery
+    waiting_for_human --> cancelled: operator terminates
+    failed --> queued: manual retry / approved budget extension
+```
 
-**问题二：自主研究的证据驱动控制与交付质量。** 仅靠 Prompt 要求 Agent “充分研究”无法判断研究是否真的覆盖用户问题。当前通过研究维度矩阵、Finding—Source 关联、覆盖率和停滞检测识别缺口，再由 Evaluator 检查目标覆盖、证据充分性、来源可靠性、结论一致性和报告完整性。难点是让研究自由度与确定性质量约束并存，同时承认当前控制器仍有一部分依赖 Agent 遵循建议。
+Worker 使用全局 SQLite 租约和心跳；每次领取任务增加 `worker_generation`。任务关键写操作在数据库事务中重新校验任务状态、Worker ID 和执行代次，防止失去所有权的旧 Worker 继续写入。
 
-**问题三：长时执行的资源边界与可诊断性。** 模型调用、工具请求和运行时间都可能累积，外部服务也会超时或返回不稳定结果。当前对工具次数、累计运行时间和 Token 预留设置硬闸门，并把模型/工具调用、错误、重试、恢复决策写入事件日志。难点是预算不能只在任务开始时检查，而必须在实际执行边界生效；出现问题后还要能追溯根因。
+任务运行状态与研究阶段、计划步骤是不同维度。研究阶段用于观察范围确认、资料检索、来源阅读、证据分析、报告撰写和交付校验；计划步骤则由 Agent 定义，并可在研究过程中更新。计划策略版本和步骤进度分别持久化，普通进度变化不会制造新的战略计划版本。
 
-## 4. 如果运行半年并积累大量成功和失败任务，最值得做的三项改进
+## 六、关键技术取舍
 
-**第一，建立可回放的任务评测与失败分析体系。** 将任务目标、计划版本、来源、Finding、工具调用、质量评分、修复轮次和最终结果整理成脱敏评测样本。构建代表性研究任务集和故障注入集，支持版本间回放比较，定位哪些提示词、模型、工具或控制策略真正提高了成功率和证据质量。先让改进可测量，而不是直接用历史日志训练模型。
+| 选择 | 解决的问题 | 取舍 |
+|---|---|---|
+| Deep Agents + LangGraph | 开放式工具使用、消息状态和图执行 Checkpoint | 复用 Agent 运行框架，不自建模型工具循环 |
+| FastAPI + 独立 Worker | API 与长时间任务解耦 | 当前通过单机 Worker 降低部署复杂度 |
+| SQLite | 任务、事件、工具调用和预算的持久化事务 | 适合单机 MVP，未来并发规模增大后可替换 |
+| 三类存储分工 | 区分业务状态、Agent 上下文和研究产物 | 跨存储一致性通过核验与保守恢复实现 |
+| Evidence Registry + Research Controller | 让研究覆盖率基于 Finding 与有效来源，而非搜索数量 | 控制器提供可解释建议，Agent 保留研究决策权 |
+| 规则校验 + 独立上下文评审 | 同时检查可确定的结构约束和较复杂的报告质量 | 评审使用同一模型配置，作为质量辅助而非独立模型投票 |
+| 有界预算 + 收敛阶段 | 为最终综合、保存和修复保留资源 | Token 预留采用启发式估算，Provider usage 可用时用于结算 |
+| 保守恢复 | 防止未知写入被盲目重放 | 无法核验的副作用转人工，而不是假设 exactly-once |
 
-**第二，增强运行基础设施和恢复能力。** 当任务量和岗位数量增长后，将 SQLite 单机存储升级为适合并发的数据库，增加队列与多 Worker 调度、分布式租约、租户隔离和更可靠的产物存储。继续完善工具幂等契约、外部副作用核验和恢复演练，避免并发条件下的重复执行与状态竞争。
+## 七、设计如何被验证
 
-**第三，基于历史结果优化研究策略与岗位能力。** 分析不同任务类型下的来源质量、工具成功率、模型表现、预算消耗和修复收益，逐步实现模型/工具路由、来源优先级、预算分配、重试策略和研究模板的自适应优化。同时沉淀岗位 Profile 和可复用工具契约，让新岗位复用公共运行时，而不复制整套 Agent 执行系统。
+项目不仅检查模块是否存在，还通过测试验证关键设计关系：
 
----
+- **条件决策**：`tests/test_autonomous_research_e2e.py` 使用 `ConditionalResearchModel` 读取实际工具消息。相互矛盾的证据触发带完整审计字段的计划修订；支持性证据保留原计划。反事实测试只改变来源内容，检查 Agent 的后续决策是否随证据变化。
+- **进程中断恢复**：`tests/test_process_crash_recovery.py` 使用独立子进程，在 Artifact 写入、工具调用开始和 Checkpoint 保存等边界强制终止，再验证恢复时的执行代次、消息状态和副作用核验。
+- **Worker 竞态**：`tests/test_worker_fencing_races.py` 使用独立 SQLite 连接和同步屏障，验证 Worker 接管、终态竞争及事务回滚。
+- **恢复一致性**：`tests/test_recovery_consistency.py` 验证不同工具类型的副作用核验策略。
+- **岗位扩展**：`tests/test_role_extensibility.py` 验证测试专用分析岗位复用公共运行时。
+- **文档约束**：`tests/test_documentation.py` 检查文档编码、引用路径及关键设计实现。
 
-**当前实现边界：** 项目目前是单机单 Worker MVP，默认只注册 Research Agent；Controller 的多数行动建议仍由 Agent 执行；来源快照检查尚未达到防篡改级别。离线测试覆盖条件决策和真实子进程中断恢复；真实模型端到端研究及外部服务联合故障仍需运行验收。上述三项改进是基于未来半年任务记录的演进方向，不应误认为当前已经实现。
+这些测试使用确定性模型和 HTTP 替身，重点验证系统控制流和持久化机制；真实模型质量与真实外部服务联合运行仍需单独冒烟验证。
 
+## 八、当前版本的运行范围
 
-## 条件决策、原子恢复与离线验证
-
-`tests/test_autonomous_research_e2e.py` 使用 `ConditionalResearchModel` 读取实际对话和工具结果，保留生产 Deep Agents Builder、Profile、System Prompt、工具注册、Worker、Executor 和真实 SQLite Checkpoint。矛盾证据触发战略重规划及完整审计；支持性证据保持 V1 计划；反事实测试仅替换证据内容，验证后续行动变化。质量反馈触发定向修订，无效评审和修复耗尽均阻止自动交付。自动化结果证明模拟决策下的工程链路，不证明真实模型研究判断。
-
-Database 通过 `BEGIN IMMEDIATE` 在同一事务中检查任务状态、`worker_id`、`worker_generation`，再更新工具终态和对应事件。开始记录与开始事件也原子提交。任务完成、失败、暂停、取消、重试的状态、预留预算释放和对应事件在同一事务中执行。相同终态的重复回调不增加事件，矛盾终态被拒绝；生产工具重放保护复用已成功调用的持久化结果，不确定写操作先核验或转人工。已确认的 Artifact 写入通过精确读回避免重复改写。
-
-`tests/test_worker_fencing_races.py` 使用独立线程和真实 SQLite 连接验证接管竞态、终态竞争和事件插入失败回滚。`tests/test_process_crash_recovery.py` 使用跨平台 spawn 子进程和 Pipe 屏障，在 Artifact 写入后、工具开始后、Checkpoint 首节点保存后强制终止进程，再验证恢复、generation 增加、消息保留和副作用不重复。损坏 Checkpoint 保留现场并转人工。`tests/test_recovery_consistency.py` 保留原有跨存储和副作用核验测试。
-
-`tests/test_role_extensibility.py` 的分析岗位只用于测试，不是生产默认岗位。它复用 API、公共 Worker/Executor、预算和 Checkpoint，拥有自己的 JSON 产物校验和 Finalizer，覆盖暂停后恢复、取消和暂时错误重试，不触发研究专属质量评估。系统仍是单机单 Worker，不承诺多岗位并行。
-
-`tests/test_documentation.py` 检查 UTF-8、非空文档、连续问号/替换字符、中文段落和文档引用路径。所有自动化模型、Reviewer、HTTP 数据均为模拟响应，不调用真实模型 API、不产生真实 Token 费用。测试阻断外网连接，DNS 使用确定性替身；Windows asyncio 所需本地唤醒套接字仍允许。CI 运行全量 pytest 和前端 JavaScript 语法检查。
-
-数据库事务只覆盖任务库。Checkpoint、工作区文件与任务库之间通过核验协调，不是分布式原子事务。真实 Provider 行为、真实模型质量、多主机文件并发和外部服务恰好执行一次仍需真实环境验证；冲突不得以覆盖文件或台账消除。
+当前是单机单 Worker MVP，生产默认注册 Research Agent。岗位注册接口已经将岗位构建、配置、产物、校验、修复、收尾和预算抽象出来；多岗位并行调度、分布式 Worker 和多主机存储不属于当前版本目标。该取舍使项目能够先验证最重要的长期任务自治、证据反馈和安全恢复闭环。

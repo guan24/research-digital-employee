@@ -1,277 +1,403 @@
-# 可信研究闭环：当前实现、数据流与边界
+# 研究生命周期与可信交付设计
 
-> 本文描述当前 main 分支已经接入的实现，不再把原始设计方案中的目标接口、伪代码或未来能力写成现成功能。代码是事实来源；未实现或仅由 Agent 遵循提示词执行的部分会明确标注。
+本文说明当前实现如何将自主研究、证据管理、动态控制、质量评估、长任务恢复和人工决策组织为一个完整生命周期。文中以当前代码为准，区分 Agent 的自主决策与 Runtime 的确定性约束。
 
-## 1. 实现概览
+## 一、设计目标与基本原则
 
-当前研究闭环由四个模块组成，并由 ResearchLifecycleCoordinator 在 Executor 的研究阶段边界和最终交付阶段进行协调。
+研究任务不是固定的“搜索若干次—读取若干篇—生成报告”流程。Agent 应根据新获得的资料决定下一步研究动作；系统则需要保证研究过程可追溯、任务可恢复、资源有边界、最终成果可验证。
 
-| 模块 | 代码位置 | 当前职责 |
+当前闭环遵循五项原则：
+
+1. **目标驱动而非步骤驱动**：用户提供目标和交付要求，Agent 负责选择研究路径。
+2. **计划可演进**：初始计划用于表达战略，只有研究范围、假设、优先级或剩余工作发生实质变化时才创建新版本。
+3. **结论关联证据**：来源被读取不等于研究结论成立；Finding 必须关联来源 ID 和研究维度。
+4. **建议与强制分层**：Controller 提供证据驱动建议，Agent 负责大部分研究决策；Runtime 对预算、任务控制和人工停车执行确定性约束。
+5. **先核验再恢复**：进程中断后先判断工具副作用和 Checkpoint 状态，再决定是否重新执行。
+
+## 二、模块职责与调用关系
+
+| 模块 | 代码位置 | 职责 |
 |---|---|---|
-| Research Controller | `app/runtime/research_controller.py` | 规范化研究要求、根据 Finding 与来源快照计算覆盖率、检测停滞、输出受限行动建议 |
-| Research Evaluator | `app/runtime/research_evaluator.py` | 规则评分、独立上下文 LLM 评审、五维加权评分、硬阻断和修复缺陷 |
-| Recovery Manager | `app/runtime/recovery_manager.py` | 工具调用生命周期、未知调用核验、Checkpoint 检查、过期任务恢复协调 |
-| Lifecycle Coordinator | `app/runtime/lifecycle_coordinator.py` | 串联要求初始化、阶段覆盖评估、最终报告质量评估和控制决策 |
+| Research Agent | `app/agents/research/agent.py`、`app/agents/research/system_prompt.md` | 规划、工具选择、研究分析、记忆和报告撰写 |
+| Research Tool Service | `app/tools/research_tools.py` | 研究工具、计划、需求矩阵、Finding 和状态查询 |
+| Evidence Registry | `app/infrastructure/evidence_registry.py` | 来源快照、来源元数据和 Finding 持久化 |
+| Plan Progress Tracker | `app/runtime/plan_progress.py` | 计划步骤状态、工具关联和产物验证 |
+| Research Controller | `app/runtime/research_controller.py` | 研究需求、覆盖率、关键缺口、停滞和行动建议 |
+| Research Evaluator | `app/runtime/research_evaluator.py` | 规则评分、独立上下文评审、硬阻断和质量缺陷 |
+| ReportValidator | `app/runtime/report_validator.py` | Markdown 结构和引用溯源检查 |
+| Lifecycle Coordinator | `app/runtime/lifecycle_coordinator.py` | 在研究阶段边界与最终交付阶段协调 Controller 和 Evaluator |
+| Recovery Manager | `app/runtime/recovery_manager.py` | 工具调用生命周期、未知副作用核验和 Checkpoint 检查 |
+| Worker / Executor | `app/runtime/worker.py`、`app/runtime/executor.py` | 任务领取、Agent 执行、预算、恢复、修复和终态收尾 |
 
-其他关键组件：
-- `app/runtime/executor.py`：构建 Agent、绑定 Checkpoint 和回调、处理人工决策、执行最终交付校验与有限修复。
-- `app/runtime/worker.py`：单 Worker 租约、心跳、任务领取、错误分类、重试和终态收尾。
-- `app/runtime/plan_progress.py`：根据工具和研究阶段推断计划步骤进度。
-- `app/infrastructure/database.py`：持久化任务、研究控制状态、质量评估、工具调用、恢复决策和人工干预。
-- `app/infrastructure/evidence_registry.py`：保存来源元数据、来源快照和 Finding。
+## 三、端到端研究闭环
 
-## 2. 两类状态不要混为一谈
+```mermaid
+flowchart TD
+    U["用户研究目标"] --> API["创建持久化任务"]
+    API --> W["Worker 领取并建立执行代次"]
+    W --> EX["Executor 创建 / 恢复 Agent"]
+    EX --> P["Agent 制定研究计划"]
+    P --> R["定义研究需求矩阵"]
+    R --> A["Agent 自主搜索、阅读、分析"]
+    A --> S["保存来源快照"]
+    S --> F["登记 Finding 并关联研究维度"]
+    F --> M["保存研究记忆和中间成果"]
+    M --> C["Controller 评估证据覆盖"]
+    C --> D{"下一步决策"}
+    D -->|补充证据| A
+    D -->|战略发生变化| RP["完整计划重规划"]
+    RP --> A
+    D -->|需要人工| H["waiting_for_human"]
+    H --> HI["人工自然语言指令"]
+    HI --> EX
+    D -->|进入收敛 / 证据充分| REP["撰写 report.md"]
+    REP --> V["ReportValidator"]
+    V --> E["ResearchEvaluator"]
+    E --> Q{"质量通过？"}
+    Q -->|缺陷可修复| FIX["定向补充 / 报告修复"]
+    FIX --> A
+    Q -->|评审不可用或质量未收敛| H
+    Q -->|通过| READ["报告读回与哈希"]
+    READ --> DONE["交付与计划归档"]
+    W -.异常中断.-> REC["Recovery Manager"]
+    REC -->|可核验恢复| EX
+    REC -->|存在歧义| H
+```
 
-### 2.1 任务运行状态
+### 3.1 任务状态与研究阶段是两个维度
 
-SQLite 中的任务状态包括：
+任务状态由 SQLite 管理，包括 `queued`、`running`、`retry_wait`、`paused`、`waiting_for_human`、`completed`、`failed`、`cancelled`、`deleting` 和 `archived`。
 
-- `queued`、`running`、`retry_wait`
-- `paused`、`waiting_for_human`
-- `completed`、`failed`、`cancelled`
-- `archived`、`deleting`
-
-Worker 只领取 `runtime_generation=2` 且状态为 `queued` 或到期的 `retry_wait` 任务。`waiting_for_human` 不会被 Worker 自动领取。人工决策完成后，任务按动作重新进入队列、完成或取消。
-
-### 2.2 研究阶段与计划步骤
-
-研究阶段不是一套完全独立、由状态机强制驱动的工作流。PlanProgressTracker 根据工具名和工具参数将执行活动粗略映射到：
+研究阶段由 `PlanProgressTracker` 根据工具活动粗粒度映射为：
 
 `scope → discovery → reading → analysis → report → validation`
 
-这些阶段用于更新计划进度和触发阶段性评估，不代表 Agent 必须按固定顺序调用工具。Agent 可以根据新信息重规划。计划策略版本由 `research_plan_updated` 记录；步骤进度由 `research_plan_step_status` 独立记录。自动推断的步骤完成仍需存在、非空并可读回的成果；否则状态为 `awaiting_verification`。
+阶段用于展示进度和触发观察点，不构成 Agent 必须依次执行的固定工作流。Agent 可以根据新证据返回前面的阶段，也可以重排计划。
 
-## 3. Research Controller：实际控制逻辑
+## 四、研究计划与需求矩阵
 
-### 3.1 研究要求矩阵
+### 4.1 战略计划
 
-Agent 通过 `define_research_requirements` 提交 1–20 个研究维度。每个维度包含：
+`update_research_plan` 用于创建初始计划或记录实质性重规划。模型工具契约要求：
 
-- `id`、`title`
-- `questions`
-- `expected_evidence`
-- `priority`：critical / high / normal
-- `min_sources`：1–10
+- 一个计划包含标题、研究目标和 3–8 个步骤；
+- 每个步骤具有唯一 ID、标题、目标和预期产物；
+- 可选指定阶段、依赖关系和预期产物路径；
+- 计划结构先经过 Pydantic 校验，校验失败不会增加版本或覆盖原计划。
 
-还可配置 `quality_policy.min_total_score` 和 `quality_policy.min_dimension_score)。这些值只能提高研究岗位的默认质量门槛，不能降低岗位基线。
+初始计划记录版本 1。后续计划只有发生实质变化才增加版本；普通步骤开始、完成、跳过或工具调用不会创建战略计划版本。
 
-如果 Agent 没有定义矩阵，Controller 会尝试从最新研究计划步骤派生维度；没有可用步骤时创建一个 `research_scope` 兜底维度。要求矩阵及版本保存在 `research_control_state`，并通过 `research_requirements_updated` 事件留痕。
+### 4.2 重规划审计
 
-### 3.2 覆盖率计算
+每次实质性重规划必须提交完整的新计划，并填写五项信息：
 
-覆盖率不按搜索结果条数计算，而是沿以下关系计算：
+| 字段 | 含义 |
+|---|---|
+| `trigger` | 触发重规划的事件或新条件 |
+| `new_information` | 新获得的具体信息或证据 |
+| `problem_analysis` | 原计划为何不足、受阻、被证伪或效率不佳 |
+| `decision` | 根据证据作出的战略决策 |
+| `changes` | 后续研究步骤、顺序、范围或交付如何变化 |
+
+系统对比前后计划，保留未改变步骤的进度；新增或实质修改的步骤重新进入待执行状态。计划版本和步骤进度分别记录，便于区分“研究策略改变”和“工作推进”。
+
+### 4.3 研究需求矩阵
+
+Agent 通过 `define_research_requirements` 提交 3–12 个研究维度。每个维度包括：
+
+- `id`、`title`；
+- `questions`：需要回答的问题；
+- `expected_evidence`：预期证据；
+- `priority`：`critical`、`high` 或 `normal`；
+- `min_sources`：最低有效来源数量。
+
+可选 `quality_policy` 只能提高岗位默认的总分和单维度质量门槛，不能降低岗位基线。
+
+研究维度应表达用户真正关心的比较问题，而不是机械复制“搜索、阅读、写报告”等通用阶段。若 Agent 未主动定义，Controller 可从现有计划派生后备维度，以保证覆盖评估仍可执行。
+
+## 五、来源、Finding 与证据覆盖
+
+### 5.1 证据登记簿 Evidence Registry
+
+`EvidenceRegistry` 保存两类核心记录：
+
+**来源（Source）**
+
+- 稳定来源 ID，例如 `S0001`；
+- 标题、URL、来源类型和获取时间；
+- 正文内容哈希；
+- 任务工作区中的快照路径；
+- 来源验证状态。
+
+网页、PDF、GitHub 文件和 arXiv 论文在成功提取后进入统一来源登记流程。搜索结果本身是候选资料，不会仅因出现在搜索列表中就自动成为已验证 Finding。
+
+**研究发现（Finding）**
+
+- Finding ID，例如 `F0001`；
+- 结论或主张 `claim`；
+- 关联来源 `source_ids`；
+- 关联研究维度 `dimension_id`；
+- 解释依据和置信度。
+
+由此形成：
+
+`研究维度 → Finding → Source ID → 来源快照 → 原始 URL`
+
+报告使用 `[S0001]` 等来源 ID 支持正文主张，并在 Sources 章节提供直接 URL。Evidence Registry 提供来源摘要和快照读回能力。
+
+### 5.2 覆盖率计算
+
+Research Controller 不按搜索次数或搜索结果条数计算研究进度，而是沿 Finding 与来源关联计算：
 
 `dimension → Finding(dimension_id) → source_ids → registered source snapshot`
 
-只有 Finding 关联的来源 ID 已登记且来源快照通过当前完整性检查，才计入该维度的有效来源数。有效来源数除以该维度的 `min_sources` 得到维度覆盖比例，最高为 1。
+对每个维度：
 
-优先级权重为 critical=3、high=2、normal=1。全局覆盖率是按优先级加权后的维度覆盖率。每个维度输出 covered、partial 或 uncovered 状态；未覆盖的 critical 维度形成 critical gap。
+\[
+coverage_i = \min\left(1,\frac{valid\_source\_count_i}{min\_sources_i}\right)
+\]
 
-### 3.3 停滞检测
+只有被 Finding 关联、已登记且通过当前快照检查的来源才计入有效来源数量。
 
-进度向量包括：
-- coverage_ratio
-- valid_source_count
-- finding_count
-- critical_gap_count
-- quality_total
+优先级权重为：
 
-当覆盖率提升至少 0.03、新增有效来源、新增 Finding、关键缺口减少或质量总分提升至少 2 分之一发生时，视为有实质进展。仅在 phase_boundary、final_delivery、scheduled_checkpoint 等周期触发器上累积停滞计数；连续两个周期没有改善，且仍有关键缺口时，判为 stagnated。
+| 优先级 | 权重 |
+|---|---:|
+| critical | 3 |
+| high | 2 |
+| normal | 1 |
 
-### 3.4 决策与强制程度
+总体覆盖率为按优先级加权的维度覆盖率：
 
-Controller 依据质量评审状态、预算阶段、停滞状态和覆盖缺口返回：
-- `FILL_EVIDENCE_GAP`
-- `REPLAN`
-- `CONTINUE_RESEARCH`
-- `ENTER_CONVERGENCE`
-- `REQUEST_HUMAN`
+\[
+Coverage = \frac{\sum_i w_i \cdot coverage_i}{\sum_i w_i}
+\]
 
-这是确定性建议和允许动作列表，不是一个自动执行所有动作的规划器。Agent 通过 `get_research_status` 获取状态和决策提示，并依据提示选择研究行动。运行时有两类直接强制机制：
-1. 预算进入 convergence 后，工具层拒绝新的搜索和来源读取，只保留有限的综合、成果、记忆和证据操作。
-2. 阶段边界评估返回 `REQUEST_HUMAN` 时，TaskEventCallback 将任务原子地置为 `waiting_for_human`，释放 Worker 所有权并创建人工待办。
+维度状态分为 `covered`、`partial` 和 `uncovered`。未完全覆盖的 critical 维度形成关键研究缺口。
 
-其他建议（例如补证据或重规划）主要由 Agent 按提示词执行，当前尚未全部转化为运行时硬约束。
+### 5.3 停滞检测
 
-## 4. Research Evaluator：实际质量门禁
+Controller 持久化进度向量：
 
-### 4.1 五维评分
+- `coverage_ratio`；
+- `valid_source_count`；
+- `finding_count`；
+- `critical_gap_count`；
+- `quality_total`。
 
-| 维度 | 默认权重 | 当前规则侧主要依据 |
-|---|---:|---|
-| 目标覆盖度 | 20% | Controller 的加权维度覆盖率 |
-| 证据充分性 | 25% | 每个维度的有效来源数与 min_sources |
-| 来源可靠性 | 20% | 通过快照存在性/标记检查的来源占比 |
-| 结论一致性 | 20% | Finding 文本中正反向词汇与共同关键词的启发式冲突检查 |
-| 报告完整性 | 15% | 范围/方法、发现/分析、局限、结论、来源章节及报告长度 |
+当总体覆盖率提升至少 0.03、新增有效来源、新增 Finding、关键缺口减少或质量总分提升至少 2 分之一发生时，视为出现实质进展。只有 `phase_boundary`、`final_delivery` 和 `scheduled_checkpoint` 等周期触发器会累计停滞次数；普通状态查询是观察，不会被误计为一个研究周期。
 
-规则评分与 LLM 评分按 60% / 40% 合成。默认总分至少 80 分、每个维度至少 60 分；岗位 Profile 是基线，任务要求可以提高门槛。
+连续两个符合条件的周期没有改善且仍存在关键缺口时，Controller 将任务标记为停滞，并建议人工介入。
 
-### 4.2 LLM 评审边界
+## 六、Research Controller：建议与运行时约束
 
-评审通过单独的 ChatOpenAI 调用执行，不继承 Research Agent 的历史消息，温度为 0，使用相同的 `OPENAI_MODEL`、`OPENAI_BASE_URL` 和凭据配置。评审最多重试 2 次，输出 JSON 格式的五维分数、unsupported_claims、contradictions、missing_dimensions 和 actionable_repairs。
+Controller 根据研究覆盖、停滞、质量评估状态和预算阶段，返回建议动作及允许动作：
 
-当前传入的评审材料有明确上限：
-- 报告最多 16,000 字符；
-- 最多 8 个来源，每个来源取快照末尾最多 1,000 字符；
-- 最多 30 条 Finding；
-- 评审输入 JSON 最多 42,000 字符。
+| 动作 | 含义 |
+|---|---|
+| `FILL_EVIDENCE_GAP` | 针对未覆盖维度补充证据 |
+| `REPLAN` | 根据新信息修改后续研究策略 |
+| `CONTINUE_RESEARCH` | 沿当前方向继续研究 |
+| `ENTER_CONVERGENCE` | 停止新增探索，优先综合和交付 |
+| `REQUEST_HUMAN` | 将需要人工判断的情况交给操作人员 |
 
-因此，“独立”指独立调用和上下文，不代表独立模型供应商或第二套模型。来源摘录也不等于完整来源全文。
+Controller 不直接搜索资料，也不替 Agent 写计划。Agent 通过 `get_research_status` 获取覆盖矩阵和行动建议，并根据上下文选择具体工具与研究动作。
 
-### 4.3 硬阻断、修复与人工决策
+Runtime 对两类情形执行确定性约束：
 
-规则层的非空报告、来源登记和来源快照校验先执行。报告引用不存在的 source ID 会形成不可豁免硬阻断；其他报告结构或引用问题会形成可修复缺陷。存在硬阻断时跳过 LLM 评审。
+1. 预算进入收敛阶段后，工具层阻止新的搜索和来源读取，保留有限的综合、成果、记忆和证据操作。
+2. 阶段边界评估返回 `REQUEST_HUMAN` 时，任务原子地进入 `waiting_for_human`，释放 Worker 所有权并创建人工待办。
 
-最终交付通过条件包括：
-- 没有不可豁免硬阻断；
-- 没有 critical defects；
-- 加权总分及各维度分数达到阈值；
-- Reviewer 状态为 completed 或显式的 offline_rules_only。
+因此，系统采用“Agent 自主研究决策 + Controller 证据反馈 + Runtime 硬约束”的分层控制方式。
 
-当前研究注册项在 `app/agents/registry.py` 中设置 `max_revisions=3`，即初次验证后最多进行三轮交付修复。评审不可用时不会以规则评分冒充通过，而是创建人工待办；修复轮次耗尽且没有硬阻断时，仍未达标的报告也会进入人工决策。人工可继续修复、批准降级交付或终止，具体动作受待办 choices 限制。
+## 七、报告验证与质量评估
 
-配置注意：`app/agents/research/profile.toml` 中的 `quality_max_revisions=2` 会被 Evaluator 读取到 profile，但当前 Executor 的实际修订循环使用 AgentRegistration 的 `max_revisions=3`。这两个配置尚未统一；当前生效值是 3。
+### 7.1 报告结构校验 ReportValidator
 
-### 4.4 ReportValidator 实际检查项
+ReportValidator 执行确定性结构和溯源检查：
 
-ReportValidator 检查：
-- Markdown 一级标题；
-- 独立 Sources/References/参考资料章节；
-- 不含来源列表的正文最低长度；
-- 正文及来源章节中存在 URL；
-- 正文引用的 source ID 已登记；
+- 存在 Markdown 一级标题；
+- 存在独立 Sources/References/参考资料章节；
+- 正文长度达到最低要求；
+- 正文和来源章节包含直接 URL；
+- 正文引用的来源 ID 已在 Evidence Registry 登记；
 - 正文引用来源的 URL 出现在 Sources 章节；
-- 至少 40% 的合格正文段落（长度至少 80 字符）包含有效来源引用；
-- 若报告使用 Finding ID，则 ID 必须存在于登记簿。
+- 至少 40% 的合格正文段落包含有效来源引用（合格段落至少 80 个字符）；
+- 使用 Finding ID 时，该 ID 必须存在于登记簿。
 
-该门禁验证格式、来源登记和引用链，不判断来源内容是否真正蕴含报告结论。语义支持由有限上下文的 LLM Reviewer 辅助检查。
+该组件验证报告结构和来源关联，不单独证明来源内容在语义上支持结论。
 
-## 5. Recovery Manager：实际工具恢复策略
+### 7.2 ResearchEvaluator 五维评估
 
-### 5.1 工具调用生命周期
+| 维度 | 权重 | 主要评价内容 |
+|---|---:|---|
+| 目标覆盖度 | 20% | 研究维度和用户目标覆盖情况 |
+| 证据充分性 | 25% | 各维度有效来源数量与最低证据要求 |
+| 来源可靠性 | 20% | 已登记来源及快照可用性 |
+| 结论一致性 | 20% | Finding 之间可能存在的矛盾 |
+| 报告完整性 | 15% | 研究范围/方法、发现/分析、局限、结论和来源章节 |
 
-TaskEventCallback 在工具开始、结束或报错时调用 RecoveryManager。数据库中的工具调用记录包含 call_id、幂等键、工具名、参数 JSON/哈希、worker_generation、状态、尝试次数、结果摘要/哈希和错误信息。
+规则评分与 LLM 评审默认按 60% / 40% 合成。默认加权总分至少 80 分，每个维度至少 60 分；任务的 `quality_policy` 可以提高门槛。
 
-当前状态包括 running、succeeded、failed、unknown。幂等键使用 task_id、LangGraph node/step（可用时）、工具名和规范化参数哈希生成；没有图节点元数据时退化为 run_id 作用域，避免错误合并两个不同调用。
+### 7.3 独立上下文评审
 
-### 5.2 未知调用核验规则
+LLM Reviewer 通过单独的 ChatOpenAI 调用执行，不继承 Research Agent 的对话历史；但它使用同一模型配置，不代表独立模型供应商或第二套模型。
 
-Worker 心跳过期后，RecoveryManager 将未结束的调用标记为 unknown，并按工具类别核验：
+评审上下文包含用户目标、研究需求、覆盖状态、规则评分、Finding、报告和有限来源摘录。输入有明确上限：报告最多 16,000 字符，最多 8 个来源且每个来源最多 1,000 字符摘录，最多 30 条 Finding，最终评审输入 JSON 最多 42,000 字符。
 
-| 工具类型 | 当前处理 |
+Reviewer 输出五维分数、unsupported claims、contradictions、missing dimensions 和 actionable repairs。评审响应必须符合结构化 JSON 契约；评审不可用时，生产流程不会将规则分数直接冒充为独立评审通过，而是创建人工待办。
+
+### 7.4 修复与交付
+
+研究岗位通过 Registry 注册 `max_revisions=3`，Executor 在初次验证后最多进行三轮交付修复。每轮修复只针对结构化缺陷补充研究或修订报告，避免重复已完成且有证据的工作。
+
+交付前要求：
+
+- 报告文件存在且非空；
+- ReportValidator 通过；
+- 不存在不可豁免硬阻断；
+- 无 critical defects；
+- 总分和单维度分数达到门槛；
+- Reviewer 状态满足当前交付策略。
+
+通过后，Executor 重新读取报告、计算 SHA-256 并记录 `report_delivered`。若评审不可用或有限修复后仍未达到质量门槛，则保留报告和评估记录，进入人工决策。
+
+## 八、长任务执行、异常恢复与一致性
+
+### 8.1 Worker 与任务状态
+
+FastAPI 只负责任务操作，Worker 在后台独立运行。Worker 通过 SQLite 全局租约协调单机单 Worker 执行，并周期性更新心跳。
+
+领取任务时增加 `worker_generation`。数据库关键写操作在事务内重新检查任务状态、`worker_id` 和 `worker_generation`，防止失去所有权的旧 Worker 在新 Worker 接管后继续写入。
+
+任务状态包括：
+
+`queued`、`running`、`retry_wait`、`paused`、`waiting_for_human`、`completed`、`failed`、`cancelled`、`deleting`、`archived`。
+
+### 8.2 图执行检查点 LangGraph Checkpoint
+
+Executor 使用 `task_id` 作为 LangGraph `thread_id`。首次执行创建图状态；暂停、人工决策或失败重试后，在保留原任务 ID 和工作区的情况下读取 Checkpoint，继续尚未完成的图执行。
+
+Checkpoint 保存 Agent 消息和图节点状态，不取代任务数据库，也不取代工作区中的研究资料。
+
+### 8.3 工具调用生命周期
+
+工具调用进入持久化台账，记录：
+
+- `call_id`、工具名称和输入参数；
+- 输入哈希和幂等键；
+- `worker_generation`；
+- running、succeeded、failed 或 unknown 状态；
+- 结果摘要/哈希和错误信息。
+
+`begin_tool_call` 将开始记录与事件原子写入；工具终态与对应事件也在同一数据库事务中提交。重复且一致的终态回调不会重复插入事件，矛盾终态会被拒绝。
+
+### 8.4 恢复核验策略
+
+Worker 心跳过期后，RecoveryManager 先将未完成调用标记为 unknown，再按工具类型核验：
+
+| 工具类别 | 恢复策略 |
 |---|---|
-| web_search、fetch_url、fetch_pdf、GitHub、arXiv | 只读请求无法从本地证明远端响应，允许重新请求并保留原调用记录 |
-| save_artifact | 读取目标文件；内容与原始输入完全一致时标记成功，否则允许重试 |
-| record_finding | 查找完全匹配的 claim、source_ids 和 dimension_id；找到则标记成功 |
-| update_research_plan | 比较规范化后的最新计划与本次输入；完全一致才标记成功 |
-| update_plan_step_status | 比较步骤 ID、状态、备注、计划版本；完成状态还要求对应产物路径验证事件 |
-| define_research_requirements | 比较规范化后的当前要求与本次输入；完全一致才标记成功 |
-| 未知工具 | 不盲目重放，要求人工处理 |
+| 搜索、网页/PDF、GitHub、arXiv 等只读请求 | 本地无法证明远端响应是否已返回，允许按预算重新请求并保留原调用记录 |
+| `save_artifact` | 读取目标文件；内容与原始输入完全一致才确认成功 |
+| `save_research_memory` | 读回研究记忆并核验内容 |
+| `record_finding` | 检查登记簿是否已有完全匹配的 Finding |
+| `update_research_plan` | 对比当前计划事件、计划文件和版本 |
+| `update_plan_step_status` | 对比步骤状态、计划版本和已验证产物 |
+| `define_research_requirements` | 对比当前研究要求矩阵 |
+| 无法自动核验的工具 | 不盲目重放，进入人工处理 |
 
-这不是外部服务的 exactly-once 保证。只读请求在恢复后可能重复发送；已知写入只有在本地持久化事实能够证明时才自动确认。
+恢复管理器还会检查 Checkpoint SQLite 数据库、表结构和对应 `thread_id`。如果发现 Checkpoint 损坏或工具副作用存在歧义，任务进入 `waiting_for_human`；只有能够安全恢复时才重新入队并复用原 Checkpoint。
 
-### 5.3 Checkpoint 与任务恢复
+这是一种保守的副作用核验机制，不宣称外部服务 exactly-once。只读外部请求在恢复后可能重复发送；已知写操作只有在持久化事实能够证明时才自动确认。
 
-RecoveryManager 检查 Checkpoint SQLite 数据库、必要表结构以及对应 task_id 是否存在 checkpoint 行。发现数据库/表结构损坏，或存在无法自动核验的工具类型时，创建 `recovery_conflict` 人工待办；该类冲突默认只允许终止，避免在状态不明时继续执行。
+### 8.5 错误分类和重试
 
-没有歧义时，Worker 执行 stale-task requeue：结算未完成 Token reservation、将任务重新置为 queued、设置 resume_mode，并由 Executor 使用原 task_id/thread_id 恢复 LangGraph Checkpoint。该流程先进行工具调用核验，再进行任务重新入队。
+Runtime 将错误区分为任务控制信号、可重试错误和终态错误。网络超时、限流和上游服务暂时不可用等错误可进入有限重试；认证、权限、不可恢复参数和明确硬预算耗尽等情况进入终态处理。
 
-Checkpoint 检查是数据库结构和 thread 记录级检查，不等同于对图状态语义正确性的完整证明。
+默认重试采用有上限的指数退避。操作人员可通过任务重试接口重新入队，复用已有 Checkpoint 和工作区。
 
-## 6. SQLite 数据模型与迁移
+## 九、资源预算与收敛
 
-当前关键表：
+研究岗位默认资源预算：
 
-| 表 | 作用 |
+| 资源 | 默认值 |
+|---|---:|
+| 工具调用次数 | 30 |
+| 累计运行时间 | 3,600 秒 |
+| Token | 100,000 |
+
+模型调用前，Runtime 预留启发式输入 Token 估算、4,096 Token 输出上限和 256 Token 固定开销；模型响应后可用时使用 Provider usage 结算。Token 估算用于预算保护，不等同于 Provider 精确计量。
+
+收敛阶段保护：
+
+- Token 预算的 30%；
+- 工具调用次数的 25%；
+- 累计运行时间的 20%。
+
+预留还受最小值和最多预留总额一半的规则约束。当探索额度触及收敛边界时，系统阻止新的搜索和来源读取，将剩余额度用于证据整理、报告综合、保存、读回、验证和修复。预算硬上限仍然生效；扩额需要操作人员明确批准。
+
+## 十、人工干预与自然语言决策
+
+人工干预是长任务的受控分支，而不是让用户理解内部 JSON 结构。
+
+当前主要待办类型包括：
+
+- 研究停滞且关键维度仍有缺口；
+- 独立质量评审不可用；
+- 有限修复后质量仍未达到门槛；
+- Checkpoint 或工具副作用无法安全核验。
+
+API 接收 `action`、自然语言 `instruction`、`reason` 和必要的 `confirm`。系统校验该待办允许的动作并保存决策；不会要求用户手动填写研究维度 JSON。
+
+任务恢复时，Executor 将人工指令以稳定消息 ID 注入 Agent 上下文。Agent 读取人工决策和当前研究状态，再决定如何处理：
+
+- 补充研究要求：保留已有维度，将用户自然语言转化为完整研究需求矩阵；
+- 改变研究方向：按五项审计字段提交完整的新计划；
+- 继续研究或修复：保留已验证工作，优先处理尚未解决的问题；
+- 批准降级交付：必须显式确认并填写原因，报告读回核验后记录人工批准；
+- 终止：结束任务并保留审计记录。
+
+若 Checkpoint 停留在待执行工具节点，新的人工指令会优先于尚未执行的旧工具批次，避免人工决策后继续执行已被替代的操作。
+
+## 十一、可观测性与开发者诊断
+
+任务事件在写入 SQLite 后通过 SSE 推送。事件 ID 单调递增，前端可通过 `Last-Event-ID` 或 `after_id` 续传。
+
+开发者可以从不同视角检查同一任务：
+
+| 观察对象 | 主要问题 |
 |---|---|
-| tasks | 任务状态、预算、Worker 所有权、generation、错误历史 |
-| events | 按 event_id 排序的执行审计日志 |
-| token_reservations | 模型调用 Token 预留和结算 |
-| worker_lease | 全局单 Worker 租约 |
-| schema_migrations | 迁移版本标记 |
-| research_control_state | 研究要求、覆盖快照、进度向量、停滞计数 |
-| quality_assessments | 五维分数、硬阻断、缺陷、Reviewer 结果 |
-| tool_calls | 工具调用生命周期和幂等键 |
-| recovery_decisions | 恢复核验与决策记录 |
-| human_interventions | 待处理人工请求和决策 |
+| 事件时间线 | 任务按什么顺序执行，哪里发生错误或重试 |
+| 模型调用 | 使用了什么可观察输入/输出，耗时和 Token 如何 |
+| 工具调用 | 调用了什么工具、参数和结果是什么、是否存在未知副作用 |
+| 研究计划 | 当前战略、版本历史和步骤进度是什么 |
+| 证据登记簿 | 哪些来源被读取，哪些 Finding 支持哪些维度 |
+| 研究控制状态 | 覆盖率、关键缺口、停滞和建议动作是什么 |
+| 质量评估 | 哪些维度未达标，硬阻断和修复建议是什么 |
+| 预算与恢复 | 资源消耗、收敛阶段、恢复核验结果和人工待办是什么 |
+| Artifact | 中间成果和最终报告实际保存了什么 |
 
-当前迁移采用增量列检查，并使用 schema_migrations 的版本 1 标记一次性归档逻辑。首次执行时，generation 1 的 queued/running/retry_wait/paused/waiting_for_human 任务转为 archived，并记录 archived_from_status；新建任务显式设置 generation 2。Worker 只领取 generation 2。迁移不会自动接管旧任务的历史 Checkpoint。当前代码没有实现原设计稿所述的“所有迁移统一在一个 BEGIN IMMEDIATE 事务内完成”，因此不应将迁移描述为全流程原子事务。
+执行轨迹记录模型和工具的可观察输入、输出、耗时和错误，不记录隐藏思维链。
 
-## 7. 实际 API
+## 十二、关键设计验证
 
-当前已实现的研究相关接口：
+| 测试 | 验证目标 |
+|---|---|
+| `tests/test_autonomous_research_e2e.py` | 实际工具证据改变时，模型决策是否相应改变；矛盾证据触发重规划，支持性证据保留原计划；质量反馈驱动定向修复 |
+| `tests/test_process_crash_recovery.py` | 在 Artifact 写入、工具调用开始和 Checkpoint 保存等真实子进程边界中断后，能否核验副作用并安全恢复 |
+| `tests/test_worker_fencing_races.py` | Worker 接管、执行代次隔离、终态竞争和事务回滚 |
+| `tests/test_recovery_consistency.py` | 不同工具类型的恢复策略和跨存储一致性 |
+| `tests/test_research_lifecycle.py` | 研究需求、覆盖率、停滞、质量评估和人工干预 |
+| `tests/test_report_validator.py` | 报告结构、来源 ID、URL 和段落级引用检查 |
+| `tests/test_budget_gates.py` | 工具、Token 和运行时间预算闸门 |
+| `tests/test_role_extensibility.py` | 第二岗位在测试环境中复用公共 API、Worker、Executor、Checkpoint 和预算 |
+| `tests/test_documentation.py` | 文档编码、源码路径引用和关键设计声明 |
 
-| 方法 | 路径 | 用途 |
-|---|---|---|
-| GET | `/tasks/{task_id}/research` | 研究控制状态、最近质量评估、恢复决策、待处理人工请求和决策历史 |
-| GET | `/tasks/{task_id}/evidence` | 证据登记簿摘要 |
-| GET | `/tasks/{task_id}/memory` | 当前持久化研究记忆 |
-| GET | `/tasks/{task_id}/budget` | 预算用量、收敛预留和当前阶段 |
-| POST | `/tasks/{task_id}/budget/approve` | 批准预算扩展 |
-| POST | `/tasks/{task_id}/human-intervention/resolve` | 解析指定人工待办 |
+自动化测试使用确定性模型和 HTTP 测试替身，重点验证真实生产 Builder、Worker、Executor、SQLite 和 Checkpoint 的控制链路。真实模型的研究判断质量、Provider 长期稳定性和真实外部服务联合故障仍需通过部署冒烟和故障注入进一步验证。
 
-其他任务、事件、SSE、成果和控制接口见 README。当前没有独立的 `/research-state`、`/quality`、`/recovery` 或 `/continue` 路由；这些是早期设计草案中的接口名，不是当前 API。
+## 十三、实现范围
 
-## 8. 可观测事件
+当前版本以单机单 Worker 和 Research Agent 为运行基线。Agent Registry 已提供岗位独立构建、Profile、产物、校验、修复、Finalizer 和预算契约；第二岗位在测试中验证公共运行时复用。多 Worker 并发、多主机调度和多岗位生产编排属于后续扩展方向。
 
-执行事件保存在 SQLite，再通过 SSE 推送。关键事件包括：
-- 任务生命周期、Worker heartbeat/recovery、retry 和错误分类；
-- 模型调用开始/完成/失败、Token reservation/settlement；
-- 工具调用开始/完成/失败及工具调用恢复；
-- 研究计划更新、步骤进度、研究要求更新；
-- 研究覆盖评估、控制决策、阶段边界观察；
-- 质量评估、交付校验、修复耗尽、报告交付；
-- 人工干预请求、决策解析和决策消费。
-
-SSE 使用 event_id 作为恢复游标。执行轨迹记录模型和工具的可观察输入/输出摘要，不采集隐藏思维链。
-
-## 9. 预算策略
-
-研究岗位默认值来自 `app/agents/research/profile.toml`：
-- max_steps = 30
-- max_runtime_seconds = 3600
-- max_total_tokens = 100000
-
-主 Agent 模型每次调用前预留：启发式输入 Token 估算 + 4096 输出 Token + 256 固定开销。输入估算结合 CJK 字符比例和 UTF-8 字节长度；Provider usage 是可用时的结算依据。主模型 max_tokens 设置为 4096；Evaluator 评审调用 max_tokens 为 1400。
-
-收敛保护预留比例为 Token 30%、工具调用 25%、运行时间 20%，并应用最小预留和最多预留一半的规则。达到某一维度的探索额度上限后，进入 convergence，工具层阻止新的搜索/读取，保留有限的成果、记忆、证据和进度操作。预算硬上限耗尽会导致终态失败；批准扩额后可以恢复已有 Checkpoint。
-
-## 10. 当前验证覆盖与尚未证明的事项
-
-离线测试重点覆盖：
-- Controller 研究要求、覆盖率、停滞和人工停车；
-- Evaluator 五维规则评分、评审失败和交付修复；
-- ReportValidator 来源 ID、URL、段落引用和快照检查；
-- RecoveryManager 未知工具调用分类、Artifact/Finding/计划/进度核验；
-- Worker 租约、过期任务、Checkpoint 恢复和预算闸门；
-- 人工决策注入、降级交付读回校验；
-- API、SSE、事件脱敏和前端轨迹更新。
-
-主要测试文件：`tests/test_research_lifecycle.py`、`tests/test_executor_recovery.py`、`tests/test_report_validator.py`、`tests/test_budget_gates.py`、`tests/test_worker.py`、`tests/test_api.py`。
-
-GitHub Actions 的离线测试使用测试替身，不代表真实模型已自主完成一项研究，也不代表真实外部调用期间的进程崩溃恢复已经完成端到端验证。真实模型、Tavily、GitHub MCP 和 arXiv 联合运行仍需单独冒烟测试与故障注入。
-
-## 11. 明确的实现边界
-
-1. **快照完整性不是防篡改校验。** EvidenceRegistry 保存内容 SHA-256 元数据；Controller、Evaluator 和 ReportValidator 当前主要检查快照文件存在及其中包含 hash/URL 标记，没有重新计算提取正文的 SHA-256。Artifact 工具也没有对 evidence 命名空间设置只读保护。
-2. **控制器不是自主执行调度器。** 除预算工具闸门和 REQUEST_HUMAN 停车外，大部分研究控制建议由 Agent 遵循提示词执行。
-3. **评审不是独立模型投票。** Reviewer 使用相同模型配置，只隔离调用上下文；评审材料经过截断，规则冲突检查也属于启发式。
-4. **恢复不是 exactly-once。** 只读外部请求允许重试，可能重复发送；Checkpoint 检查不证明完整图状态语义。
-5. **岗位抽象尚未彻底解耦。** 只有 research 岗位注册，Executor 仍包含 research-specific 分支；多岗位并行调度尚未实现。
-6. **迁移原子性有限。** 当前增量迁移有版本标记和旧任务归档逻辑，但不应宣称所有迁移操作被单一事务整体包裹。
-
-
-## 条件决策、原子恢复与离线验证
-
-`tests/test_autonomous_research_e2e.py` 使用 `ConditionalResearchModel` 读取实际对话和工具结果，保留生产 Deep Agents Builder、Profile、System Prompt、工具注册、Worker、Executor 和真实 SQLite Checkpoint。矛盾证据触发战略重规划及完整审计；支持性证据保持 V1 计划；反事实测试仅替换证据内容，验证后续行动变化。质量反馈触发定向修订，无效评审和修复耗尽均阻止自动交付。自动化结果证明模拟决策下的工程链路，不证明真实模型研究判断。
-
-Database 通过 `BEGIN IMMEDIATE` 在同一事务中检查任务状态、`worker_id`、`worker_generation`，再更新工具终态和对应事件。开始记录与开始事件也原子提交。任务完成、失败、暂停、取消、重试的状态、预留预算释放和对应事件在同一事务中执行。相同终态的重复回调不增加事件，矛盾终态被拒绝；生产工具重放保护复用已成功调用的持久化结果，不确定写操作先核验或转人工。已确认的 Artifact 写入通过精确读回避免重复改写。
-
-`tests/test_worker_fencing_races.py` 使用独立线程和真实 SQLite 连接验证接管竞态、终态竞争和事件插入失败回滚。`tests/test_process_crash_recovery.py` 使用跨平台 spawn 子进程和 Pipe 屏障，在 Artifact 写入后、工具开始后、Checkpoint 首节点保存后强制终止进程，再验证恢复、generation 增加、消息保留和副作用不重复。损坏 Checkpoint 保留现场并转人工。`tests/test_recovery_consistency.py` 保留原有跨存储和副作用核验测试。
-
-`tests/test_role_extensibility.py` 的分析岗位只用于测试，不是生产默认岗位。它复用 API、公共 Worker/Executor、预算和 Checkpoint，拥有自己的 JSON 产物校验和 Finalizer，覆盖暂停后恢复、取消和暂时错误重试，不触发研究专属质量评估。系统仍是单机单 Worker，不承诺多岗位并行。
-
-`tests/test_documentation.py` 检查 UTF-8、非空文档、连续问号/替换字符、中文段落和文档引用路径。所有自动化模型、Reviewer、HTTP 数据均为模拟响应，不调用真实模型 API、不产生真实 Token 费用。测试阻断外网连接，DNS 使用确定性替身；Windows asyncio 所需本地唤醒套接字仍允许。CI 运行全量 pytest 和前端 JavaScript 语法检查。
-
-数据库事务只覆盖任务库。Checkpoint、工作区文件与任务库之间通过核验协调，不是分布式原子事务。真实 Provider 行为、真实模型质量、多主机文件并发和外部服务恰好执行一次仍需真实环境验证；冲突不得以覆盖文件或台账消除。
+当前设计已验证的核心闭环是：**Agent 自主研究 → 证据登记与覆盖评估 → 根据新信息调整计划 → 质量门禁与有限修复 → 任务持久化、异常恢复和过程审计**。
