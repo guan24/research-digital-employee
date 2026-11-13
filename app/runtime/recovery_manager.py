@@ -106,7 +106,10 @@ class RecoveryManager:
                     if persisted == content:
                         self.db.finish_tool_call(task_id, call_id, "recovered by exact artifact read-back")
                         return {"action": "mark_succeeded", "confidence": "high",
-                                "reason": "目标 Artifact 与原始写入内容完全一致。", "path": path}
+                                "reason": "目标 Artifact 与原始写入内容完全一致。",
+                                "path": path,
+                                "sha256": hashlib.sha256(persisted.encode("utf-8")).hexdigest(),
+                                "bytes": len(persisted.encode("utf-8"))}
                 except (OSError, ValueError):
                     pass
             return {"action": "retry_allowed", "confidence": "medium",

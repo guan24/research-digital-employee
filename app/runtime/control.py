@@ -22,3 +22,7 @@ class TaskStepLimitExceeded(TaskControlSignal):
 
 class WorkerLeaseLost(TaskControlSignal):
     """The current execution no longer owns its worker/task generation."""
+
+
+class TaskWaitingForHuman(TaskControlSignal):
+    """Execution was deliberately parked for an explicit human decision."""

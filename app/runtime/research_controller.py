@@ -58,9 +58,23 @@ class ResearchController:
                 "min_sources": min_sources,
             })
             seen.add(dimension_id)
+        quality_policy = value.get("quality_policy") or {}
+        if not isinstance(quality_policy, dict):
+            raise ValueError("quality_policy must be an object")
+        normalized_policy = {}
+        for key in ("min_total_score", "min_dimension_score"):
+            if key in quality_policy:
+                score = float(quality_policy[key])
+                if not 0 <= score <= 100:
+                    raise ValueError(f"quality_policy.{key} must be between 0 and 100")
+                normalized_policy[key] = score
+        unknown_policy = set(quality_policy) - {"min_total_score", "min_dimension_score"}
+        if unknown_policy:
+            raise ValueError("unsupported quality_policy fields: " + ", ".join(sorted(unknown_policy)))
         return {
             "schema_version": 1,
             "dimensions": dimensions,
+            "quality_policy": normalized_policy,
             "source": str(value.get("source") or "agent"),
         }
 
@@ -76,7 +90,8 @@ class ResearchController:
             key for key in set(current_dimensions) & set(previous_dimensions)
             if current_dimensions[key] != previous_dimensions[key]
         )
-        if previous and not (added or removed or changed):
+        policy_changed = (previous.get("quality_policy") or {}) != (normalized.get("quality_policy") or {})
+        if previous and not (added or removed or changed or policy_changed):
             return {"saved": False, "version": int(current.get("requirements_version") or 1),
                     "message": "No material research requirement change."}
         version = int(current.get("requirements_version") or 0) + 1
@@ -95,8 +110,12 @@ class ResearchController:
         self.db.add_event(self.task_id, "research_requirements_updated", {
             "version": version, "source": source, "dimension_count": len(normalized["dimensions"]),
             "added": added, "removed": removed, "changed": changed,
+            "quality_policy_changed": policy_changed,
+            "quality_policy": normalized.get("quality_policy") or {},
         })
-        return {"saved": True, "version": version, "added": added, "removed": removed, "changed": changed}
+        return {"saved": True, "version": version, "added": added, "removed": removed,
+                "changed": changed, "quality_policy_changed": policy_changed,
+                "quality_policy": normalized.get("quality_policy") or {}}
 
     def ensure_requirements(self, plan: dict[str, Any] | None) -> dict[str, Any]:
         state = self.db.get_research_control_state(self.task_id) or {}
@@ -192,20 +211,32 @@ class ResearchController:
                 "coverage_ratio": round(ratio, 4),
             })
         coverage_ratio = weighted_covered / total_weight if total_weight else 0.0
+        previous = state.get("progress_vector") or {}
+        latest_assessments = self.db.list_quality_assessments(self.task_id, limit=1)
+        quality_total = (
+            float(latest_assessments[-1].get("total_score") or 0)
+            if latest_assessments else float(previous.get("quality_total") or 0)
+        )
         progress_vector = {
             "coverage_ratio": round(coverage_ratio, 4),
             "valid_source_count": sum(item["valid_source_count"] for item in dimensions),
             "finding_count": len(findings),
             "critical_gap_count": len(critical_gaps),
+            "quality_total": round(quality_total, 2),
         }
-        previous = state.get("progress_vector") or {}
         improved = (
             progress_vector["coverage_ratio"] - float(previous.get("coverage_ratio") or 0) >= 0.03
             or progress_vector["valid_source_count"] > int(previous.get("valid_source_count") or 0)
             or progress_vector["finding_count"] > int(previous.get("finding_count") or 0)
             or progress_vector["critical_gap_count"] < int(previous.get("critical_gap_count") or 0)
+            or progress_vector["quality_total"] - float(previous.get("quality_total") or 0) >= 2.0
         )
-        stagnation = 0 if improved or not previous else int(state.get("stagnation_count") or 0) + 1
+        # Status inspection by the Agent is observational, not a research cycle.
+        cycle_trigger = trigger in {"phase_boundary", "final_delivery", "scheduled_checkpoint"}
+        previous_stagnation = int(state.get("stagnation_count") or 0)
+        stagnation = 0 if improved else (
+            previous_stagnation + 1 if cycle_trigger and previous else previous_stagnation
+        )
         snapshot = {
             "trigger": trigger,
             "requirements_version": int(state.get("requirements_version") or requirements.get("version") or 1),
@@ -238,7 +269,11 @@ class ResearchController:
     def decide(self, coverage: dict[str, Any], budget: dict[str, Any],
                quality: dict[str, Any] | None = None) -> dict[str, Any]:
         phase = str(budget.get("phase") or "research")
-        if phase == "convergence":
+        if quality and (quality.get("reviewer") or {}).get("status") == "unavailable":
+            recommended = "REQUEST_HUMAN"
+            allowed = ["REQUEST_HUMAN", "ENTER_CONVERGENCE"]
+            reason = "独立质量评审连续失败或不可用，不能以规则评分替代评审结论。"
+        elif phase == "convergence":
             recommended = "ENTER_CONVERGENCE"
             allowed = ["ENTER_CONVERGENCE", "REQUEST_HUMAN"]
             reason = "预算已进入收敛阶段，停止新增探索并优先完成综合与交付。"

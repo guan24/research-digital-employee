@@ -229,8 +229,13 @@ class ResearchEvaluator:
         elif allow_llm:
             sources = [{key: item.get(key) for key in ("source_id", "title", "url", "source_type", "verified")}
                        for item in registry.get("sources", []) if isinstance(item, dict)]
-            findings = [{key: item.get(key) for key in ("finding_id", "dimension_id", "claim", "source_ids", "confidence")}
-                        for item in registry.get("findings", []) if isinstance(item, dict)]
+            findings = [{
+                "finding_id": item.get("finding_id"),
+                "dimension_id": item.get("dimension_id"),
+                "claim": str(item.get("claim") or "")[:500],
+                "source_ids": list(item.get("source_ids") or [])[:8],
+                "confidence": item.get("confidence"),
+            } for item in registry.get("findings", []) if isinstance(item, dict)]
             context = {
                 "goal": task.get("goal", ""),
                 "requirements": (self.db.get_research_control_state(self.task_id) or {}).get("requirements", {}),

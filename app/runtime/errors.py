@@ -3,7 +3,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from app.runtime.control import (
     TaskPaused, TaskCancelled, TaskDeadlineExceeded, TaskStepLimitExceeded,
-    WorkerLeaseLost, TaskControlSignal,
+    WorkerLeaseLost, TaskControlSignal, TaskWaitingForHuman,
 )
 
 
@@ -34,6 +34,7 @@ def classify_exception(exc: BaseException) -> tuple[str, str, bool]:
         TaskDeadlineExceeded: ("control", "RUNTIME_BUDGET_EXHAUSTED"),
         TaskStepLimitExceeded: ("control", "TOOL_STEP_BUDGET_EXHAUSTED"),
         WorkerLeaseLost: ("control", "WORKER_LEASE_LOST"),
+        TaskWaitingForHuman: ("control", "WAITING_FOR_HUMAN"),
         BudgetExhausted: ("control", "TOKEN_BUDGET_EXHAUSTED"),
     }
     for kind, result in control.items():

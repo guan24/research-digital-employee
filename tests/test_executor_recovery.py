@@ -91,6 +91,75 @@ def test_executor_recovers_completed_checkpoint_without_reinvoking(settings, db)
 
 
 
+def test_executor_runs_integrated_evidence_and_quality_delivery_loop(settings, db):
+    from app.infrastructure.evidence_registry import EvidenceRegistry
+    from app.runtime.research_controller import ResearchController
+
+    task = db.create_task("研究 Agent 生命周期闭环")
+    task = db.claim_next_task("worker-quality-loop")
+    artifacts = ArtifactStore(settings.workspace_dir, task["task_id"])
+    registry = EvidenceRegistry(artifacts)
+    source = registry.register_source(
+        url="https://example.org/architecture",
+        title="Primary architecture source",
+        content="The primary source documents the architecture, state persistence and recovery semantics. " * 12,
+    )
+    registry.record_finding(
+        claim="The system persists graph state and resumes pending work after interruption.",
+        source_ids=[source["source_id"]],
+        rationale="Verified against the immutable source snapshot.",
+        confidence="high",
+        dimension_id="architecture",
+    )
+    ResearchController(db, task["task_id"], artifacts).define_requirements({
+        "dimensions": [{
+            "id": "architecture", "title": "系统架构", "questions": ["状态如何持久化和恢复？"],
+            "expected_evidence": ["一手架构资料"], "priority": "critical", "min_sources": 1,
+        }]
+    })
+    report = (
+        "# 研究报告\n\n"
+        "## 研究范围与方法\n\n"
+        + ("本研究依据登记的一手架构资料分析状态持久化与任务恢复机制，并将关键结论与来源快照逐项核对 [S0001]。 " * 3)
+        + "\n\n## 主要发现\n\n"
+        + ("系统使用持久化执行状态恢复中断任务，来源快照支持这一实现判断，并记录了相应证据边界 [S0001]。 " * 3)
+        + "\n\n## 局限性\n\n"
+        + ("当前验证覆盖单 Worker 的离线恢复路径，尚未覆盖多主机并发执行和外部服务长期故障 [S0001]。 " * 3)
+        + "\n\n## 结论\n\n"
+        + ("该实现能够为单 Worker 长任务提供可追踪的状态恢复基础，仍需通过故障注入进一步验证边界 [S0001]。 " * 3)
+        + "\n\n## Sources\n\n- https://example.org/architecture\n"
+    )
+
+    class LifecycleAgent:
+        def get_state(self, config):
+            return None
+        def invoke(self, payload, config):
+            callback = config["callbacks"][0]
+            callback.on_tool_start({"name": "web_search"}, '{"query":"architecture"}', run_id="quality-loop-tool")
+            callback.on_tool_end('{"results":[]}', run_id="quality-loop-tool")
+            return {"messages": [{"role": "assistant", "content": report}]}
+
+    reviewer = lambda _: {"scores": {key: 95 for key in (
+        "goal_coverage", "evidence_sufficiency", "source_reliability",
+        "conclusion_consistency", "report_completeness")}}
+    agent = LifecycleAgent()
+    runner = ResearchExecutor(
+        settings, db,
+        agent_builder=lambda *_args: agent,
+        checkpointer_factory=fake_checkpointer,
+        research_reviewer=reviewer,
+        quality_review_enabled=True,
+    )
+    output = runner.run(task)
+    assert Path(output).read_text(encoding="utf-8").startswith("# 研究报告")
+    assessments = db.list_quality_assessments(task["task_id"])
+    assert len(assessments) == 1 and assessments[0]["passed"] is True
+    events = db.get_events(task["task_id"])
+    assert any(event["event_type"] == "research_phase_boundary_observed" for event in events)
+    delivered = next(event for event in events if event["event_type"] == "report_delivered")
+    assert delivered["payload"]["quality_assessment_id"] == assessments[0]["assessment_id"]
+
+
 def test_manual_retry_resumes_original_checkpoint_thread_id(settings, db):
     task = db.create_task("Research a topic with enough detail", max_attempts=1)
     claimed = db.claim_next_task("worker-a")

@@ -1070,12 +1070,14 @@ class ResearchToolService(TaskToolService):
             return json.dumps(finding, ensure_ascii=False)
 
         @tool("define_research_requirements")
-        def define_research_requirements_tool(dimensions: list[dict[str, Any]]) -> str:
-            """Define the research coverage matrix after the initial plan. Each dimension needs id, title, questions, expected_evidence, priority and min_sources."""
+        def define_research_requirements_tool(
+            dimensions: list[dict[str, Any]], quality_policy: dict[str, Any] | None = None
+        ) -> str:
+            """Define the research coverage matrix. Optional quality_policy may only raise the role baseline min_total_score and min_dimension_score."""
             self.check_control()
             from app.runtime.research_controller import ResearchController
             result = ResearchController(self.db, self.task_id, self.artifacts).define_requirements(
-                {"dimensions": dimensions}, source="agent"
+                {"dimensions": dimensions, "quality_policy": quality_policy or {}}, source="agent"
             )
             return json.dumps(result, ensure_ascii=False, indent=2)
 
@@ -1083,17 +1085,10 @@ class ResearchToolService(TaskToolService):
         def get_research_status_tool() -> str:
             """Inspect current research-dimension coverage, critical evidence gaps, stagnation and the controller action recommendation."""
             self.check_control()
-            from app.runtime.research_controller import ResearchController
-            controller = ResearchController(self.db, self.task_id, self.artifacts)
-            events = self.db.get_events(self.task_id, limit=5000)
-            plan_event = next((event for event in reversed(events)
-                               if event.get("event_type") == "research_plan_updated"), None)
-            plan = (plan_event or {}).get("payload", {}).get("plan") or {}
-            coverage = controller.assess_coverage(
-                EvidenceRegistry(self.artifacts).summary(), plan, trigger="agent_query"
-            )
-            decision = controller.decide(coverage, self.db.get_budget_status(self.task_id))
-            return json.dumps({"coverage": coverage, "decision": decision}, ensure_ascii=False, indent=2)
+            from app.runtime.lifecycle_coordinator import ResearchLifecycleCoordinator
+            coordinator = ResearchLifecycleCoordinator(self.settings, self.db, self.task_id, self.artifacts)
+            result = coordinator.assess_progress("agent_query")
+            return json.dumps(result, ensure_ascii=False, indent=2)
 
         @tool("get_evidence_registry")
         def get_evidence_registry_tool() -> str:

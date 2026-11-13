@@ -172,12 +172,70 @@ def test_research_evaluator_combines_rule_and_independent_review(settings, db):
     assert assessment["passed"] is True
     assert assessment["total_score"] >= 80
     assert set(received) == {
-        "goal", "requirements", "coverage", "sources", "findings",
-        "rule_scores", "rule_defects", "report",
+        "goal", "requirements", "coverage", "registered_source_count", "sources",
+        "findings", "rule_scores", "rule_defects", "report_sha256", "report",
     }
+    assert received["sources"][0]["snapshot_excerpt"]
+    assert assessment["report_sha256"] == assessment["reviewer"]["report_sha256"]
     saved = db.list_quality_assessments(task["task_id"])
     assert len(saved) == 1
     assert saved[0]["assessment_id"] == assessment["assessment_id"]
+
+
+def test_research_evaluator_raises_task_quality_threshold_without_allowing_lowering(settings, db):
+    task = _running_task(db)
+    artifacts = ArtifactStore(settings.workspace_dir, task["task_id"])
+    registry, _, _ = _registered_evidence(artifacts)
+    controller = ResearchController(db, task["task_id"], artifacts)
+    controller.define_requirements({
+        "dimensions": [{
+            "id": "architecture", "title": "架构机制", "questions": ["如何执行？"],
+            "expected_evidence": ["官方源码"], "priority": "critical", "min_sources": 1,
+        }],
+        "quality_policy": {"min_total_score": 92, "min_dimension_score": 75},
+    })
+    coverage = controller.assess_coverage(registry.summary())
+    reviewer = lambda _: {"scores": {key: 95 for key in (
+        "goal_coverage", "evidence_sufficiency", "source_reliability",
+        "conclusion_consistency", "report_completeness")}}
+    evaluator = ResearchEvaluator(
+        settings, db, task["task_id"], artifacts, reviewer=reviewer,
+        profile={"weights": {key: value for key, value in zip(
+            ("goal_coverage", "evidence_sufficiency", "source_reliability",
+             "conclusion_consistency", "report_completeness"), (20, 25, 20, 20, 15))},
+            "min_total_score": 80, "min_dimension_score": 60, "rule_ratio": 0.6},
+    )
+    report = "# 研究报告\n\n## 研究范围与方法\n范围。\n\n## 主要发现\n发现。\n\n## 局限性\n局限。\n\n## 结论\n结论。\n\n## Sources\n- https://github.com/example/project\n" + ("补充证据分析。" * 200)
+    assessment = evaluator.evaluate(task, report, registry.summary(), coverage, allow_llm=True)
+    assert assessment["thresholds"]["min_total_score"] == 92
+    assert assessment["thresholds"]["min_dimension_score"] == 75
+    assert assessment["passed"] is True
+
+    controller.define_requirements({
+        "dimensions": [{
+            "id": "architecture", "title": "架构机制", "questions": ["如何执行？"],
+            "expected_evidence": ["官方源码"], "priority": "critical", "min_sources": 1,
+        }],
+        "quality_policy": {"min_total_score": 40, "min_dimension_score": 20},
+    })
+    lower = evaluator.evaluate(task, report, registry.summary(), coverage, allow_llm=True)
+    assert lower["thresholds"]["min_total_score"] == 80
+    assert lower["thresholds"]["min_dimension_score"] == 60
+
+
+def test_research_evaluator_rejects_missing_independent_review_dimension(settings, db):
+    task = _running_task(db)
+    artifacts = ArtifactStore(settings.workspace_dir, task["task_id"])
+    evaluator = ResearchEvaluator(
+        settings, db, task["task_id"], artifacts,
+        reviewer=lambda _: {"scores": {"goal_coverage": 90}},
+    )
+    try:
+        evaluator.review_with_llm({"goal": "test"})
+    except ValueError as exc:
+        assert "omitted score dimension" in str(exc)
+    else:
+        raise AssertionError("incomplete reviewer scores must be rejected")
 
 
 def test_research_evaluator_never_waives_unknown_source_id(settings, db):
@@ -222,6 +280,8 @@ def test_recovery_manager_verifies_artifact_side_effect_by_hash(settings, db):
     )
     assert result["action"] == "mark_succeeded"
     assert result["confidence"] == "high"
+    assert result["sha256"]
+    assert result["bytes"] == len(content.encode("utf-8"))
     assert db.get_open_tool_calls(task["task_id"]) == []
 
 
