@@ -7,6 +7,7 @@ import time
 from fastapi.testclient import TestClient
 
 from app.api.main import app
+from app.infrastructure.artifact_store import ArtifactStore
 
 
 def test_task_api_create_status_and_events(tmp_path, monkeypatch):
@@ -306,3 +307,129 @@ def test_runtime_budget_extension_adds_quota_and_requeues_checkpoint(tmp_path, m
         events = db.get_events(task_id)
         assert any(event["event_type"] == "budget_checkpoint_resume_requested" for event in events)
         assert any(event["event_type"] == "task_manually_requeued" for event in events)
+
+
+def test_research_api_exposes_human_choices_and_rejects_unsafe_recovery_action(tmp_path, monkeypatch):
+    monkeypatch.setenv("APP_HOME", str(tmp_path))
+    monkeypatch.setenv("DATA_DIR", str(tmp_path / "data"))
+    monkeypatch.setenv("WORKSPACE_DIR", str(tmp_path / "workspaces"))
+    with TestClient(app) as client:
+        created = client.post("/tasks", json={
+            "goal": "Research a task whose checkpoint recovery is ambiguous",
+        })
+        task_id = created.json()["task_id"]
+        db = client.app.state.db
+        db.claim_next_task("recovery-choice-worker")
+        intervention_id = db.set_waiting_for_human(
+            task_id, "recovery_conflict",
+            {"summary": "Checkpoint state is ambiguous.", "choices": ["terminate"]},
+            worker_id="recovery-choice-worker",
+        )
+        state = client.get(f"/tasks/{task_id}/research")
+        assert state.status_code == 200
+        assert state.json()["pending_intervention"]["allowed_actions"] == ["terminate"]
+
+        rejected = client.post(f"/tasks/{task_id}/human-intervention/resolve", json={
+            "intervention_id": intervention_id, "action": "continue_research",
+        })
+        assert rejected.status_code == 409
+        assert db.get_task(task_id)["status"] == "waiting_for_human"
+
+        terminated = client.post(f"/tasks/{task_id}/human-intervention/resolve", json={
+            "intervention_id": intervention_id, "action": "terminate",
+            "reason": "Checkpoint 状态无法核验，按保守恢复策略终止。",
+        })
+        assert terminated.status_code == 200
+        current = db.get_task(task_id)
+        assert current["status"] == "cancelled"
+        assert current["resume_mode"] == 0
+        decision = db.list_human_decisions(task_id)
+        assert decision[-1]["payload"]["action"] == "terminate"
+
+
+def test_human_requirements_decision_merges_and_persists_before_resume(tmp_path, monkeypatch):
+    monkeypatch.setenv("APP_HOME", str(tmp_path))
+    monkeypatch.setenv("DATA_DIR", str(tmp_path / "data"))
+    monkeypatch.setenv("WORKSPACE_DIR", str(tmp_path / "workspaces"))
+    with TestClient(app) as client:
+        created = client.post("/tasks", json={
+            "goal": "Research the architecture and security boundary of a system",
+        })
+        task_id = created.json()["task_id"]
+        db = client.app.state.db
+        db.claim_next_task("human-requirements-worker")
+        from app.runtime.research_controller import ResearchController
+        ResearchController(db, task_id).define_requirements({
+            "dimensions": [{
+                "id": "architecture", "title": "架构机制",
+                "questions": ["系统如何组织执行？"], "expected_evidence": ["官方源码"],
+                "priority": "critical", "min_sources": 1,
+            }]
+        })
+        intervention_id = db.set_waiting_for_human(
+            task_id, "research_control_requires_human",
+            {"message": "请补充研究要求。",
+             "choices": ["continue_research", "change_research_direction",
+                         "add_research_requirements", "terminate"]},
+            worker_id="human-requirements-worker",
+        )
+        response = client.post(f"/tasks/{task_id}/human-intervention/resolve", json={
+            "intervention_id": intervention_id,
+            "action": "add_research_requirements",
+            "requirements": {"dimensions": [{
+                "id": "security", "title": "安全边界",
+                "questions": ["系统的安全边界是什么？"],
+                "expected_evidence": ["官方安全文档"],
+                "priority": "critical", "min_sources": 2,
+            }]},
+        })
+        assert response.status_code == 200
+        assert response.json()["status"] == "queued"
+        state = db.get_research_control_state(task_id)
+        assert [item["id"] for item in state["requirements"]["dimensions"]] == ["architecture", "security"]
+        decision = db.list_human_decisions(task_id)[-1]
+        assert decision["payload"]["action"] == "add_research_requirements"
+        assert decision["payload"]["request"]["message"] == "请补充研究要求。"
+
+
+def test_degraded_delivery_requires_confirmation_and_readback_verified_artifact(tmp_path, monkeypatch):
+    monkeypatch.setenv("APP_HOME", str(tmp_path))
+    monkeypatch.setenv("DATA_DIR", str(tmp_path / "data"))
+    monkeypatch.setenv("WORKSPACE_DIR", str(tmp_path / "workspaces"))
+    with TestClient(app) as client:
+        created = client.post("/tasks", json={
+            "goal": "Research a report that needs explicit degraded-delivery approval",
+        })
+        task_id = created.json()["task_id"]
+        db = client.app.state.db
+        db.claim_next_task("degraded-approval-worker")
+        store = ArtifactStore(client.app.state.settings.workspace_dir, task_id)
+        store.write_text("reports/final.md", "# Draft report\n\nEvidence and limitations.")
+        intervention_id = db.set_waiting_for_human(
+            task_id, "quality_not_satisfied",
+            {"message": "报告未达到质量门槛。", "artifact_path": "reports/final.md",
+             "choices": ["continue_repair", "approve_degraded_delivery", "terminate"]},
+            worker_id="degraded-approval-worker",
+        )
+        missing_confirmation = client.post(f"/tasks/{task_id}/human-intervention/resolve", json={
+            "intervention_id": intervention_id, "action": "approve_degraded_delivery",
+            "reason": "人工已审阅并批准。",
+        })
+        assert missing_confirmation.status_code == 422
+        assert db.get_task(task_id)["status"] == "waiting_for_human"
+
+        approved = client.post(f"/tasks/{task_id}/human-intervention/resolve", json={
+            "intervention_id": intervention_id, "action": "approve_degraded_delivery",
+            "reason": "人工已审阅主要缺陷及局限，同意降级交付。",
+            "confirm": True,
+        })
+        assert approved.status_code == 200
+        current = db.get_task(task_id)
+        assert current["status"] == "completed"
+        assert current["result_path"]
+        persisted = store.read_text("reports/final.md")
+        assert "人工批准的降级交付说明" in persisted
+        delivered = [event for event in db.get_events(task_id) if event["event_type"] == "report_delivered"]
+        assert delivered[-1]["payload"]["manual_approval"] is True
+        assert len(delivered[-1]["payload"]["sha256"]) == 64
+

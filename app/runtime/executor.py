@@ -7,13 +7,14 @@ import time
 from contextlib import contextmanager
 from pathlib import Path
 from datetime import datetime, timezone
+from types import SimpleNamespace
 from typing import Any, Callable, Iterator
 
 from app.config import Settings
 from app.infrastructure.artifact_store import ArtifactStore
 from app.infrastructure.database import Database
 from app.infrastructure.evidence_registry import EvidenceRegistry
-from app.runtime.control import TaskPaused, TaskCancelled, TaskDeadlineExceeded, TaskStepLimitExceeded, WorkerLeaseLost
+from app.runtime.control import TaskPaused, TaskCancelled, TaskDeadlineExceeded, TaskStepLimitExceeded, WorkerLeaseLost, TaskWaitingForHuman
 from app.runtime.budget import estimate_model_call_reservation
 from app.runtime.errors import BudgetExhausted
 
@@ -200,6 +201,7 @@ class TaskEventCallback(BaseCallbackHandler):
         self, db: Database, task_id: str, started_monotonic: float,
         max_runtime_seconds: int, worker_id: str | None = None,
         worker_generation: int | None = None, plan_progress_service: Any | None = None,
+        recovery_manager: Any | None = None, lifecycle_coordinator: Any | None = None,
     ):
         self.db = db
         self.task_id = task_id
@@ -208,13 +210,19 @@ class TaskEventCallback(BaseCallbackHandler):
         self.worker_id = worker_id
         self.worker_generation = worker_generation
         self.plan_progress_service = plan_progress_service
+        self.recovery_manager = recovery_manager
+        self.lifecycle_coordinator = lifecycle_coordinator
         self._llm_started: dict[str, float] = {}
         self._tool_started: dict[str, float] = {}
         self._tool_names: dict[str, str] = {}
+        self._tool_inputs: dict[str, str] = {}
+        self._last_lifecycle_phase: str | None = None
         self._token_reservations: set[str] = set()
 
     def _check_control(self) -> None:
         task = self.db.get_task(self.task_id)
+        if task and task.get("status") == "waiting_for_human":
+            raise TaskWaitingForHuman("task is waiting for an operator decision")
         if self.worker_id:
             if not self.db.owns_worker_lease(self.worker_id):
                 raise WorkerLeaseLost("worker singleton lease was lost")
@@ -353,10 +361,20 @@ class TaskEventCallback(BaseCallbackHandler):
         tool_name = (serialized or {}).get("name", "unknown")
         self._tool_started[str(run_id)] = time.monotonic()
         self._tool_names[str(run_id)] = tool_name
+        self._tool_inputs[str(run_id)] = str(input_str)
+        call_id = str(run_id)
+        if self.recovery_manager is not None:
+            metadata = kwargs.get("metadata") or {}
+            self.recovery_manager.begin_tool_call(
+                self.task_id, call_id, tool_name, str(input_str),
+                int(self.worker_generation or 0),
+                metadata if isinstance(metadata, dict) else {},
+            )
         self.db.add_event(
             self.task_id,
             "tool_call_started",
-            {"tool": tool_name, "input": str(input_str)[:2500], "run_id": str(run_id)},
+            {"tool": tool_name, "input": str(input_str)[:2500], "run_id": str(run_id),
+             "call_id": call_id, "recovery_tracking": self.recovery_manager is not None},
         )
         if self.plan_progress_service is not None:
             try:
@@ -380,11 +398,11 @@ class TaskEventCallback(BaseCallbackHandler):
                 "phase": phase, "error_type": type(exc).__name__, "error": str(exc)[:1000],
             })
 
-    def complete_active_plan_step(self, note: str) -> None:
+    def complete_active_plan_step(self, note: str, output_path: str | None = None) -> None:
         if self.plan_progress_service is None:
             return
         try:
-            self.plan_progress_service.complete_active_plan_step(note)
+            self.plan_progress_service.complete_active_plan_step(note, output_path=output_path)
         except (TaskPaused, TaskCancelled, TaskDeadlineExceeded, WorkerLeaseLost):
             raise
         except Exception as exc:
@@ -392,23 +410,79 @@ class TaskEventCallback(BaseCallbackHandler):
                 "phase": "completion", "error_type": type(exc).__name__, "error": str(exc)[:1000],
             })
 
+    def _observe_research_phase(self, tool_name: str, input_value: str) -> None:
+        if self.lifecycle_coordinator is None or self.plan_progress_service is None:
+            return
+        phase = self.plan_progress_service._tool_phase(tool_name, input_value)
+        if phase is None or phase == self._last_lifecycle_phase:
+            return
+        try:
+            result = self.lifecycle_coordinator.assess_progress(trigger="phase_boundary")
+            decision = result.get("decision") or {}
+            self.db.add_event(self.task_id, "research_phase_boundary_observed", {
+                "phase": phase,
+                "coverage_ratio": result.get("coverage", {}).get("coverage_ratio"),
+                "recommended_action": decision.get("recommended_action"),
+            })
+            self._last_lifecycle_phase = phase
+            if decision.get("recommended_action") == "REQUEST_HUMAN":
+                intervention_id = self.db.set_waiting_for_human(
+                    self.task_id, "research_control_requires_human",
+                    {
+                        "message": decision.get("reason") or "研究控制器检测到持续性关键缺口，需要人工决定研究方向。",
+                        "coverage": result.get("coverage"),
+                        "decision": decision,
+                        "choices": [
+                            "continue_research", "change_research_direction",
+                            "add_research_requirements", "terminate",
+                        ],
+                    },
+                    worker_id=self.worker_id,
+                )
+                if not intervention_id:
+                    raise RuntimeError("research controller requested human review but task could not be parked")
+                self.db.add_event(self.task_id, "research_controller_parked_for_human", {
+                    "intervention_id": intervention_id, "phase": phase,
+                    "recommended_action": "REQUEST_HUMAN",
+                })
+                raise TaskWaitingForHuman(
+                    f"research controller parked task for human decision ({intervention_id})"
+                )
+        except (TaskPaused, TaskCancelled, TaskDeadlineExceeded, WorkerLeaseLost, TaskWaitingForHuman):
+            raise
+        except Exception as exc:
+            self.db.add_event(self.task_id, "research_phase_assessment_failed", {
+                "phase": phase, "error_type": type(exc).__name__, "error": str(exc)[:1000],
+            })
+
     def on_tool_end(self, output, *, run_id, **kwargs):
-        started = self._tool_started.pop(str(run_id), time.monotonic())
-        tool_name = self._tool_names.pop(str(run_id), "unknown")
+        key = str(run_id)
+        started = self._tool_started.pop(key, time.monotonic())
+        tool_name = self._tool_names.pop(key, "unknown")
+        input_value = self._tool_inputs.pop(key, "")
+        if self.recovery_manager is not None:
+            self.recovery_manager.finish_tool_call(self.task_id, key, output)
         self.db.add_event(
             self.task_id,
             "tool_call_completed",
-            {"output": str(output)[:20000], "duration_ms": int((time.monotonic() - started) * 1000), "run_id": str(run_id)},
+            {"output": str(output)[:20000], "duration_ms": int((time.monotonic() - started) * 1000),
+             "run_id": key, "call_id": key},
         )
+        self._observe_research_phase(tool_name, input_value)
         self._check_control()
 
     def on_tool_error(self, error, *, run_id, **kwargs):
-        started = self._tool_started.pop(str(run_id), time.monotonic())
-        tool_name = self._tool_names.pop(str(run_id), "unknown")
+        key = str(run_id)
+        started = self._tool_started.pop(key, time.monotonic())
+        tool_name = self._tool_names.pop(key, "unknown")
+        self._tool_inputs.pop(key, None)
+        if self.recovery_manager is not None:
+            self.recovery_manager.fail_tool_call(self.task_id, key, error)
         self.db.add_event(
             self.task_id,
             "tool_call_failed",
-            {"error": str(error)[:4000], "duration_ms": int((time.monotonic() - started) * 1000), "run_id": str(run_id)},
+            {"error": str(error)[:4000], "duration_ms": int((time.monotonic() - started) * 1000),
+             "run_id": key, "call_id": key, "tool": tool_name},
         )
         self._check_control()
 
@@ -459,11 +533,15 @@ def sqlite_checkpointer(checkpoint_path: Path) -> Iterator[Any]:
 class ResearchExecutor:
     def __init__(self, settings: Settings, db: Database,
                  agent_builder: Callable[..., Any] | None = None,
-                 checkpointer_factory: Callable[[Path], Any] = sqlite_checkpointer):
+                 checkpointer_factory: Callable[[Path], Any] = sqlite_checkpointer,
+                 research_reviewer: Callable[[dict[str, Any]], dict[str, Any]] | None = None,
+                 quality_review_enabled: bool = True):
         self.settings = settings
         self.db = db
         self.agent_builder = agent_builder
         self.checkpointer_factory = checkpointer_factory
+        self.research_reviewer = research_reviewer
+        self.quality_review_enabled = bool(quality_review_enabled)
 
     def _registration(self, task):
         from app.agents.registry import get_agent_registration
@@ -523,6 +601,17 @@ class ResearchExecutor:
         artifacts.write_text(path, normalized + "\n")
         return self._verify_artifact(task_id, artifacts, path, source)
 
+    def _park_for_human(self, task_id: str, worker_id: str | None,
+                        category: str, request: dict[str, Any]) -> None:
+        intervention_id = self.db.set_waiting_for_human(
+            task_id, category, request, worker_id=worker_id
+        )
+        if not intervention_id:
+            raise RuntimeError("could not atomically park task for human intervention")
+        raise TaskWaitingForHuman(
+            f"task parked for human decision: {category} ({intervention_id})"
+        )
+
     def run(self, task: dict[str, Any], worker_id: str | None = None) -> str:
         from app.runtime.errors import DeliveryValidationExhausted
         task_id = task["task_id"]
@@ -531,12 +620,25 @@ class ResearchExecutor:
         started = time.monotonic()
         artifacts = ArtifactStore(self.settings.workspace_dir, task_id)
         plan_progress_service = None
+        recovery_manager = None
+        lifecycle_coordinator = None
         if registration.agent_type == "research":
             from app.runtime.plan_progress import PlanProgressTracker
+            from app.runtime.recovery_manager import RecoveryManager
             plan_progress_service = PlanProgressTracker(self.db, task_id, artifacts)
+        from app.runtime.recovery_manager import RecoveryManager
+        recovery_manager = RecoveryManager(
+            self.db, self.settings.workspace_dir, self.settings.checkpoint_path
+        )
+        if registration.agent_type == "research" and self.quality_review_enabled:
+            from app.runtime.lifecycle_coordinator import ResearchLifecycleCoordinator
+            lifecycle_coordinator = ResearchLifecycleCoordinator(
+                self.settings, self.db, task_id, artifacts, reviewer=self.research_reviewer
+            )
         callback = TaskEventCallback(
             self.db, task_id, started, int(task["max_runtime_seconds"]),
             worker_id, task.get("worker_generation"), plan_progress_service,
+            recovery_manager, lifecycle_coordinator,
         )
         callback._check_control()
         config = {
@@ -551,22 +653,79 @@ class ResearchExecutor:
         with self.checkpointer_factory(self.settings.checkpoint_path) as checkpointer:
             agent = self._build_agent(task, checkpointer, started, registration)
             snapshot = agent.get_state(config)
+            human_decisions = (
+                self.db.list_unconsumed_human_decisions(task_id, limit=10)
+                if task.get("resume_mode") else []
+            )
+            human_messages = []
+            for decision in human_decisions:
+                event_payload = decision.get("payload") or {}
+                decision_payload = event_payload.get("payload") or {}
+                intervention_id = str(event_payload.get("intervention_id") or "")
+                action = str(event_payload.get("action") or "")
+                request_payload = event_payload.get("request") or {}
+                instruction = {
+                    "action": action,
+                    "reason": decision_payload.get("reason", ""),
+                    "direction": decision_payload.get("direction", ""),
+                    "requirements": decision_payload.get("requirements"),
+                    "request": request_payload,
+                }
+                content = (
+                    "任务刚刚经过人工干预并已恢复。请严格执行以下人工决策，先核对研究状态和现有证据，"
+                    "必要时更新计划，不要重复已经完成的研究步骤。\n"
+                    + json.dumps(instruction, ensure_ascii=False, indent=2)
+                    + "\n如需读取完整审计记录，请调用 get_human_decisions。"
+                )
+                from langchain_core.messages import HumanMessage
+                human_messages.append(HumanMessage(
+                    id=f"human-intervention-{intervention_id}", content=content,
+                ))
+
+            existing_message_ids = set()
+            if snapshot is not None:
+                values = getattr(snapshot, "values", None) or {}
+                for message in values.get("messages", []) if isinstance(values, dict) else []:
+                    message_id = message.get("id") if isinstance(message, dict) else getattr(message, "id", None)
+                    if message_id:
+                        existing_message_ids.add(str(message_id))
+            unseen_human_messages = [
+                message for message in human_messages
+                if str(getattr(message, "id", "")) not in existing_message_ids
+            ]
+
             if snapshot is not None and getattr(snapshot, "next", ()):
                 self.db.add_event(task_id, "checkpoint_resume", {"pending_nodes": list(snapshot.next)})
-                result = agent.invoke(None, config=config)
+                if unseen_human_messages:
+                    updater = getattr(agent, "update_state", None)
+                    if callable(updater):
+                        updater(config, {"messages": unseen_human_messages})
+                        result = agent.invoke(None, config=config)
+                    else:
+                        result = agent.invoke({"messages": unseen_human_messages}, config=config)
+                else:
+                    result = agent.invoke(None, config=config)
             elif snapshot is not None and getattr(snapshot, "values", None):
                 self.db.add_event(task_id, "checkpoint_already_complete", {})
                 result = snapshot.values
+                resume_messages = list(unseen_human_messages)
                 if task.get("resume_mode"):
                     events = self.db.get_events(task_id, limit=5000)
                     failed_validation = next((event for event in reversed(events) if event["event_type"] == "delivery_validation_completed" and not event["payload"].get("valid")), None)
                     if failed_validation:
                         repair = "上次交付校验未通过，请基于已保存的报告和以下校验反馈进行定向修复，不要重新执行已完成的研究：\\n" + str(failed_validation["payload"].get("errors", "")) + "\\n修复后覆盖岗位声明的产物文件。"
                         self.db.add_event(task_id, "delivery_repair_resumed", {"source_event_id": failed_validation["event_id"]})
-                        result = agent.invoke({"messages": [{"role": "user", "content": repair}]}, config=config)
+                        resume_messages.append({"role": "user", "content": repair})
+                if resume_messages:
+                    result = agent.invoke({"messages": resume_messages}, config=config)
             else:
                 self.db.add_event(task_id, "agent_initial_run", {})
-                result = agent.invoke({"messages": [{"role": "user", "content": task["goal"]}]}, config=config)
+                initial_messages = [{"role": "user", "content": task["goal"]}, *unseen_human_messages]
+                result = agent.invoke({"messages": initial_messages}, config=config)
+
+            for decision in human_decisions:
+                intervention_id = str((decision.get("payload") or {}).get("intervention_id") or "")
+                self.db.mark_human_decision_consumed(task_id, intervention_id)
 
             # Re-check after graph execution so a provider call that ran past the
             # deadline cannot be accepted as a successful final response.
@@ -610,7 +769,45 @@ class ResearchExecutor:
                 for revision in range(registration.max_revisions + 1):
                     report = artifacts.read_text(artifact_path)
                     validation = registration.validator(report, task, artifacts)
-                    valid = self._validation_ok(validation)
+                    structural_valid = self._validation_ok(validation)
+                    quality_assessment = None
+                    if lifecycle_coordinator is not None:
+                        quality_assessment = lifecycle_coordinator.evaluate_delivery(
+                            task, report, validation=validation, callback=callback, allow_llm=True
+                        )
+                        reviewer_status = (quality_assessment.get("reviewer") or {}).get("status")
+                        if reviewer_status == "unavailable":
+                            self._park_for_human(task_id, worker_id, "independent_review_unavailable", {
+                                "message": "独立研究质量评审不可用，不能自动通过交付。",
+                                "artifact_path": artifact_path,
+                                "assessment": quality_assessment,
+                                "choices": ["continue_research", "continue_repair", "approve_degraded_delivery", "terminate"],
+                            })
+                        if not quality_assessment.get("passed"):
+                            quality_messages = [
+                                str(item.get("message") or item.get("code") or "质量硬门槛未通过")
+                                for item in (quality_assessment.get("hard_blocks") or [])
+                            ] + [
+                                str(item.get("message") or item.get("code") or "研究质量缺陷")
+                                for item in (quality_assessment.get("defects") or [])
+                            ]
+                            if not quality_messages:
+                                quality_messages.append(
+                                    "五维质量评分未达到门槛："
+                                    + str(quality_assessment.get("total_score"))
+                                    + "；阈值：" + str(quality_assessment.get("thresholds"))
+                                )
+                            original_errors = getattr(validation, "errors", ()) or ()
+                            validation = SimpleNamespace(
+                                valid=False,
+                                errors=tuple([*(original_errors if not isinstance(original_errors, str) else [original_errors]),
+                                              *quality_messages]),
+                                original_validation=validation,
+                                quality_assessment=quality_assessment,
+                            )
+                    valid = structural_valid and (
+                        quality_assessment is None or bool(quality_assessment.get("passed"))
+                    )
                     errors = self._validation_errors(validation)
                     validation_payload = {
                         "agent_type": registration.agent_type,
@@ -627,6 +824,13 @@ class ResearchExecutor:
                         "finding_count": getattr(validation, "finding_count", None),
                         "cited_source_ids": list(getattr(validation, "cited_source_ids", ()) or ()),
                         "cited_finding_ids": list(getattr(validation, "cited_finding_ids", ()) or ()),
+                        "quality_assessment_id": (quality_assessment or {}).get("assessment_id"),
+                        "quality_total_score": (quality_assessment or {}).get("total_score"),
+                        "quality_dimension_scores": (quality_assessment or {}).get("dimension_scores"),
+                        "quality_passed": (quality_assessment or {}).get("passed"),
+                        "quality_reviewer_status": ((quality_assessment or {}).get("reviewer") or {}).get("status"),
+                        "quality_hard_blocks": (quality_assessment or {}).get("hard_blocks", []),
+                        "quality_defects": (quality_assessment or {}).get("defects", []),
                     }
                     self.db.add_event(task_id, "delivery_validation_completed", validation_payload)
                     callback.sync_plan_progress_for_phase(
@@ -643,8 +847,14 @@ class ResearchExecutor:
                             "evidence_coverage": getattr(validation, "evidence_coverage", None),
                             "source_count": getattr(validation, "source_count", None),
                             "report_url_count": getattr(validation, "report_url_count", None),
+                            "quality_assessment_id": (quality_assessment or {}).get("assessment_id"),
+                            "quality_total_score": (quality_assessment or {}).get("total_score"),
+                            "quality_dimension_scores": (quality_assessment or {}).get("dimension_scores"),
                         })
-                        callback.complete_active_plan_step("最终报告已通过交付校验并正式交付。")
+                        callback.complete_active_plan_step(
+                            "最终报告已通过交付校验并正式交付。",
+                            output_path=artifact_path,
+                        )
                         break
 
                     if revision >= registration.max_revisions:
@@ -653,7 +863,15 @@ class ResearchExecutor:
                             "revisions": registration.max_revisions,
                             "errors": errors[:4000],
                             "artifact_preserved": artifacts.exists(artifact_path),
+                            "quality_assessment_id": (quality_assessment or {}).get("assessment_id"),
                         })
+                        if quality_assessment is not None and not quality_assessment.get("hard_blocks"):
+                            self._park_for_human(task_id, worker_id, "quality_not_satisfied", {
+                                "message": "报告已完成有限修复，但仍未达到岗位质量门槛。",
+                                "artifact_path": artifact_path,
+                                "assessment": quality_assessment,
+                                "choices": ["continue_repair", "approve_degraded_delivery", "terminate"],
+                            })
                         raise DeliveryValidationExhausted(
                             f"delivery validation failed after {registration.max_revisions} revisions: {errors}"
                         )
@@ -695,5 +913,8 @@ class ResearchExecutor:
                     "sha256": hashlib.sha256(persisted.encode("utf-8")).hexdigest(),
                     "validation_required": False,
                 })
-                callback.complete_active_plan_step("最终成果已持久化并完成交付。")
+                callback.complete_active_plan_step(
+                    "最终成果已持久化并完成交付。",
+                    output_path=artifact_path,
+                )
         return str((artifacts.workspace / artifact_path).resolve())

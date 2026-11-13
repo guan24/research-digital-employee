@@ -8,6 +8,7 @@ import socket
 import time
 import random
 from datetime import datetime, timezone
+from typing import Any
 from urllib.parse import urljoin, urlparse
 
 import httpx
@@ -536,6 +537,7 @@ class ResearchToolService(TaskToolService):
                     "title": str(step.get("title") or "").strip(),
                     "objective": str(step.get("objective") or "").strip(),
                     "expected_output": str(step.get("expected_output") or "").strip(),
+                    "expected_output_path": str(step.get("expected_output_path") or "").strip(),
                 }
                 for index, step in enumerate(plan.get("steps") or [], start=1)
                 if isinstance(step, dict)
@@ -562,6 +564,7 @@ class ResearchToolService(TaskToolService):
                 "source": payload.get("source") or "agent",
                 "phase": payload.get("phase"),
                 "event_id": event.get("event_id", 0),
+                "verified_output": payload.get("verified_output"),
             }
         return progress
 
@@ -622,7 +625,7 @@ class ResearchToolService(TaskToolService):
                 continue
             changed_fields = [
                 field
-                for field in ("title", "objective", "expected_output")
+                for field in ("title", "objective", "expected_output", "expected_output_path")
                 if step.get(field) != previous_steps[step_id].get(field)
             ]
             if changed_fields:
@@ -934,8 +937,9 @@ class ResearchToolService(TaskToolService):
         step_id: str,
         status: str,
         note: str = "",
+        output_path: str | None = None,
     ) -> str:
-        """Persist one step's execution progress without creating a strategic plan version."""
+        """Persist one step's execution progress; completion requires a read-back-verified artifact."""
         self.check_control()
         allowed_statuses = {"pending", "in_progress", "completed", "skipped", "failed"}
         normalized_status = str(status or "").strip().lower()
@@ -970,7 +974,27 @@ class ResearchToolService(TaskToolService):
         previous = progress.get(normalized_step_id, {})
         previous_status = previous.get("status", "pending")
         normalized_note = str(note or "").strip()
-        if previous_status == normalized_status and previous.get("note", "") == normalized_note:
+        verified_output = None
+        if normalized_status == "completed":
+            expected_path = str(step.get("expected_output_path") or "").strip()
+            candidate_path = str(output_path or expected_path).strip()
+            if expected_path and output_path and str(output_path).strip() != expected_path:
+                raise ValueError("output_path must match the plan step expected_output_path")
+            if not candidate_path or not self.artifacts.exists(candidate_path):
+                raise ValueError("completing a plan step requires an existing expected_output_path/output_path artifact")
+            output_content = self.artifacts.read_text(candidate_path)
+            if not output_content.strip():
+                raise ValueError("plan step output artifact is empty")
+            import hashlib
+            encoded = output_content.encode("utf-8")
+            verified_output = {
+                "path": candidate_path,
+                "sha256": hashlib.sha256(encoded).hexdigest(),
+                "bytes": len(encoded),
+            }
+        if previous_status == normalized_status and previous.get("note", "") == normalized_note and (
+            normalized_status != "completed" or previous.get("verified_output")
+        ):
             return (
                 f"Step '{normalized_step_id}' remains {normalized_status}; "
                 "no duplicate progress event was written."
@@ -988,6 +1012,7 @@ class ResearchToolService(TaskToolService):
                 "note": normalized_note[:1500],
                 "plan_version": version,
                 "source": "agent",
+                "verified_output": verified_output,
             },
         )
         current_events = self.db.get_events(self.task_id, limit=5000)
@@ -1032,7 +1057,7 @@ class ResearchToolService(TaskToolService):
             changes: str = "",
         ) -> str:
             """Create or materially revise the overall plan.
-            Supply title, objective and ordered step objects with id, title, objective and expected_output.
+            Supply title, objective and ordered step objects with id, title, objective, expected_output and optional expected_output_path (a task-relative artifact path).
             Do not send a JSON document inside a string argument.
             Do not call for routine progress updates; use update_plan_step_status for those.
             Every later strategic replan must explain trigger, new_information, problem_analysis, decision and changes."""
@@ -1050,20 +1075,49 @@ class ResearchToolService(TaskToolService):
             step_id: str,
             status: str,
             note: str = "",
+            output_path: str | None = None,
         ) -> str:
-            """Update execution progress for one step in the current overall research plan.
-            Use status pending, in_progress, completed, skipped or failed.
-            Call when a step starts, finishes, is intentionally skipped, or cannot be completed.
-            This records progress separately and does not create a new strategic plan version."""
-            return self.update_plan_step_status(step_id, status, note)
+            """Update execution progress for one step in the current overall research plan. When status is completed, supply output_path or configure expected_output_path; the runtime reads the artifact back and records its SHA-256."""
+            return self.update_plan_step_status(step_id, status, note, output_path)
 
         @tool("record_finding")
-        def record_finding_tool(claim: str, source_ids: list[str], rationale: str = "", confidence: str = "medium") -> str:
-            """Record an evidence-linked claim with source IDs such as S0001."""
+        def record_finding_tool(claim: str, source_ids: list[str], rationale: str = "",
+                                confidence: str = "medium", dimension_id: str | None = None) -> str:
+            """Record an evidence-linked claim. Always supply the matching research dimension_id when one exists."""
             self.check_control()
-            finding = EvidenceRegistry(self.artifacts).record_finding(claim=claim, source_ids=source_ids, rationale=rationale, confidence=confidence)
+            finding = EvidenceRegistry(self.artifacts).record_finding(
+                claim=claim, source_ids=source_ids, rationale=rationale,
+                confidence=confidence, dimension_id=dimension_id,
+            )
             self.db.add_event(self.task_id, "research_finding_recorded", finding)
             return json.dumps(finding, ensure_ascii=False)
+
+        @tool("define_research_requirements")
+        def define_research_requirements_tool(
+            dimensions: list[dict[str, Any]], quality_policy: dict[str, Any] | None = None
+        ) -> str:
+            """Define the research coverage matrix. Optional quality_policy may only raise the role baseline min_total_score and min_dimension_score."""
+            self.check_control()
+            from app.runtime.research_controller import ResearchController
+            result = ResearchController(self.db, self.task_id, self.artifacts).define_requirements(
+                {"dimensions": dimensions, "quality_policy": quality_policy or {}}, source="agent"
+            )
+            return json.dumps(result, ensure_ascii=False, indent=2)
+
+        @tool("get_human_decisions")
+        def get_human_decisions_tool() -> str:
+            """Read audited operator decisions after a task was parked for human intervention. Apply the requested direction, repair action or continuation before doing more research."""
+            self.check_control()
+            return json.dumps(self.db.list_unconsumed_human_decisions(self.task_id, limit=10), ensure_ascii=False, indent=2)
+
+        @tool("get_research_status")
+        def get_research_status_tool() -> str:
+            """Inspect current research-dimension coverage, critical evidence gaps, stagnation and the controller action recommendation."""
+            self.check_control()
+            from app.runtime.lifecycle_coordinator import ResearchLifecycleCoordinator
+            coordinator = ResearchLifecycleCoordinator(self.settings, self.db, self.task_id, self.artifacts)
+            result = coordinator.assess_progress("agent_query")
+            return json.dumps(result, ensure_ascii=False, indent=2)
 
         @tool("get_evidence_registry")
         def get_evidence_registry_tool() -> str:
@@ -1137,6 +1191,9 @@ class ResearchToolService(TaskToolService):
         return [
             *self.as_common_tools(),
             record_finding_tool,
+            define_research_requirements_tool,
+            get_human_decisions_tool,
+            get_research_status_tool,
             get_evidence_registry_tool,
             update_research_plan_tool,
             update_plan_step_status_tool,

@@ -51,6 +51,7 @@ class PlanProgressTracker:
                     "title": str(step.get("title") or "").strip(),
                     "objective": str(step.get("objective") or "").strip(),
                     "expected_output": str(step.get("expected_output") or "").strip(),
+                    "expected_output_path": str(step.get("expected_output_path") or "").strip(),
                 }
                 for index, step in enumerate(plan.get("steps") or [], start=1)
                 if isinstance(step, dict)
@@ -75,6 +76,7 @@ class PlanProgressTracker:
                 "phase": payload.get("phase"),
                 "plan_version": payload.get("plan_version"),
                 "event_id": event.get("event_id", 0),
+                "verified_output": payload.get("verified_output"),
             }
         return progress
 
@@ -122,12 +124,37 @@ class PlanProgressTracker:
             return "reading" if path.startswith("sources/") else "analysis"
         return None
 
+    def _verified_expected_output(
+        self, step: dict[str, Any], output_path: str | None = None,
+    ) -> dict[str, Any] | None:
+        path = str(output_path or step.get("expected_output_path") or "").strip()
+        if not path:
+            expected = str(step.get("expected_output") or "").strip()
+            if expected.lower().endswith((".md", ".txt", ".json", ".csv", ".yaml", ".yml")):
+                path = expected
+        if not path or not self.artifacts.exists(path):
+            return None
+        try:
+            content = self.artifacts.read_text(path)
+        except (OSError, ValueError):
+            return None
+        if not content.strip():
+            return None
+        import hashlib
+        encoded = content.encode("utf-8")
+        return {"path": path, "sha256": hashlib.sha256(encoded).hexdigest(), "bytes": len(encoded)}
+
     def _append_status(
         self, step: dict[str, Any], status: str, note: str, phase: str, version: int,
+        output_path: str | None = None,
     ) -> None:
         events = self.db.get_events(self.task_id, limit=5000)
         progress = self._latest_progress(events)
         previous = progress.get(step["id"], {}).get("status", "pending")
+        verified_output = self._verified_expected_output(step, output_path) if status == "completed" else None
+        if status == "completed" and verified_output is None:
+            status = "awaiting_verification"
+            note = (str(note or "") + " 产物尚未通过存在性、非空和读回校验，等待 Agent 提供 output_path 后确认完成。").strip()
         self.db.add_event(self.task_id, "research_plan_step_status", {
             "step_id": step["id"],
             "step_title": step["title"],
@@ -137,6 +164,7 @@ class PlanProgressTracker:
             "plan_version": version,
             "source": "runtime",
             "phase": phase,
+            "verified_output": verified_output,
         })
         current_events = self.db.get_events(self.task_id, limit=5000)
         current_progress = self._latest_progress(current_events)
@@ -231,7 +259,7 @@ class PlanProgressTracker:
         candidates = [
             step for step in plan["steps"]
             if progress.get(step["id"], {}).get("status", "pending")
-            not in {"completed", "skipped", "failed", "in_progress"}
+            not in {"completed", "skipped", "failed", "in_progress", "awaiting_verification"}
         ]
         phase_candidates = [step for step in candidates if self._step_phase(step) == phase]
         candidate = (phase_candidates or candidates or [None])[0]
@@ -270,7 +298,9 @@ class PlanProgressTracker:
         )
         return f"Runtime progress: {candidate['id']} -> in_progress ({phase})."
 
-    def complete_active_plan_step(self, note: str = "最终交付已完成") -> int:
+    def complete_active_plan_step(
+        self, note: str = "最终交付已完成", output_path: str | None = None,
+    ) -> int:
         events = self.db.get_events(self.task_id, limit=5000)
         plan_event = next(
             (event for event in reversed(events) if event.get("event_type") == "research_plan_updated"),
@@ -296,6 +326,6 @@ class PlanProgressTracker:
         for item in active:
             self._append_status(
                 step_by_id[item["step_id"]], "completed", note,
-                item.get("phase") or "validation", version,
+                item.get("phase") or "validation", version, output_path=output_path,
             )
         return len(active)

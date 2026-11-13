@@ -72,7 +72,8 @@ class EvidenceRegistry:
         return source
 
     def record_finding(self, *, claim: str, source_ids: list[str],
-                       rationale: str = "", confidence: str = "medium") -> dict[str, Any]:
+                       rationale: str = "", confidence: str = "medium",
+                       dimension_id: str | None = None) -> dict[str, Any]:
         normalized_claim = str(claim or "").strip()
         ids = list(dict.fromkeys(str(value).strip().upper() for value in source_ids if str(value).strip()))
         if not normalized_claim:
@@ -85,11 +86,13 @@ class EvidenceRegistry:
         if missing:
             raise ValueError("unknown source_id(s): " + ", ".join(missing))
         for finding in registry["findings"]:
-            if finding.get("claim") == normalized_claim and finding.get("source_ids") == ids:
+            if (finding.get("claim") == normalized_claim and finding.get("source_ids") == ids
+                    and finding.get("dimension_id") == (str(dimension_id).strip().lower() if dimension_id else None)):
                 return finding
         finding = {
             "finding_id": f"F{len(registry['findings']) + 1:04d}",
             "claim": normalized_claim[:2000], "source_ids": ids,
+            "dimension_id": str(dimension_id).strip().lower()[:64] if dimension_id else None,
             "rationale": str(rationale or "")[:3000],
             "confidence": confidence if confidence in {"low", "medium", "high"} else "medium",
             "recorded_at": self._now(),

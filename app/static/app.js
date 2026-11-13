@@ -16,11 +16,12 @@ let agentProfiles = [];
 let workerOverview = { status: 'offline' };
 let eventStreamMode = 'connecting';
 let lastBudget = null;
+let researchState = null;
 
 const names = {
   deleting: '正在删除', queued: '排队中', running: '运行中',
   retry_wait: '等待重试', paused: '已暂停', completed: '已完成',
-  failed: '执行失败', cancelled: '已取消'
+  failed: '执行失败', cancelled: '已取消', waiting_for_human: '等待人工决策'
 };
 
 const eventNames = {
@@ -35,6 +36,9 @@ const eventNames = {
   artifact_saved: '中间成果保存', report_materialized_from_final_answer: '最终报告生成',
   report_saved_by_agent: '最终报告保存', task_manually_requeued: '人工重新入队',
   retry_scheduled: '自动重试调度', execution_exception: '执行异常',
+  human_intervention_requested: '请求人工决策', human_intervention_resolved: '人工决策已提交',
+  research_controller_parked_for_human: '研究控制器暂停等待人工决策',
+  research_quality_assessed: '研究质量评估', recovery_decision_recorded: '恢复决策记录',
   task_failed: '任务失败', task_completed: '任务完成',
   worker_recovery_scheduled: 'Worker 恢复调度', task_cancelled: '任务取消'
 };
@@ -154,6 +158,7 @@ async function refresh(manual = false) {
       detail = await req('/tasks/' + taskId);
       if (selected === taskId) {
         renderTaskSummary();
+        await loadResearchState(taskId);
         if (manual) await load(taskId);
       }
     } catch (error) { if (manual) $('detail').innerHTML = '<div class="load-error">任务详情刷新失败：' + esc(error.message) + '</div>'; }
@@ -218,6 +223,8 @@ async function load(taskId) {
   detail = null; events = []; artifacts = []; activeFile = ''; fileText = ''; lastBudget = null;
   $('taskStatus').textContent = '加载中';
   setStreamStatus('');
+  researchState = null;
+  $('researchControlPanel').innerHTML = '<div class="empty">正在读取研究控制与人工干预状态…</div>';
   $('qualityPanel').innerHTML = '<div class="empty">正在读取交付校验记录…</div>';
   $('detail').innerHTML = '<div class="empty">正在读取任务执行实例…</div>';
   $('instanceDiagnostics').innerHTML = '';
@@ -249,6 +256,7 @@ async function load(taskId) {
   if (artifactResult.status === 'fulfilled') { artifacts = artifactResult.value.artifacts || []; renderArtifacts(); }
   else $('artifacts').innerHTML = '<div class="load-error">工作区文件读取失败：' +
     esc(artifactResult.reason?.message || '未知 API 错误') + '</div>';
+  await loadResearchState(taskId);
   if (taskResult.status === 'fulfilled' || historyResult.status === 'fulfilled') connectEvents(taskId);
   renderTasks();
 }
@@ -272,11 +280,13 @@ function connectEvents(taskId) {
     if(events.some(event=>event.event_id===item.event_id))return;
     events.push(item);upsertTraceEvent(item);
     if(item.event_type.startsWith('research_plan_'))renderPlan();
+    if(['research_control_decision','research_quality_assessed','recovery_decision_recorded',
+        'human_intervention_requested','human_intervention_resolved','research_controller_parked_for_human'].includes(item.event_type))loadResearchState(taskId);
     if(['budget_warning','budget_restricted','budget_soft_limit_reached','budget_extension_approved','research_memory_saved','research_finding_recorded'].includes(item.event_type))renderBudgetAndEvidence();
     if(item.event_type==='delivery_validation_completed')renderQuality();
     renderInstanceDiagnostics();renderHealth();
     if(['artifact_saved','report_saved_by_agent','report_materialized_from_final_answer','artifact_materialized_from_final_answer'].includes(item.event_type))refreshArtifacts(taskId);
-    if(['task_started','task_completed','task_failed','task_cancelled','retry_scheduled','budget_checkpoint_resume_requested'].includes(item.event_type)){
+    if(['task_started','task_completed','task_failed','task_cancelled','retry_scheduled','budget_checkpoint_resume_requested','human_intervention_requested','human_intervention_resolved','research_controller_parked_for_human'].includes(item.event_type)){
       req('/tasks/'+taskId).then(task=>{if(selected===taskId){detail=task;renderTaskSummary();renderTasks();}}).catch(()=>{});
     }
   });
@@ -295,6 +305,8 @@ async function pollNewEvents(taskId) {
       if(events.some(event=>event.event_id===item.event_id))continue;
       events.push(item);upsertTraceEvent(item);
       if(item.event_type.startsWith('research_plan_'))renderPlan();
+      if(['research_control_decision','research_quality_assessed','recovery_decision_recorded',
+          'human_intervention_requested','human_intervention_resolved','research_controller_parked_for_human'].includes(item.event_type))loadResearchState(taskId);
       if(['budget_warning','budget_restricted','budget_soft_limit_reached','budget_extension_approved','research_memory_saved','research_finding_recorded'].includes(item.event_type))renderBudgetAndEvidence();
       if(item.event_type==='delivery_validation_completed')renderQuality();
       if(['artifact_saved','report_saved_by_agent','report_materialized_from_final_answer','artifact_materialized_from_final_answer'].includes(item.event_type))refreshArtifacts(taskId);
@@ -425,6 +437,103 @@ function renderEvidence(evidence) {
       '<div class="empty"><b>尚未登记证据</b><p>Agent 完成搜索和网页读取后，会将来源、核验状态与快照登记在这里。</p></div>');
   document.querySelectorAll('[data-snapshot]').forEach(button=>button.addEventListener('click',()=>openFile(button.dataset.snapshot)));
 }
+async function loadResearchState(taskId) {
+  try {
+    const state = await req('/tasks/' + taskId + '/research');
+    if (selected !== taskId) return;
+    researchState = state;
+    renderResearchState();
+  } catch (error) {
+    if (selected !== taskId) return;
+    $('researchControlPanel').innerHTML = '<div class="panelhead">研究控制与人工干预</div><div class="load-error">研究状态读取失败：' + esc(error.message) + '</div>';
+  }
+}
+
+function renderResearchState() {
+  const root=$('researchControlPanel');
+  if(!root||!detail)return;
+  const state=researchState||{},control=state.control||{},coverage=control.coverage||{};
+  const dimensions=Array.isArray(coverage.dimensions)?coverage.dimensions:[];
+  const assessments=Array.isArray(state.quality_assessments)?state.quality_assessments:[];
+  const latest=assessments.length?assessments[assessments.length-1]:null;
+  const recovery=Array.isArray(state.recovery_decisions)?state.recovery_decisions.slice(-6).reverse():[];
+  const pending=state.pending_intervention||null;
+  const labels={
+    continue_research:'继续研究',change_research_direction:'调整研究方向',
+    add_research_requirements:'补充研究要求',continue_repair:'继续修复',
+    approve_degraded_delivery:'批准降级交付',terminate:'终止任务'
+  };
+  const statusLabels={covered:'已覆盖',partial:'部分覆盖',uncovered:'未覆盖'};
+  const dimensionHtml=dimensions.length
+    ?'<div class="research-dimensions">'+dimensions.map(item=>
+      '<div class="research-dimension"><div><b>'+esc(item.title||item.id)+'</b><small>'+esc(item.priority||'normal')+' · '+esc(statusLabels[item.status]||item.status||'待评估')+'</small></div>'+
+      '<span>'+esc(item.valid_source_count??0)+' / '+esc(item.min_sources??1)+' 个有效来源</span></div>').join('')+'</div>'
+    :'<div class="empty">研究覆盖矩阵尚未建立。</div>';
+  const qualityHtml=latest
+    ?'<div class="research-quality"><b>最近一次质量评估</b><span class="'+(latest.passed?'quality-pass':'quality-fail')+'">'+(latest.passed?'通过':'未通过')+'</span>'+
+      '<strong>'+Number(latest.total_score||0).toFixed(1)+' 分</strong><small>评审状态：'+esc(latest.reviewer?.status||'未记录')+'</small>'+
+      '<div class="research-score-grid">'+Object.entries(latest.dimension_scores||{}).map(([key,value])=>
+        '<span>'+esc(({goal_coverage:'目标覆盖',evidence_sufficiency:'证据充分性',source_reliability:'来源可靠性',conclusion_consistency:'结论一致性',report_completeness:'报告完整性'})[key]||key)+
+        ' <b>'+Number(value||0).toFixed(1)+'</b></span>').join('')+'</div></div>'
+    :'<div class="empty">尚无五维质量评估记录。</div>';
+  const recoveryHtml=recovery.length
+    ?'<div class="research-recovery-list">'+recovery.map(item=>
+      '<div><b>'+esc(item.category||'恢复')+' · '+esc(item.action||'')+'</b><small>'+esc(item.confidence||'')+' · '+esc(time(item.created_at))+'</small>'+
+      '<p>'+esc(compact(item.details?.reason||item.details?.summary||'',220))+'</p></div>').join('')+'</div>'
+    :'<div class="empty">尚无恢复决策记录。</div>';
+  const pendingHtml=pending
+    ?'<div class="human-pending"><b>任务正在等待人工决策</b><p>'+esc(pending.request?.message||pending.request?.summary||'系统请求人工介入。')+'</p>'+
+      '<small>类型：'+esc(pending.category)+' · 创建：'+esc(time(pending.created_at))+'</small>'+
+      '<form id="humanDecisionForm" class="human-decision-form"><label>决策动作<select id="humanDecisionAction">'+
+      (Array.isArray(pending.allowed_actions)?pending.allowed_actions:(Array.isArray(pending.request?.choices)?pending.request.choices:[])).filter(key=>labels[key]).map(key=>'<option value="'+esc(key)+'">'+labels[key]+'</option>').join('')+
+      '</select></label><label>处理说明 / 方向 / 新增要求<textarea id="humanDecisionInput" rows="4" placeholder="填写决策理由；调整方向时填写新的研究方向；补充要求时填写 JSON。"></textarea></label>'+
+      '<label id="humanDecisionConfirmWrap" class="human-confirm" hidden><input type="checkbox" id="humanDecisionConfirm"> 我已审阅报告，并明确批准降级交付</label>'+
+      '<button class="primary" type="submit">提交人工决策</button></form></div>'
+    :'<div class="empty">'+(detail.status==='waiting_for_human'?'等待人工决策记录读取完成。':'当前没有待处理的人工决策。')+'</div>';
+  root.innerHTML='<div class="panelhead">研究控制与人工干预</div>'+
+    '<div class="research-overview"><span>覆盖率 <b>'+ (coverage.coverage_ratio==null?'—':Math.round(Number(coverage.coverage_ratio)*100)+'%')+'</b></span>'+
+    '<span>关键缺口 <b>'+esc((coverage.critical_gaps||[]).length)+'</b></span>'+
+    '<span>停滞周期 <b>'+esc(coverage.stagnation_count??control.stagnation_count??0)+'</b></span>'+
+    '<span>研究阶段 <b>'+esc(control.phase||'planning')+'</b></span></div>'+
+    '<div class="research-section"><b>证据覆盖矩阵</b>'+dimensionHtml+'</div>'+
+    '<div class="research-section">'+qualityHtml+'</div>'+
+    '<div class="research-section"><b>恢复决策记录</b>'+recoveryHtml+'</div>'+
+    pendingHtml+
+    (Array.isArray(state.human_decisions)&&state.human_decisions.length?
+      '<details class="human-history"><summary>已提交人工决策（'+state.human_decisions.length+'）</summary>'+
+      state.human_decisions.slice(-5).reverse().map(item=>'<p><b>'+esc(item.payload?.action||'')+'</b> · '+esc(time(item.timestamp))+
+      '<br>'+esc(compact(item.payload?.payload?.reason||item.payload?.payload?.direction||'',180))+'</p>').join('')+'</details>':'');
+  const action=$('humanDecisionAction');
+  const updateForm=()=>{
+    if(!action)return;
+    const kind=action.value,input=$('humanDecisionInput'),confirm=$('humanDecisionConfirmWrap');
+    if(kind==='add_research_requirements')input.placeholder='输入 JSON，例如：{"dimensions":[{"id":"security","title":"安全边界","questions":["有哪些安全边界？"],"expected_evidence":["官方安全文档"],"priority":"critical","min_sources":2}]}';
+    else if(kind==='change_research_direction')input.placeholder='写明新的研究方向、优先级和需要解决的问题。';
+    else if(kind==='approve_degraded_delivery')input.placeholder='说明已审阅报告并批准降级交付的原因。';
+    else input.placeholder='填写本次人工决策的理由或补充说明（可选）。';
+    confirm.hidden=kind!=='approve_degraded_delivery';
+  };
+  if(action)action.addEventListener('change',updateForm);
+  updateForm();
+  $('humanDecisionForm')?.addEventListener('submit',async event=>{
+    event.preventDefault();
+    const kind=$('humanDecisionAction').value,raw=$('humanDecisionInput').value.trim();
+    const body={intervention_id:pending.intervention_id,action:kind,reason:raw};
+    if(kind==='change_research_direction')body.direction=raw;
+    if(kind==='add_research_requirements'){
+      try{body.requirements=JSON.parse(raw);}catch(error){alert('研究要求必须是合法 JSON：'+error.message);return;}
+      body.reason='人工补充研究要求';
+    }
+    if(kind==='approve_degraded_delivery')body.confirm=$('humanDecisionConfirm').checked;
+    const submit=event.currentTarget.querySelector('button[type="submit"]');
+    submit.disabled=true;submit.textContent='正在提交…';
+    try{
+      await req('/tasks/'+detail.task_id+'/human-intervention/resolve',{method:'POST',body:JSON.stringify(body)});
+      detail=await req('/tasks/'+detail.task_id);renderTaskSummary();await loadResearchState(detail.task_id);renderTasks();
+    }catch(error){alert('人工决策提交失败：'+error.message);submit.disabled=false;submit.textContent='提交人工决策';}
+  });
+}
+
 function renderQuality() {
   const root=$('qualityPanel'),event=latestValidation();
   if(!event){root.innerHTML='<div class="panelhead">交付质量</div><div class="empty">尚无交付校验记录；报告生成后将在这里显示校验结论。</div>';return;}
@@ -481,7 +590,8 @@ function normalizedPlan(plan = {}) {
       id: String(step.id || 'step-' + (index + 1)),
       title: String(step.title || ''),
       objective: String(step.objective || ''),
-      expected_output: String(step.expected_output || '')
+      expected_output: String(step.expected_output || ''),
+      expected_output_path: String(step.expected_output_path || '')
     }))
   };
 }
@@ -501,7 +611,7 @@ function planSnapshot() {
   const latest=versions.length?versions[versions.length-1]:null;
   const finalizedEvent=latest?[...events].reverse().find(e=>e.event_type==='research_plan_finalized'&&e.event_id>latest.event.event_id)||null:null;
   const progress={};
-  for(const e of events){if(e.event_type!=='research_plan_step_status')continue;const p=e.payload||{};if(p.step_id)progress[p.step_id]={status:p.status||'pending',note:p.note||''};}
+  for(const e of events){if(e.event_type!=='research_plan_step_status')continue;const p=e.payload||{};if(p.step_id)progress[p.step_id]={status:p.status||'pending',note:p.note||'',verified_output:p.verified_output||null};}
   return {versions,latest,finalizedEvent,progress};
 }
 
@@ -531,10 +641,10 @@ function planHistoryEntry(version) {
 function renderPlan() {
   const {versions,latest,finalizedEvent,progress}=planSnapshot();planVersions=versions;
   const root=$('planPanel');if(!latest){root.innerHTML='<div class="empty plan-empty">Agent 尚未提交整体研究计划。</div>';return;}
-  const counts={pending:0,in_progress:0,completed:0,skipped:0,failed:0};
+  const counts={pending:0,in_progress:0,completed:0,skipped:0,failed:0,awaiting_verification:0};
   const steps=latest.plan.steps.map(step=>{const status=progress[step.id]?.status||'pending';counts[status]=(counts[status]||0)+1;return {...step,status,note:progress[step.id]?.note||''};});
   const total=steps.length,done=counts.completed+counts.skipped,pct=total?Math.round(done/total*100):0;
-  const labels={pending:'待执行',in_progress:'进行中',completed:'已完成',skipped:'已跳过',failed:'失败'};
+  const labels={pending:'待执行',in_progress:'进行中',completed:'已完成',skipped:'已跳过',failed:'失败',awaiting_verification:'待产物核验'};
   root.innerHTML='<div class="plan-top"><div><strong>'+esc(latest.plan.title)+'</strong><p>'+esc(latest.plan.objective)+'</p></div><span class="plan-version">'+
     (finalizedEvent?'最终计划已归档':'规划执行中')+' · v'+latest.version+'</span></div>'+
     '<div class="plan-progress"><span>执行进度 '+done+'/'+total+'（'+pct+'%）</span><div><i style="width:'+pct+'%"></i></div></div>'+
@@ -543,6 +653,7 @@ function renderPlan() {
     '<div class="plan-section-label">当前整体执行计划</div><ol class="plan-steps">'+steps.map((s,i)=>
       '<li class="plan-step '+esc(s.status)+'"><span class="plan-index">'+(i+1)+'</span><div><strong>'+esc(s.title)+'</strong>'+
       (s.objective?'<p>'+esc(s.objective)+'</p>':'')+(s.expected_output?'<small>预期成果：'+esc(s.expected_output)+'</small>':'')+
+      (s.expected_output_path?'<small>产物路径：<code>'+esc(s.expected_output_path)+'</code></small>':'')+
       (s.note?'<small class="plan-step-note">'+esc(s.note)+'</small>':'')+'</div><span class="plan-state">'+labels[s.status]+'</span></li>').join('')+
     '</ol><p class="plan-archive-note">步骤进度独立记录，不产生新的策略版本。</p>'+
     (finalizedEvent?'<p class="plan-archive-note">完整计划及进度归档至 <code>notes/agent_execution_plan.json</code></p>':'')+

@@ -12,7 +12,7 @@ from app.config import Settings
 from app.infrastructure.database import Database
 from app.infrastructure.lifecycle import close_registered_resources
 from app.runtime.executor import ResearchExecutor
-from app.runtime.errors import TaskCancelled, TaskDeadlineExceeded, TaskPaused, TaskStepLimitExceeded, WorkerLeaseLost, BudgetExhausted, classify_exception
+from app.runtime.errors import TaskCancelled, TaskDeadlineExceeded, TaskPaused, TaskStepLimitExceeded, TaskWaitingForHuman, WorkerLeaseLost, BudgetExhausted, classify_exception
 
 logging.basicConfig(
     level=logging.INFO,
@@ -60,6 +60,10 @@ class Worker:
                 relative = str(Path(result_path).resolve().relative_to(self.settings.app_home)) if Path(result_path).resolve().is_relative_to(self.settings.app_home) else result_path
                 if self.db.mark_completed(task["task_id"], relative, self.worker_id):
                     self._finalize_role_if_terminal(task["task_id"])
+        except TaskWaitingForHuman:
+            # The executor has already atomically parked the task and recorded
+            # the intervention request. Do not retry or mark it completed.
+            logger.info("task %s is waiting for a human decision", task["task_id"])
         except TaskPaused:
             self.db.mark_paused(task["task_id"], self.worker_id)
         except TaskCancelled:
@@ -110,6 +114,20 @@ class Worker:
         attempt = max(1, int(task["attempts"]))
         return min(self.settings.retry_base_seconds * (2 ** (attempt - 1)), self.settings.retry_max_seconds)
 
+    def _recover_stale_tasks(self) -> int:
+        from app.runtime.recovery_manager import RecoveryManager
+        manager = RecoveryManager(
+            self.db, self.settings.workspace_dir, self.settings.checkpoint_path
+        )
+        # Reconcile the task DB, tool side effects and checkpoint before the
+        # generic stale-task transition makes the task claimable again.
+        try:
+            manager.reconcile_stale_tasks(self.settings.worker_lease_seconds)
+        except Exception:
+            logger.exception("stale-task reconciliation failed; refusing blind requeue")
+            return 0
+        return self.db.recover_stale_tasks(self.settings.worker_lease_seconds)
+
     def run_once(self) -> bool:
         while not self._stop.is_set():
             if self.db.acquire_worker_lease(self.worker_id, self.settings.worker_lease_seconds):
@@ -121,7 +139,7 @@ class Worker:
         heartbeat = threading.Thread(target=self._heartbeat_loop, name="worker-heartbeat", daemon=True)
         heartbeat.start()
         try:
-            self.db.recover_stale_tasks(self.settings.worker_lease_seconds)
+            self._recover_stale_tasks()
             task = self.db.claim_next_task(self.worker_id)
             if task is None:
                 return False
@@ -144,7 +162,7 @@ class Worker:
         logger.info("worker started: %s", self.worker_id)
         try:
             while not self._stop.is_set():
-                self.db.recover_stale_tasks(self.settings.worker_lease_seconds)
+                self._recover_stale_tasks()
                 task = self.db.claim_next_task(self.worker_id)
                 if task is None:
                     self._stop.wait(self.settings.worker_poll_seconds)

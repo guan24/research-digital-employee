@@ -8,3 +8,17 @@ description = "自主检索、证据登记、长期记忆与研究报告"
 output_artifact = "report.md"
 max_runtime_seconds = 3600
 max_total_tokens = 100000
+
+# Independent quality evaluator baseline. Weights must sum to 100.
+quality_min_total_score = 80
+quality_min_dimension_score = 60
+quality_max_revisions = 2
+quality_rule_ratio = 0.60
+quality_review_attempts = 2
+
+[quality_weights]
+goal_coverage = 20
+evidence_sufficiency = 25
+source_reliability = 20
+conclusion_consistency = 20
+report_completeness = 15

@@ -1,12 +1,15 @@
 from __future__ import annotations
 
 from contextlib import contextmanager
+import time
+import pytest
 from pathlib import Path
 from types import SimpleNamespace
 
 from app.infrastructure.artifact_store import ArtifactStore
 from app.infrastructure.evidence_registry import EvidenceRegistry
-from app.runtime.executor import ResearchExecutor
+from app.runtime.executor import ResearchExecutor, TaskEventCallback
+from app.runtime.control import TaskWaitingForHuman
 
 
 @contextmanager
@@ -46,7 +49,10 @@ def _make_runner(settings, db, agent):
     def builder(_settings, _db, _task, _checkpointer, _started):
         return agent
 
-    return ResearchExecutor(settings, db, agent_builder=builder, checkpointer_factory=fake_checkpointer)
+    return ResearchExecutor(
+        settings, db, agent_builder=builder, checkpointer_factory=fake_checkpointer,
+        quality_review_enabled=False,
+    )
 
 
 def test_executor_starts_new_task_without_checkpoint(settings, db):
@@ -89,6 +95,75 @@ def test_executor_recovers_completed_checkpoint_without_reinvoking(settings, db)
     assert agent.invocations == []
     assert "Already completed" in Path(report_path).read_text(encoding="utf-8")
 
+
+
+def test_executor_runs_integrated_evidence_and_quality_delivery_loop(settings, db):
+    from app.infrastructure.evidence_registry import EvidenceRegistry
+    from app.runtime.research_controller import ResearchController
+
+    task = db.create_task("研究 Agent 生命周期闭环")
+    task = db.claim_next_task("worker-quality-loop")
+    artifacts = ArtifactStore(settings.workspace_dir, task["task_id"])
+    registry = EvidenceRegistry(artifacts)
+    source = registry.register_source(
+        url="https://example.org/architecture",
+        title="Primary architecture source",
+        content="The primary source documents the architecture, state persistence and recovery semantics. " * 12,
+    )
+    registry.record_finding(
+        claim="The system persists graph state and resumes pending work after interruption.",
+        source_ids=[source["source_id"]],
+        rationale="Verified against the immutable source snapshot.",
+        confidence="high",
+        dimension_id="architecture",
+    )
+    ResearchController(db, task["task_id"], artifacts).define_requirements({
+        "dimensions": [{
+            "id": "architecture", "title": "系统架构", "questions": ["状态如何持久化和恢复？"],
+            "expected_evidence": ["一手架构资料"], "priority": "critical", "min_sources": 1,
+        }]
+    })
+    report = (
+        "# 研究报告\n\n"
+        "## 研究范围与方法\n\n"
+        + ("本研究依据登记的一手架构资料分析状态持久化与任务恢复机制，并将关键结论与来源快照逐项核对 [S0001]。 " * 3)
+        + "\n\n## 主要发现\n\n"
+        + ("系统使用持久化执行状态恢复中断任务，来源快照支持这一实现判断，并记录了相应证据边界 [S0001]。 " * 3)
+        + "\n\n## 局限性\n\n"
+        + ("当前验证覆盖单 Worker 的离线恢复路径，尚未覆盖多主机并发执行和外部服务长期故障 [S0001]。 " * 3)
+        + "\n\n## 结论\n\n"
+        + ("该实现能够为单 Worker 长任务提供可追踪的状态恢复基础，仍需通过故障注入进一步验证边界 [S0001]。 " * 3)
+        + "\n\n## Sources\n\n- https://example.org/architecture\n"
+    )
+
+    class LifecycleAgent:
+        def get_state(self, config):
+            return None
+        def invoke(self, payload, config):
+            callback = config["callbacks"][0]
+            callback.on_tool_start({"name": "web_search"}, '{"query":"architecture"}', run_id="quality-loop-tool")
+            callback.on_tool_end('{"results":[]}', run_id="quality-loop-tool")
+            return {"messages": [{"role": "assistant", "content": report}]}
+
+    reviewer = lambda _: {"scores": {key: 95 for key in (
+        "goal_coverage", "evidence_sufficiency", "source_reliability",
+        "conclusion_consistency", "report_completeness")}}
+    agent = LifecycleAgent()
+    runner = ResearchExecutor(
+        settings, db,
+        agent_builder=lambda *_args: agent,
+        checkpointer_factory=fake_checkpointer,
+        research_reviewer=reviewer,
+        quality_review_enabled=True,
+    )
+    output = runner.run(task)
+    assert Path(output).read_text(encoding="utf-8").startswith("# 研究报告")
+    assessments = db.list_quality_assessments(task["task_id"])
+    assert len(assessments) == 1 and assessments[0]["passed"] is True
+    events = db.get_events(task["task_id"])
+    assert any(event["event_type"] == "research_phase_boundary_observed" for event in events)
+    delivered = next(event for event in events if event["event_type"] == "report_delivered")
+    assert delivered["payload"]["quality_assessment_id"] == assessments[0]["assessment_id"]
 
 
 def test_manual_retry_resumes_original_checkpoint_thread_id(settings, db):
@@ -252,3 +327,84 @@ def test_executor_persists_repair_response_when_agent_does_not_call_save_artifac
     assert "Repaired report" in persisted
     assert any(event["event_type"] == "report_delivered" for event in events)
     assert sum(event["event_type"] == "delivery_validation_completed" for event in events) == 2
+
+
+def test_research_controller_request_human_parks_worker_and_stops_callbacks(db):
+    task = db.create_task("Park when research controller requires operator input")
+    claimed = db.claim_next_task("worker-controller-human")
+
+    class ProgressProbe:
+        @staticmethod
+        def _tool_phase(_tool_name, _input_value):
+            return "analysis"
+
+    class LifecycleProbe:
+        @staticmethod
+        def assess_progress(trigger):
+            assert trigger == "phase_boundary"
+            return {
+                "coverage": {"coverage_ratio": 0.25, "critical_gaps": [{"dimension_id": "security"}]},
+                "decision": {
+                    "recommended_action": "REQUEST_HUMAN",
+                    "reason": "关键安全维度连续评估无进展。",
+                },
+            }
+
+    callback = TaskEventCallback(
+        db, task["task_id"], time.monotonic(), 120,
+        worker_id="worker-controller-human",
+        worker_generation=claimed["worker_generation"],
+        plan_progress_service=ProgressProbe(),
+        lifecycle_coordinator=LifecycleProbe(),
+    )
+    with pytest.raises(TaskWaitingForHuman):
+        callback._observe_research_phase("record_finding", "{}")
+
+    assert db.get_task(task["task_id"])["status"] == "waiting_for_human"
+    pending = db.get_pending_human_intervention(task["task_id"])
+    assert pending["category"] == "research_control_requires_human"
+    assert "add_research_requirements" in pending["request"]["choices"]
+    with pytest.raises(TaskWaitingForHuman):
+        callback._check_control()
+
+
+def test_executor_injects_human_decision_when_resuming_completed_checkpoint(settings, db):
+    task = db.create_task("Research a topic with enough detail")
+    first_claim = db.claim_next_task("worker-human-resume")
+    _register_evidence(settings, first_claim)
+    intervention_id = db.set_waiting_for_human(
+        task["task_id"], "research_control_requires_human",
+        {"message": "请调整研究重点。", "choices": ["change_research_direction", "terminate"]},
+        worker_id="worker-human-resume",
+    )
+    db.resolve_human_intervention(
+        task["task_id"], intervention_id, "change_research_direction",
+        {"reason": "优先研究安全边界。", "direction": "将安全边界和权限隔离作为首要研究方向。"},
+    )
+    resumed_task = db.claim_next_task("worker-human-resume")
+    assert resumed_task["resume_mode"] == 1
+
+    snapshot = SimpleNamespace(
+        next=(),
+        values={"messages": [{"role": "assistant", "content": (
+            "# Research report\n\n## 摘要\n\n"
+            + ("Evidence-backed result and analysis is supported by the registered primary source [S0001]. " * 8)
+            + "\n\n## Sources\n- https://example.org/research-source"
+        )}]},
+    )
+    agent = FakeAgent(snapshot=snapshot)
+    runner = _make_runner(settings, db, agent)
+    runner.run(resumed_task)
+
+    assert len(agent.invocations) == 1
+    injected = agent.invocations[0]["messages"]
+    human_message = next(message for message in injected if getattr(message, "id", None) == f"human-intervention-{intervention_id}")
+    assert "安全边界和权限隔离" in human_message.content
+    assert "change_research_direction" in human_message.content
+    events = db.get_events(task["task_id"])
+    assert any(
+        event["event_type"] == "human_decision_consumed"
+        and event["payload"]["intervention_id"] == intervention_id
+        for event in events
+    )
+

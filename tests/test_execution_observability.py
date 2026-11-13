@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import pytest
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -150,15 +151,19 @@ def test_tool_callbacks_automatically_advance_plan_steps_from_real_work(settings
     callback.on_tool_end('{"finding_id":"F0001"}', run_id="tool-analysis")
     callback.on_tool_start({"name": "save_artifact"}, '{"path":"report.md","content":"# Report"}', run_id="tool-report")
     callback.on_tool_end('Saved report.md', run_id="tool-report")
+    service.artifacts.write_text("report.md", "# Verified report\\n\\nFinal deliverable.")
     callback.sync_plan_progress_for_phase("validation", "系统开始交付校验")
-    callback.complete_active_plan_step("报告已通过校验并交付")
+    callback.complete_active_plan_step("报告已通过校验并交付", output_path="report.md")
 
     events = db.get_events(task["task_id"])
     progress_events = [event for event in events if event["event_type"] == "research_plan_step_status"]
     latest = service._latest_step_progress(events)
     assert [latest[key]["status"] for key in ("discover", "read", "analyze", "report", "validate")] == [
-        "completed", "completed", "completed", "completed", "completed"
+        "awaiting_verification", "awaiting_verification", "awaiting_verification",
+        "completed", "completed",
     ]
+    assert latest["report"]["verified_output"]["path"] == "report.md"
+    assert latest["validate"]["verified_output"]["path"] == "report.md"
     assert all(latest[key]["source"] == "runtime" for key in latest)
     assert [event["event_type"] for event in events].count("tool_call_started") == 4
     assert [event["event_type"] for event in events].count("tool_call_completed") == 4
@@ -166,7 +171,7 @@ def test_tool_callbacks_automatically_advance_plan_steps_from_real_work(settings
     assert "research_plan_activity" not in [event["event_type"] for event in events]
 
 
-def test_report_phase_completes_an_analysis_step_without_a_separate_analysis_tool(settings, db):
+def test_report_phase_marks_analysis_as_awaiting_verification_without_an_artifact(settings, db):
     from app.runtime.plan_progress import PlanProgressTracker
 
     task, service = make_service(settings, db)
@@ -193,9 +198,9 @@ def test_report_phase_completes_an_analysis_step_without_a_separate_analysis_too
     callback.on_tool_start({"name": "save_artifact"}, '{"path":"report.md","content":"# Report"}', run_id="report")
 
     latest = service._latest_step_progress(db.get_events(task["task_id"]))
-    assert latest["discover"]["status"] == "completed"
-    assert latest["read"]["status"] == "completed"
-    assert latest["analyze"]["status"] == "completed"
+    assert latest["discover"]["status"] == "awaiting_verification"
+    assert latest["read"]["status"] == "awaiting_verification"
+    assert latest["analyze"]["status"] == "awaiting_verification"
     assert latest["report"]["status"] == "in_progress"
     assert latest["validate"]["status"] == "pending"
 
@@ -227,7 +232,12 @@ def test_plan_step_progress_is_separate_from_strategic_versions(settings, db):
     ]}
     service.update_research_plan(json.dumps(plan, ensure_ascii=False))
     service.update_plan_step_status("scope", "in_progress", "正在梳理研究边界")
-    service.update_plan_step_status("scope", "completed", "范围和评价标准已确定")
+    with pytest.raises(ValueError, match="requires an existing"):
+        service.update_plan_step_status("scope", "completed", "范围和评价标准已确定")
+    service.artifacts.write_text("notes/scope.md", "# Scope\\n\\n范围和评价标准已确定。")
+    service.update_plan_step_status(
+        "scope", "completed", "范围和评价标准已确定", output_path="notes/scope.md",
+    )
     service.update_plan_step_status("research", "in_progress", "正在检索官方资料")
     assert len([e for e in db.get_events(task["task_id"]) if e["event_type"] == "research_plan_updated"]) == 1
     live = json.loads(service.artifacts.read_text("notes/research_plan.json"))
@@ -241,7 +251,8 @@ def test_plan_progress_replan_preserves_unchanged_and_resets_modified_steps(sett
         {"id": "scope", "title": "明确范围"}, {"id": "research", "title": "收集证据"}
     ]}
     service.update_research_plan(json.dumps(initial, ensure_ascii=False))
-    service.update_plan_step_status("scope", "completed", "范围确认完成")
+    service.artifacts.write_text("notes/scope.md", "# Scope\\n\\n范围确认完成。")
+    service.update_plan_step_status("scope", "completed", "范围确认完成", output_path="notes/scope.md")
     service.update_plan_step_status("research", "in_progress", "正在收集资料")
     revised = {"title": "调整计划", "objective": "增加交叉核验", "steps": [
         {"id": "scope", "title": "明确范围"},
@@ -266,7 +277,10 @@ def test_final_plan_archive_contains_step_progress(settings, db):
     task, service = make_service(settings, db)
     service.update_research_plan(json.dumps({"title":"计划","objective":"研究","steps":[
         {"id":"one","title":"收集资料"},{"id":"two","title":"撰写报告"}]}, ensure_ascii=False))
-    service.update_plan_step_status("one", "completed", "资料已收集")
+    service.artifacts.write_text("notes/source-list.md", "# Sources\\n\\n资料已收集。")
+    service.update_plan_step_status(
+        "one", "completed", "资料已收集", output_path="notes/source-list.md",
+    )
     service.update_plan_step_status("two", "in_progress", "正在撰写")
     archive_path = ResearchExecutor(settings, db).finalize_plan(task["task_id"], "completed")
     archive = json.loads(service.artifacts.read_text(archive_path))
