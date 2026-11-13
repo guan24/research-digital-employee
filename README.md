@@ -1,22 +1,22 @@
 # Research Digital Employee
 
-A long-running autonomous research system built with **Deep Agents, LangGraph, FastAPI and SQLite**. A user submits a research goal; the Research Agent creates and adapts its plan, searches and reads external sources, records evidence and findings, saves intermediate artifacts, and produces a source-backed Markdown report. A separate Worker runs tasks in the background, so closing the browser does not stop an active task.
+A long-running autonomous research system built with **Deep Agents, LangGraph, FastAPI and SQLite**. A user submits a research goal; the Research Agent creates and adapts its plan, searches and reads external sources, records evidence and findings, saves intermediate artifacts, and produces a source-backed Markdown report. A separate Worker executes tasks independently of the browser session, keeping long-running research active while users leave the console.
 
-The project addresses the central challenge in the development exercise: for example, researching leading Coding Agent architectures and comparing planning, tool use and context management in a source-backed Markdown report. Such work may take tens of minutes or longer; new evidence may change the best next action, and model/provider failures or process interruptions must not erase the task's progress. Developers must also be able to inspect how a result was produced and distinguish role-specific capabilities from shared runtime services.
+The project addresses the central challenge in the development exercise: researching leading Coding Agent architectures and comparing planning, tool use and context management in a source-backed Markdown report. Such work may take tens of minutes or longer. New evidence can change the best next action, while persistent state and recovery preserve task progress across model/provider failures and process interruptions. Developers can inspect how a result was produced and distinguish role-specific capabilities from shared runtime services.
 
 ## What the project demonstrates
 
 | Exercise requirement | Implementation |
 |---|---|
-| Autonomous research, not a fixed pipeline | The Agent chooses searches, reads, analysis and follow-up actions; material strategy changes are recorded as plan revisions |
+| Autonomous research and adaptive planning | The Agent chooses searches, reads, analysis and follow-up actions; material strategy changes are recorded as plan revisions |
 | External search, reading and intermediate artifacts | Tavily, web/PDF retrieval, GitHub MCP, arXiv, task-scoped artifacts, durable memory and an evidence registry |
 | Long-running execution and production failures | Independent Worker, SQLite task state, LangGraph checkpoints, lease/heartbeat, retries, budgets and conservative recovery |
 | Understand and diagnose task execution | Persistent event journal, model/tool call records, SSE replay, plan snapshots, evidence, budget, quality and recovery records |
 | Separate role capabilities from shared capabilities | Agent Registry defines role contracts; task lifecycle, Worker, persistence, budget and audit are shared runtime services |
 | Technology choice is open | Uses Python, Deep Agents, LangGraph, FastAPI, SQLite and an OpenAI-compatible model endpoint; components can be replaced as role and deployment needs evolve |
-| No complex UI is required; design and runnable code matter most | The web console is an operator surface for task control, execution inspection and human decisions; engineering effort is centered on Agent autonomy, persistence, evidence, recovery and verification |
+| Operator interface and engineering focus | The web console supports task control, execution inspection and human decisions; engineering effort is centered on Agent autonomy, persistence, evidence, recovery and verification |
 
-The goal is not simply to give a model tools. It is to place an autonomous research Agent inside a durable task lifecycle with evidence feedback, resource boundaries, delivery validation and recovery.
+The system places an autonomous research Agent inside a durable task lifecycle with evidence feedback, resource boundaries, delivery validation and recovery.
 
 ## Architecture
 
@@ -71,12 +71,12 @@ flowchart TB
 - `data/checkpoints.sqlite` stores LangGraph graph state and message history, keyed by `task_id` as `thread_id`.
 - `workspaces/{task_id}/` stores plan versions, research memory, source snapshots, the evidence registry, intermediate artifacts and the final report.
 
-These stores have distinct responsibilities: the task database records business state, the checkpoint preserves Agent execution context, and the workspace holds research material and deliverables. Recovery reconciles them rather than treating any one store as a complete substitute for the others.
+These stores have distinct responsibilities: the task database records business state, the checkpoint preserves Agent execution context, and the workspace holds research material and deliverables. Recovery reconciles state and side effects across all three stores.
 
 ## Research lifecycle
 
 1. **Accept a goal.** The API validates the requested role, creates a durable task and applies role-level budget defaults.
-2. **Claim in the background.** The Worker obtains the global lease, claims the task and increments `worker_generation`. The browser is an operator console, not the task process.
+2. **Claim in the background.** The Worker obtains the global lease, claims the task and increments `worker_generation`. The browser provides task operation and observation; the Worker owns background execution.
 3. **Plan the research.** The Agent creates a structured plan of 3–8 steps and a coverage matrix of 3–12 research dimensions.
 4. **Research autonomously.** The Agent chooses searches, webpage/PDF reads, GitHub inspection or arXiv retrieval. Successfully extracted sources are snapshotted; important conclusions become Findings linked to source IDs and research dimensions.
 5. **Adapt to evidence.** The Research Controller measures dimension coverage, critical gaps and stagnation, then returns bounded recommendations. The Agent chooses and performs most research actions based on the observed evidence.
@@ -165,7 +165,7 @@ Budget extensions require operator approval. A task failed by a hard budget gate
 - An OpenAI or OpenAI-compatible Chat Completions endpoint.
 - A Tavily API key for web search.
 - An optional read-only GitHub fine-grained PAT.
-- Node.js 22 for frontend JavaScript tests only; Node is not required to run the backend.
+- Node.js 22 for frontend JavaScript tests; backend execution uses Python.
 
 ### Install
 
@@ -255,7 +255,7 @@ python -m pytest -v
 node --check app/static/app.js
 ```
 
-GitHub Actions runs pytest on Ubuntu and Windows with Python 3.12 and checks frontend JavaScript with Node.js 22. Automated tests use local SQLite and test doubles; they do not call a real model API or incur provider token usage.
+GitHub Actions runs pytest on Ubuntu and Windows with Python 3.12 and checks frontend JavaScript with Node.js 22. Automated tests use local SQLite and deterministic test doubles for repeatable execution without provider token costs.
 
 Key verification paths:
 
@@ -266,7 +266,7 @@ Key verification paths:
 - `tests/test_role_extensibility.py`: reuse of the shared runtime by a second role in tests.
 - `tests/test_documentation.py`: document encoding, references and key design claims.
 
-The console includes a [read-only task execution example](examples/rainbow-research/README.md) with a redacted real report, event trace, plan, evidence, budget and human-decision history. It is not imported into the runnable task database and triggers no model calls. The historical task ended with human-approved degraded delivery because its independent review was unavailable; the example demonstrates execution traceability, not an automatic quality pass.
+The console includes a [read-only task execution example](examples/rainbow-research/README.md) with a redacted real report, event trace, plan, evidence, budget and human-decision history. The sample is served as a static snapshot, separately from runnable task data, and can be inspected without model calls. The historical task's independent quality review was unavailable, its quality assessment returned `passed=false`, and an operator approved degraded delivery; the snapshot preserves the corresponding execution trace and human decision.
 
 ## Design documents
 
