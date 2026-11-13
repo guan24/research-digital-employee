@@ -292,20 +292,25 @@ def test_recovery_manager_verifies_artifact_side_effect_by_hash(settings, db):
 def test_human_intervention_parks_and_resumes_task_with_directive(db):
     task = _running_task(db)
     intervention_id = db.set_waiting_for_human(
-        task["task_id"], "quality_not_satisfied",
-        {"message": "研究质量未达到门槛。"}, worker_id="worker-lifecycle-test",
+        task["task_id"], "research_control_requires_human",
+        {"message": "研究关键维度持续存在缺口。",
+         "choices": ["continue_research", "change_research_direction",
+                     "add_research_requirements", "terminate"]},
+        worker_id="worker-lifecycle-test",
     )
     assert intervention_id
     assert db.get_task(task["task_id"])["status"] == "waiting_for_human"
     resolved = db.resolve_human_intervention(
         task["task_id"], intervention_id, "change_research_direction",
-        {"directive": "补充官方源码证据并核验版本差异。"},
+        {"reason": "补充官方源码证据并核验版本差异。",
+         "direction": "补充官方源码证据并核验版本差异。"},
     )
     assert resolved["status"] == "queued"
     events = db.get_events(task["task_id"])
     decision = next(event for event in reversed(events)
                     if event["event_type"] == "human_intervention_resolved")
-    assert decision["payload"]["payload"]["directive"].startswith("补充官方源码")
+    assert decision["payload"]["payload"]["direction"].startswith("补充官方源码")
+    assert decision["payload"]["category"] == "research_control_requires_human"
 
 
 def test_event_limit_returns_latest_events_for_long_running_tasks(db):
