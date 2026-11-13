@@ -346,7 +346,8 @@ class PlanProgressTracker:
         plan = self._normalize_plan((pe.get("payload") or {}).get("plan") or {})
         ids = {s["id"]: s for s in plan["steps"]}
         active = [p for p in self._latest_progress(events).values()
-                  if p.get("status") == "in_progress" and int(p.get("plan_version") or 1) == version
+                  if p.get("status") in {"in_progress", "awaiting_verification"}
+                  and int(p.get("plan_version") or 1) == version
                   and p.get("step_id") in ids]
         for p in sorted(active, key=lambda x: x.get("event_id", 0), reverse=True):
             self.transition_step(p["step_id"], "completed", note, source="runtime",
@@ -402,8 +403,93 @@ class PlanProgressTracker:
                     for s in plan["steps"]]}
         self.artifacts.write_text("notes/research_plan.json", json.dumps(live, ensure_ascii=False, indent=2))
         try:
-            from app.tools.research_tools import ResearchToolService
-            ResearchToolService.persist_plan_archive(self.db, self.task_id, self.artifacts, status="in_progress")
+            progress = self._latest_progress(events)
+            history = []
+            previous_signature = None
+            for event in events:
+                if event.get("event_type") != "research_plan_updated":
+                    continue
+                p = event.get("payload") or {}
+                archived_plan = self._normalize_plan(p.get("plan") or {})
+                signature = json.dumps(archived_plan, ensure_ascii=False, sort_keys=True)
+                if signature == previous_signature:
+                    continue
+                previous_signature = signature
+                history.append({
+                    "version": len(history) + 1,
+                    "timestamp": event.get("timestamp"),
+                    "change_type": p.get("change_type") or ("initial" if not history else "replan"),
+                    "trigger": p.get("trigger") or p.get("change_reason") or "",
+                    "new_information": p.get("new_information") or "",
+                    "problem_analysis": p.get("problem_analysis") or "",
+                    "decision": p.get("decision") or "",
+                    "changes": p.get("changes") or p.get("change_reason") or "",
+                    "plan_diff": p.get("plan_diff") or {},
+                    "original_plan_text": p.get("original_plan_text") or "",
+                    "plan": archived_plan,
+                })
+            step_progress = {
+                step["id"]: {
+                    "status": progress.get(step["id"], {}).get("status", "pending"),
+                    "updated_at": progress.get(step["id"], {}).get("updated_at"),
+                    "note": progress.get(step["id"], {}).get("note", ""),
+                    "source": progress.get(step["id"], {}).get("source"),
+                    "phase": progress.get(step["id"], {}).get("phase"),
+                    "plan_version": progress.get(step["id"], {}).get("plan_version"),
+                    "verified_output": progress.get(step["id"], {}).get("verified_output"),
+                    "tool_call_id": progress.get(step["id"], {}).get("tool_call_id"),
+                    "tool_name": progress.get(step["id"], {}).get("tool_name"),
+                }
+                for step in plan["steps"]
+            }
+            final_plan_with_progress = {
+                **plan,
+                "steps": [
+                    {
+                        **step,
+                        "status": step_progress[step["id"]]["status"],
+                        "status_updated_at": step_progress[step["id"]]["updated_at"],
+                        "status_note": step_progress[step["id"]]["note"],
+                        "status_source": step_progress[step["id"]]["source"],
+                        "verified_output": step_progress[step["id"]]["verified_output"],
+                    }
+                    for step in plan["steps"]
+                ],
+            }
+            counts = {status: sum(1 for item in step_progress.values() if item["status"] == status)
+                      for status in sorted(self.STATUSES)}
+            latest_focus = next(
+                (event.get("payload") or {} for event in reversed(events)
+                 if event.get("event_type") == "research_plan_step_focus_changed"),
+                {},
+            )
+            task = self.db.get_task(self.task_id) or {}
+            archive = {
+                "schema_version": 2,
+                "task_id": self.task_id,
+                "goal": task.get("goal", ""),
+                "status": task.get("status", "in_progress"),
+                "outcome": None,
+                "finalized_at": None,
+                "current_version": len(history),
+                "final_plan": plan,
+                "final_plan_with_progress": final_plan_with_progress,
+                "progress": step_progress,
+                "progress_counts": counts,
+                "active_step": (
+                    {"step_id": latest_focus.get("step_id"),
+                     "plan_version": latest_focus.get("plan_version"),
+                     "phase": latest_focus.get("phase"),
+                     "source": latest_focus.get("source")}
+                    if latest_focus.get("active") else None
+                ),
+                "history": history,
+                "note": "Strategic plan revisions and execution progress are stored separately.",
+            }
+            self.artifacts.write_text(
+                "notes/agent_execution_plan.json",
+                json.dumps(archive, ensure_ascii=False, indent=2),
+            )
         except Exception as exc:
             self.db.add_event(self.task_id, "research_plan_snapshot_refresh_failed", {
                 "error_type": type(exc).__name__, "error": str(exc)[:1000]})
