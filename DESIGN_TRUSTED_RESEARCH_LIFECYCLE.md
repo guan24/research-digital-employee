@@ -11,7 +11,7 @@ Agent 根据新获得的资料持续调整研究动作；系统通过证据登�
 1. **目标驱动而非步骤驱动**：用户提供目标和交付要求，Agent 负责选择研究路径。
 2. **计划可演进**：初始计划用于表达战略，只有研究范围、假设、优先级或剩余工作发生实质变化时才创建新版本。
 3. **结论关联证据**：Finding 关联来源 ID 和研究维度，形成研究主张、证据来源与研究问题之间的可追溯关系。
-4. **建议与强制分层**：Controller 提供证据驱动建议，Agent 负责大部分研究决策；Runtime 对预算、任务控制和人工停车执行确定性约束。
+4. **建议与强制分层**：Controller 提供证据驱动建议，Agent 负责大部分研究决策；共享任务运行层对预算、任务控制和人工停车执行确定性约束。
 5. **先核验再恢复**：进程中断后先判断工具副作用和 Checkpoint 状态，再决定是否重新执行。
 
 ## 二、模块职责与调用关系
@@ -203,12 +203,12 @@ Controller 根据研究覆盖、停滞、质量评估状态和预算阶段，返
 
 Controller 不直接搜索资料，也不替 Agent 写计划。Agent 通过 `get_research_status` 获取覆盖矩阵和行动建议，并根据上下文选择具体工具与研究动作。
 
-Runtime 对两类情形执行确定性约束：
+共享任务运行层对两类情形执行确定性约束：
 
 1. 预算进入收敛阶段后，工具层阻止新的搜索和来源读取，保留有限的综合、成果、记忆和证据操作。
 2. 阶段边界评估返回 `REQUEST_HUMAN` 时，任务原子地进入 `waiting_for_human`，释放 Worker 所有权并创建人工待办。
 
-因此，系统采用“Agent 自主研究决策 + Controller 证据反馈 + Runtime 硬约束”的分层控制方式。
+因此，系统采用“Agent 自主研究决策 + Controller 证据反馈 + 共享任务运行层硬约束”的分层控制方式。
 
 ## 七、报告验证与质量评估
 
@@ -313,7 +313,7 @@ Worker 心跳过期后，RecoveryManager 先将未完成调用标记为 unknown�
 
 ### 8.5 错误分类和重试
 
-Runtime 将错误区分为任务控制信号、可重试错误和终态错误。网络超时、限流和上游服务暂时不可用等错误可进入有限重试；认证、权限、不可恢复参数和明确硬预算耗尽等情况进入终态处理。
+共享任务运行层将错误区分为任务控制信号、可重试错误和终态错误。网络超时、限流和上游服务暂时不可用等错误可进入有限重试；认证、权限、不可恢复参数和明确硬预算耗尽等情况进入终态处理。
 
 默认重试采用有上限的指数退避。操作人员可通过任务重试接口重新入队，复用已有 Checkpoint 和工作区。
 
@@ -327,7 +327,7 @@ Runtime 将错误区分为任务控制信号、可重试错误和终态错误。
 | 累计运行时间 | 3,600 秒 |
 | Token | 100,000 |
 
-模型调用前，Runtime 预留启发式输入 Token 估算、4,096 Token 输出上限和 256 Token 固定开销；模型响应后可用时使用 Provider usage 结算。Token 估算用于预算保护，不等同于 Provider 精确计量。
+模型调用前，共享任务运行层在模型调用前预留启发式输入 Token 估算、4,096 Token 输出上限和 256 Token 固定开销；模型响应后可用时使用 Provider usage 结算。Token 估算用于预算保护，不等同于 Provider 精确计量。
 
 收敛阶段保护：
 
@@ -391,13 +391,13 @@ API 接收 `action`、自然语言 `instruction`、`reason` 和必要的 `confir
 | `tests/test_research_lifecycle.py` | 研究需求、覆盖率、停滞、质量评估和人工干预 |
 | `tests/test_report_validator.py` | 报告结构、来源 ID、URL 和段落级引用检查 |
 | `tests/test_budget_gates.py` | 工具、Token 和运行时间预算闸门 |
-| `tests/test_role_extensibility.py` | 第二岗位在测试环境中复用公共 API、Worker、Executor、Checkpoint 和预算 |
+| `tests/test_role_extensibility.py` | 第二岗位在测试环境中复用共享 API、Worker、Executor、Checkpoint 和预算 |
 | `tests/test_documentation.py` | 文档编码、源码路径引用和关键设计声明 |
 
 自动化测试使用确定性模型和 HTTP 测试替身，覆盖生产 Builder、Worker、Executor、SQLite 与 Checkpoint 的控制链路，以及工具副作用核验、任务恢复和岗位运行时复用。
 
 ## 十三、实现范围
 
-当前版本以单机单 Worker 和 Research Agent 为运行基线。Agent Registry 通过岗位独立 Builder、Profile、产物、校验、修复、Finalizer 和预算契约承载岗位差异；测试专用分析岗位复用公共运行时接口。后续可沿该架构扩展多 Worker 并发、多主机调度和多岗位生产编排。
+当前版本以单机单 Worker 和 Research Agent 为运行基线。Agent Registry 通过岗位独立 Builder、Profile、产物、校验、修复、Finalizer 和预算契约承载岗位差异；测试专用分析岗位复用共享任务运行层接口。后续可沿该架构扩展多 Worker 并发、多主机调度和多岗位生产编排。
 
 系统围绕 **Agent 自主研究 → 证据登记与覆盖评估 → 根据新信息调整计划 → 质量门禁与有限修复 → 任务持久化、异常恢复和过程审计** 组织完整研究闭环。

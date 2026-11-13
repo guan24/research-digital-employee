@@ -2,7 +2,7 @@
 
 A long-running autonomous research system built with **Deep Agents, LangGraph, FastAPI and SQLite**. A user submits a research goal; the Research Agent creates and adapts its plan, searches and reads external sources, records evidence and findings, saves intermediate artifacts, and produces a source-backed Markdown report. A separate Worker executes tasks independently of the browser session, keeping long-running research active while users leave the console.
 
-The project addresses the central challenge in the development exercise: researching leading Coding Agent architectures and comparing planning, tool use and context management in a source-backed Markdown report. Such work may take tens of minutes or longer. New evidence can change the best next action, while persistent state and recovery preserve task progress across model/provider failures and process interruptions. Developers can inspect how a result was produced and distinguish role-specific capabilities from shared runtime services.
+The project addresses the central challenge in the development exercise: researching leading Coding Agent architectures and comparing planning, tool use and context management in a source-backed Markdown report. Such work may take tens of minutes or longer. New evidence can change the best next action, while persistent state and recovery preserve task progress across model/provider failures and process interruptions. Developers can inspect how a result was produced and distinguish role-specific capabilities from shared task runtime layer services.
 
 ## What the project demonstrates
 
@@ -12,7 +12,7 @@ The project addresses the central challenge in the development exercise: researc
 | External search, reading and intermediate artifacts | Tavily, web/PDF retrieval, GitHub MCP, arXiv, task-scoped artifacts, durable memory and an evidence registry |
 | Long-running execution and production failures | Independent Worker, SQLite task state, LangGraph checkpoints, lease/heartbeat, retries, budgets and conservative recovery |
 | Understand and diagnose task execution | Persistent event journal, model/tool call records, SSE replay, plan snapshots, evidence, budget, quality and recovery records |
-| Separate role capabilities from shared capabilities | Agent Registry defines role contracts; task lifecycle, Worker, persistence, budget and audit are shared runtime services |
+| Separate role capabilities from shared capabilities | Agent Registry defines role contracts; task lifecycle, Worker, persistence, budget and audit are shared task runtime layer services |
 | Technology choice is open | Uses Python, Deep Agents, LangGraph, FastAPI, SQLite and an OpenAI-compatible model endpoint; components can be replaced as role and deployment needs evolve |
 | Operator interface and engineering focus | The web console supports task control, execution inspection and human decisions; engineering effort is centered on Agent autonomy, persistence, evidence, recovery and verification |
 
@@ -27,7 +27,7 @@ flowchart TB
     API["FastAPI"]
     DB[("SQLite Task Database")]
     W["Background Worker"]
-    EX["Shared Executor / Runtime"]
+    EX["Executor (Shared Task Runtime Layer)"]
     REG["Agent Registry"]
     A["Research Agent"]
     RT["Research Tools"]
@@ -62,7 +62,7 @@ flowchart TB
 | Research tools | Web search, webpage/PDF retrieval, GitHub repository/source inspection and arXiv |
 | Research Controller | Evidence coverage, critical gaps, stagnation and bounded next-action recommendations |
 | ResearchEvaluator / ReportValidator | Report provenance and structure checks, rule-based scoring and isolated-context review |
-| Worker / Runtime | Task claiming, lease/heartbeat, checkpointing, budget gates, error classification, retries, recovery and finalization |
+| Worker / Shared Task Runtime Layer | Task claiming, lease/heartbeat, checkpointing, budget gates, error classification, retries, recovery and finalization |
 | Persistence and audit | SQLite task/control/event records, LangGraph checkpoints, workspace artifacts and tool-call journal |
 
 ### Persistence ownership
@@ -263,7 +263,7 @@ Key verification paths:
 - `tests/test_process_crash_recovery.py`: real subprocess interruption and recovery around Artifact, tool-call and checkpoint boundaries.
 - `tests/test_worker_fencing_races.py`: Worker takeover, generation fencing and competing terminal writes.
 - `tests/test_recovery_consistency.py`: cross-store state and tool-side-effect reconciliation.
-- `tests/test_role_extensibility.py`: reuse of the shared runtime by a second role in tests.
+- `tests/test_role_extensibility.py`: reuse of the shared task runtime layer by a second role in tests.
 - `tests/test_documentation.py`: document encoding, references and key design claims.
 
 The console includes a [read-only task execution example](examples/rainbow-research/README.md) with a redacted real report, event trace, plan, evidence, budget and human-decision history. The sample is served as a static snapshot, separately from runnable task data, and can be inspected without model calls. The historical task's independent quality review was unavailable, its quality assessment returned `passed=false`, and an operator approved degraded delivery; the snapshot preserves the corresponding execution trace and human decision.
@@ -276,4 +276,4 @@ The console includes a [read-only task execution example](examples/rainbow-resea
 
 ## Current operating scope
 
-This is a single-machine MVP for validating the core design. Production registers the `research` role and runs one Worker under a global lease. The Agent Registry defines role-specific builders, profiles, artifacts, validators, repair handlers, finalizers and budget defaults; a second role currently verifies reuse of the shared runtime in tests. A queue, Worker pool and multi-role scheduling can be added without moving role-specific research logic into the shared runtime.
+This is a single-machine MVP for validating the core design. Production registers the `research` role and runs one Worker under a global lease. The Agent Registry defines role-specific builders, profiles, artifacts, validators, repair handlers, finalizers and budget defaults; a second role currently verifies reuse of the shared task runtime layer in tests. A queue, Worker pool and multi-role scheduling can be added without moving role-specific research logic into the shared task runtime layer.

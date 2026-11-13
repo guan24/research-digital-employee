@@ -12,7 +12,7 @@
 | 调用搜索、读取资料、保存中间成果 | Tavily、网页/PDF、GitHub MCP、arXiv；任务级 Artifact、研究记忆、来源快照和 Finding 登记簿 |
 | 支持长时间运行和真实故障 | 独立 Worker、SQLite 任务状态、LangGraph Checkpoint、租约/心跳、重试、预算闸门和保守恢复 |
 | 理解执行过程并分析问题 | 持久化事件账本、模型/工具调用记录、SSE 回放、计划快照、证据、预算、质量评估和恢复记录 |
-| 区分岗位能力与公共基础能力 | Agent Registry 定义岗位契约；Worker、Executor、任务状态、持久化、预算和审计作为公共运行基础 |
+| 区分岗位能力与共享基础能力 | Agent Registry 定义岗位契约；Worker、Executor、任务状态、持久化、预算和审计由共享任务运行层统一提供 |
 | 技术选型开放 | 使用 Python、Deep Agents、LangGraph、FastAPI、SQLite 和 OpenAI 兼容模型接口，相关组件可按岗位和部署需要替换 |
 | 界面定位与工程重点 | Web 控制台提供任务操作、执行观察和人工决策入口；工程重点是 Agent 自主性、持久化、证据控制、恢复和测试验证 |
 
@@ -27,11 +27,11 @@ flowchart TB
     API["FastAPI"]
     DB[("SQLite 任务数据库")]
     W["独立 Worker"]
-    EX["公共 Executor / Runtime"]
+    EX["Executor（共享任务运行层）"]
     REG["Agent Registry"]
     A["Research Agent"]
     RT["研究工具"]
-    TT["公共任务工具"]
+    TT["共享任务工具"]
     LC["Research Lifecycle Coordinator"]
     CP[("LangGraph Checkpoint")]
     FS[("任务工作区 / Artifact")]
@@ -60,11 +60,11 @@ flowchart TB
 | FastAPI 操作接口 | 创建和控制任务，查询岗位、事件、计划、研究状态、证据、预算和成果，处理人工决策 |
 | Agent Registry | 描述岗位 Builder、Profile、产物路径、校验器、修复器、Finalizer 和默认预算 |
 | Research Agent | 自主规划、选择工具、研究资料、分析证据、保存记忆并撰写报告 |
-| 公共任务工具 | 任务级文件读写、长期记忆、预算查询和预算扩展申请 |
+| 共享任务工具 | 任务级文件读写、长期记忆、预算查询和预算扩展申请 |
 | 研究工具 | 网络搜索、网页/PDF、GitHub 仓库与源码、arXiv 论文 |
 | Research Controller | 根据研究维度、Finding 和有效来源计算覆盖率，识别关键缺口与停滞并提出下一步建议 |
 | Research Evaluator / ReportValidator | 校验报告结构和引用关系，结合规则评分与独立上下文评审执行质量门禁 |
-| Worker / Runtime | 任务领取、租约、心跳、Checkpoint、预算、错误分类、重试、恢复和终态处理 |
+| Worker / 共享任务运行层 | 任务领取、租约、心跳、Checkpoint、预算、错误分类、重试、恢复和终态处理 |
 | 持久化与审计 | SQLite 任务与事件、LangGraph Checkpoint、任务工作区、工具调用台账和恢复记录 |
 
 ### 三类持久化数据
@@ -265,7 +265,7 @@ GitHub Actions 在 Ubuntu 和 Windows、Python 3.12 环境运行 pytest，并使
 - `tests/test_process_crash_recovery.py`：通过真实子进程中断验证 Artifact、工具调用和 Checkpoint 的恢复。
 - `tests/test_worker_fencing_races.py`：验证 Worker 接管、执行代次隔离和并发终态写入。
 - `tests/test_recovery_consistency.py`：验证跨存储状态和工具副作用核验。
-- `tests/test_role_extensibility.py`：验证第二岗位在测试环境中复用公共运行时。
+- `tests/test_role_extensibility.py`：验证第二岗位在测试环境中复用共享任务运行层。
 - `tests/test_documentation.py`：检查文档编码、路径引用和关键设计实现。
 
 控制台附带一个[只读任务执行样例](examples/rainbow-research/README.md)，展示脱敏的真实报告、执行事件、研究计划、证据、预算和人工决策。样例以静态快照方式呈现，与可运行任务数据库分离，查看时无需调用模型。该历史任务的独立质量评审状态为 `unavailable`，质量评估结果为 `passed=false`，最终经人工批准降级交付；样例保留了相应的执行轨迹与人工决策记录。

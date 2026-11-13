@@ -9,7 +9,7 @@
 1. **自治性**：Agent 根据任务目标和研究证据自主选择研究路径，并在新信息改变研究方向时更新计划。
 2. **持久性**：任务、执行上下文、证据和中间成果能够跨请求、跨进程保存。
 3. **可诊断性**：关键模型调用、工具调用、计划变化、错误和恢复决策能够追溯。
-4. **可扩展性**：岗位差异留在岗位层，任务运行和可靠性能力沉淀为公共服务。
+4. **可扩展性**：岗位差异留在岗位层，任务运行和可靠性能力沉淀为共享任务运行层。
 
 最小版本选择单机、SQLite、单 Worker，减少分布式系统带来的额外变量，优先验证长期任务状态、证据控制和恢复机制。
 
@@ -22,7 +22,7 @@ flowchart TB
         API["FastAPI"]
     end
 
-    subgraph Runtime["公共任务运行层"]
+    subgraph Runtime["共享任务运行层"]
         W["Worker"]
         EX["Executor"]
         REG["Agent Registry"]
@@ -78,7 +78,7 @@ FastAPI 负责接收任务和人工操作请求，提供任务、岗位、事件
 
 API 负责任务接入与操作控制，任务创建后由独立 Worker 领取并持续执行，使长时间研究与 HTTP 请求、浏览器会话解耦。
 
-### 3.2 公共运行时
+### 3.2 共享任务运行层
 
 | 组件 | 当前职责 |
 |---|---|
@@ -89,18 +89,18 @@ API 负责任务接入与操作控制，任务创建后由独立 Worker 领取�
 | Database | 事务化维护任务状态、Worker 所有权、执行代次、预算、事件和人工待办 |
 | Artifact Store | 在任务隔离的工作区中读写文件，限制路径和允许的文件类型 |
 
-公共运行时聚焦任务执行、控制、持久化、恢复和审计；领域知识、研究策略与专用工具由岗位 Agent 提供。
+共享任务运行层负责任务执行、控制、持久化、恢复和审计；领域知识、研究策略与专用工具由岗位 Agent 提供。
 
 ### 3.3 岗位能力层
 
 当前生产环境注册 `research` 岗位。Research Agent 负责理解研究目标、创建计划、定义研究维度、选择工具、形成 Finding、保存记忆和撰写报告。
 
-研究工具与公共任务工具分开：
+研究工具与共享任务工具分开：
 
 - 研究工具：Tavily、网页/PDF、GitHub MCP、arXiv，以及研究计划、需求、Finding 和证据状态工具。
-- 公共任务工具：Artifact 读写、长期记忆、预算查询和扩额申请。
+- 共享任务工具：Artifact 读写、长期记忆、预算查询和扩额申请。
 
-岗位注册契约允许不同岗位定义自己的模型构建器、Profile、产物、校验器、修复器、Finalizer 和预算。`tests/test_role_extensibility.py` 通过测试专用分析岗位，验证岗位可以复用公共 API、Worker、Executor、Checkpoint 和任务工具。生产环境默认注册 Research Agent。
+岗位注册契约允许不同岗位定义自己的模型构建器、Profile、产物、校验器、修复器、Finalizer 和预算。`tests/test_role_extensibility.py` 通过测试专用分析岗位，验证岗位可以复用共享 API、Worker、Executor、Checkpoint 和任务工具。生产环境默认注册 Research Agent。
 
 ### 3.4 研究生命周期控制
 
@@ -110,7 +110,7 @@ ResearchLifecycleCoordinator 在研究阶段边界和最终交付阶段协调：
 - Research Evaluator：组合规则评分和独立上下文 LLM 评审，输出五维质量分数、硬阻断和可修复缺陷。
 - ReportValidator：检查 Markdown 结构、来源 ID、直接 URL 和正文引用覆盖率。
 
-Controller 根据证据覆盖生成行动建议，Agent 结合研究上下文选择下一步行动并更新计划；Runtime 执行预算硬闸门、任务控制和人工停车。
+Controller 根据证据覆盖生成行动建议，Agent 结合研究上下文选择下一步行动并更新计划；共享任务运行层负责执行预算硬闸门、任务控制和人工停车。
 
 ## 四、三类持久化数据的所有权
 
@@ -167,11 +167,11 @@ Worker 使用全局 SQLite 租约和心跳；每次领取任务增加 `worker_ge
 - **进程中断恢复**：`tests/test_process_crash_recovery.py` 使用独立子进程，在 Artifact 写入、工具调用开始和 Checkpoint 保存等边界强制终止，再验证恢复时的执行代次、消息状态和副作用核验。
 - **Worker 竞态**：`tests/test_worker_fencing_races.py` 使用独立 SQLite 连接和同步屏障，验证 Worker 接管、终态竞争及事务回滚。
 - **恢复一致性**：`tests/test_recovery_consistency.py` 验证不同工具类型的副作用核验策略。
-- **岗位扩展**：`tests/test_role_extensibility.py` 验证测试专用分析岗位复用公共运行时。
+- **岗位扩展**：`tests/test_role_extensibility.py` 验证测试专用分析岗位复用共享任务运行层。
 - **文档约束**：`tests/test_documentation.py` 检查文档编码、引用路径及关键设计实现。
 
 测试采用确定性模型和 HTTP 替身，重点覆盖 Agent 决策控制流、Worker 接管、SQLite 状态事务、Checkpoint 与工具副作用核验。
 
 ## 八、当前版本的运行范围
 
-当前版本以单机单 Worker 为运行基线，生产环境默认注册 Research Agent。Agent Registry 将岗位构建、配置、产物、校验、修复、收尾和预算统一抽象为岗位契约；测试专用分析岗位复用公共 Runtime 接口。后续可沿该边界扩展多 Worker 并发、多主机调度和多岗位生产编排。
+当前版本以单机单 Worker 为运行基线，生产环境默认注册 Research Agent。Agent Registry 将岗位构建、配置、产物、校验、修复、收尾和预算统一抽象为岗位契约；测试专用分析岗位复用共享任务运行层接口。后续可沿该边界扩展多 Worker 并发、多主机调度和多岗位生产编排。
