@@ -15,7 +15,7 @@
 3. **证据与研究控制**：Evidence Registry 保存来源快照和 Finding；Research Controller 根据研究维度、Finding 与有效来源计算覆盖率、识别关键缺口和停滞，并向 Agent 提供行动建议。Agent 根据实际证据决定补充研究或调整计划，使研究路径能够随新信息演进。
 4. **质量交付与可观测**：ReportValidator 检查报告结构和引用关系，ResearchEvaluator 结合规则评分与独立上下文评审检查交付质量；缺陷进入有限修复或人工决策。持久化事件账本通过 SSE 实时推送并支持断点回放；模型与工具调用记录、计划版本、步骤进度及工具关联、证据、预算和恢复记录共同呈现任务执行过程。
 
-实现上采用 **Deep Agents + LangGraph + FastAPI + SQLite**：Agent 图负责自主研究与执行上下文，FastAPI 负责任务接入和操作，独立 Worker 承担后台执行，SQLite 分别持久化任务事件与图检查点，任务工作区保存研究资料和交付物。当前以单机单 Worker 验证核心闭环，岗位注册契约通过第二岗位测试验证复用能力。
+实现上采用 **Deep Agents + LangGraph + FastAPI + SQLite**：Agent 图负责自主研究与执行上下文，FastAPI 负责任务接入和操作，独立 Worker 承担后台执行，SQLite 分别持久化任务事件与图检查点，任务工作区保存研究资料和交付物。
 
 ## 三、当前方案最重要的三个技术问题
 
