@@ -74,7 +74,7 @@ flowchart TD
 
 `scope → discovery → reading → analysis → report → validation`
 
-阶段用于展示进度和触发观察点，不构成 Agent 必须依次执行的固定工作流。Agent 可以根据新证据返回前面的阶段，也可以重排计划。
+阶段用于展示进度和触发观察点；Agent 可根据新证据返回前序阶段或调整计划，研究过程由证据和任务目标驱动。
 
 ## 四、研究计划与需求矩阵
 
@@ -227,7 +227,7 @@ ReportValidator 执行确定性结构和溯源检查：
 - 至少 40% 的合格正文段落包含有效来源引用（合格段落至少 80 个字符）；
 - 使用 Finding ID 时，该 ID 必须存在于登记簿。
 
-该组件验证报告结构和来源关联，不单独证明来源内容在语义上支持结论。
+报告的结构与来源关联由 ReportValidator 校验；结论与证据的匹配度由 ResearchEvaluator 结合 Finding、来源摘录和独立上下文评审进一步评估。
 
 ### 7.2 ResearchEvaluator 五维评估
 
@@ -247,7 +247,7 @@ LLM Reviewer 通过独立的 ChatOpenAI 调用执行，使用与 Research Agent 
 
 评审上下文包含用户目标、研究需求、覆盖状态、规则评分、Finding、报告和有限来源摘录。输入有明确上限：报告最多 16,000 字符，最多 8 个来源且每个来源最多 1,000 字符摘录，最多 30 条 Finding，最终评审输入 JSON 最多 42,000 字符。
 
-Reviewer 输出五维分数、unsupported claims、contradictions、missing dimensions 和 actionable repairs。评审响应必须符合结构化 JSON 契约；评审不可用时，生产流程不会将规则分数直接冒充为独立评审通过，而是创建人工待办。
+Reviewer 输出五维分数、unsupported claims、contradictions、missing dimensions 和 actionable repairs。评审响应必须符合结构化 JSON 契约；独立评审不可用时，任务进入人工待办，规则评分、评审状态与报告内容一并保留，供操作人员作出交付决策。
 
 ### 7.4 修复与交付
 
@@ -311,7 +311,7 @@ Worker 心跳过期后，RecoveryManager 先将未完成调用标记为 unknown�
 
 恢复管理器还会检查 Checkpoint SQLite 数据库、表结构和对应 `thread_id`。如果发现 Checkpoint 损坏或工具副作用存在歧义，任务进入 `waiting_for_human`；只有能够安全恢复时才重新入队并复用原 Checkpoint。
 
-这是一种保守的副作用核验机制，不宣称外部服务 exactly-once。只读外部请求在恢复后可能重复发送；已知写操作只有在持久化事实能够证明时才自动确认。
+恢复策略按工具副作用分类：只读外部请求在结果状态未知时可在预算内重新发送；Artifact、Finding、计划和记忆等写操作须通过持久化记录或读回结果核验后确认，无法核验的操作进入人工处理。
 
 ### 8.5 错误分类和重试
 
