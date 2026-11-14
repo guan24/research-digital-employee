@@ -18,6 +18,18 @@ The project addresses the central challenge in the development exercise: researc
 
 The system places an autonomous research Agent inside a durable task lifecycle with evidence feedback, resource boundaries, delivery validation and recovery.
 
+## Submission map
+
+| Deliverable | What the reviewer can verify |
+|---|---|
+| Runnable MVP | FastAPI accepts and exposes tasks; an independent Worker performs long-running research outside the browser session |
+| Short design statement | [DESIGN.md](DESIGN.md) directly answers the four questions in the exercise |
+| Architecture and trade-offs | [DESIGN_OVERVIEW.md](DESIGN_OVERVIEW.md) explains role boundaries, the shared task runtime layer, persistence ownership, task state and technology choices |
+| Research lifecycle | [DESIGN_TRUSTED_RESEARCH_LIFECYCLE.md](DESIGN_TRUSTED_RESEARCH_LIFECYCLE.md) details evidence-driven planning, quality gates, recovery and human decisions |
+| Verification evidence | Automated tests cover evidence-dependent replanning, process interruption, Worker fencing and role-contract reuse; a redacted real execution is available as a read-only [task example](examples/rainbow-research/README.md) |
+
+The design statement is the concise evaluation document. The other documents provide implementation-level evidence and operational detail.
+
 ## Architecture
 
 ```mermaid

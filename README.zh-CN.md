@@ -18,6 +18,18 @@
 
 项目以任务生命周期为组织主线，将自主研究、持久化状态、证据约束、资源边界、质量门禁和异常恢复整合为统一执行系统。
 
+## 提交材料与评审阅读路径
+
+| 交付材料 | 评审可核验的内容 |
+|---|---|
+| 可运行的最小版本 | FastAPI 接收和管理任务，独立 Worker 在浏览器会话之外持续执行研究 |
+| 简短设计说明 | [DESIGN.md](DESIGN.md) 按题目要求直接回答四个设计问题 |
+| 系统架构与技术取舍 | [DESIGN_OVERVIEW.md](DESIGN_OVERVIEW.md) 说明岗位边界、共享任务运行层、持久化分工、任务状态和技术选型 |
+| 研究生命周期设计 | [DESIGN_TRUSTED_RESEARCH_LIFECYCLE.md](DESIGN_TRUSTED_RESEARCH_LIFECYCLE.md) 展示证据驱动规划、质量门禁、异常恢复和人工决策 |
+| 验证材料 | 自动化测试覆盖证据驱动重规划、进程中断恢复、Worker 执行代次隔离和岗位契约复用；另提供脱敏的[真实任务只读样例](examples/rainbow-research/README.md) |
+
+**DESIGN.md 是面向本题评审的简短设计说明；其余文档用于展开架构依据、实现机制和验证证据。**
+
 ## 架构概览
 
 ```mermaid
